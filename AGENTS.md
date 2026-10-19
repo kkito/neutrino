@@ -6,6 +6,12 @@
 - agent 内网出站 WSS 长连，无公网入站。隧道以 server `desired.toml` 为唯一源头，agent 本地 proxies 忽略；agent WebUI（`--web`）只管上行地址/hostname/token。
 - 协议见 `README.md` + `docs/architecture.md` + `docs/specs/`。
 
+## 文档索引
+- `README.md`：协议/功能对照/本地验证/部署。
+- `docs/architecture.md`：架构与典型流程（含 mermaid 图）。
+- `docs/nginx.md`：natproxy 侧 nginx 接入（管理域/业务域/tcp-udp/验证）。
+- `docs/specs/2026-10-19-dual-webui-design.md`：双 WebUI + 期望态设计。
+
 ## 常用命令
 ```bash
 make build      # debug 构建，零 warning 才算过
