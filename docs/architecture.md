@@ -10,18 +10,21 @@
 
 ```mermaid
 flowchart LR
-    U[访问者<br/>浏览器/TCP客户端] -->|业务流量| N[反向代理<br/>TLS卸载+分流]
-    A[管理员<br/>WebUI] --> N
-    N -->|/ws| WS["server 信令通道<br/>WSS连接复用"]
-    N -->|业务域名| HTTP["server HTTP入口<br/>按Host路由"]
+    U[访问者<br/>浏览器/TCP客户端] --> HTTP["server HTTP入口<br/>按Host路由"]
     U -->|TCP/UDP直连| TCP["server TCP/UDP入口<br/>按端口监听"]
+    A[管理员<br/>WebUI] --> WEB["server WebUI+API<br/>总览/隧道/配置"]
+    AG2[agent<br/>内网出站] --> WS["server 信令通道<br/>WSS连接复用"]
+    N["反向代理(可选)<br/>TLS卸载+分流"] -.->|/ws, WebUI| WS
+    N -.->|业务域名| HTTP
+    U -.->|经反代| N
+    A -.->|经反代| N
     HTTP -.->|Open + 数据帧| WS
     TCP -.->|Open + 数据帧| WS
     WS <==>|单条WSS出站<br/>hello/register| AG["agent<br/>内网出站长连"]
     AG -->|拨本地| L1[内网HTTP服务]
     AG -->|拨本地| L2[内网TCP服务]
     AG -->|发本地| L3[内网UDP服务]
-    WEB["server WebUI+API<br/>总览/隧道/配置"] -.->|Config热下发| WS
+    WEB -.->|Config热下发| WS
     WEB -.->|读写| ST[(state.json<br/>流量+密码)]
 ```
 
@@ -32,6 +35,8 @@ flowchart LR
   UDP 每个 peer 一个 stream，每帧即一个 datagram。
 - HTTP 按 `Host` 路由、可注入 `X-Forwarded-Proto`；TCP/UDP 按 `remote_port` 路由（lazy 监听）；
   HTTPS 当 TCP 透传、不解密。
+- WebUI 与全部 API 由 server 直出（页面编译进二进制），反向代理仅可选承担 TLS 卸载与分流，
+  直连 server 端口同样可用。
 
 ## 典型场景
 
