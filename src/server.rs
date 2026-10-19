@@ -325,11 +325,12 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         // 注意：`/` 不单独注册精确路由，否则带隧道 Host 访问 `/` 会被它抢走；
         // 统一走 fallback 按 Host 分流（WebUI vs 隧道）。
         .fallback(fallback_http_ingress)
-        .with_state((shared, token));
+        .with_state((shared, token.clone()));
     let lis = TcpListener::bind(listen).await?;
     tracing::info!("server listening ws+webui+http-ingress on {listen}");
     println!("neutrino-server running:");
     println!("  listen : http://{listen}/  (Host=业务域->隧道, /=WebUI, /ws=agent)");
+    println!("  agent token  : {token}  (agent 用 --server ws://{listen}/ws + 相同 token)");
     if need_init {
         println!("  web login    : admin / welcome2neutrino (默认, 首次登录后请改口令)");
     } else {
