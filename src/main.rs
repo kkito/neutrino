@@ -44,7 +44,7 @@ enum Cmd {
     },
     /// Run as agent (snail side)
     Agent {
-        #[arg(long, default_value = "wss://tunnel.nat.kkito.cn:7443/ws")]
+        #[arg(long, default_value = agent::DEFAULT_AGENT_SERVER)]
         server: String,
         #[arg(long, default_value = "agent.toml")]
         config: String,

@@ -61,18 +61,56 @@ async fn load_or_default(config_path: &str, url: &str) -> anyhow::Result<AgentFi
     }
 }
 
+/// 默认上行（与 CLI --server 默认值保持一致，单测 enforce）。
+pub const DEFAULT_AGENT_SERVER: &str = "wss://tunnel.nat.kkito.cn:7443/ws";
+
+/// 启动上行解析：显式 CLI > 文件 > CLI 默认。
+/// cli_explicit 指用户是否在命令行改了 --server（与默认值不同即算显式）。
+fn resolve_initial_url(cli_url: &str, cfg: &AgentFileConfig, cli_explicit: bool) -> String {
+    if cli_explicit {
+        cli_url.to_string()
+    } else if cfg.server.trim().is_empty() {
+        cli_url.to_string()
+    } else {
+        cfg.server.clone()
+    }
+}
+
+/// backoff 睡眠，可被 redial 打断：被打断返回 true（调用方立即重拨）。
+/// seen 为进入睡眠前的 generation：订阅前已到的 bump 也算打断，避免间隙丢失。
+async fn sleep_backoff_or_redial(
+    dur: std::time::Duration,
+    mut rx: tokio::sync::watch::Receiver<u64>,
+    seen: u64,
+) -> bool {
+    if *rx.borrow() != seen {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        woke = async {
+            loop {
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+                if *rx.borrow_and_update() != seen {
+                    return true;
+                }
+            }
+        } => woke,
+    }
+}
+
 pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pass: &str) -> anyhow::Result<()> {
     let cfg: AgentFileConfig = load_or_default(config_path, url).await?;
     if !cfg.proxies.is_empty() {
         tracing::warn!("local proxies in {config_path} ignored: server is source of truth");
     }
-    // CLI --server wins only when the file has no `server` key (keeps old
-    // behaviour); afterwards WebUI edits rewrite the file and take effect.
-    let initial_url = if cfg.server.trim().is_empty() {
-        url.to_string()
-    } else {
-        cfg.server.clone()
-    };
+    // 启动优先级：显式 --server > 文件 server > 默认值。
+    // 文件里的 server 是 WebUI 上次保存的；用户本次显式传参则覆盖它
+    // （并在 WebUI 保存时回写文件，后续启动不用再传）。
+    let cli_explicit = url != DEFAULT_AGENT_SERVER;
+    let initial_url = resolve_initial_url(url, &cfg, cli_explicit);
     let upstream = Arc::new(RwLock::new(Upstream {
         server_url: initial_url.clone(),
         hostname: cfg.hostname.clone(),
@@ -224,8 +262,22 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
             if backoff.len() > 1 {
                 backoff.remove(0);
             }
-            tracing::warn!("session ended; retry in {s}s");
-            tokio::time::sleep(std::time::Duration::from_secs(s)).await;
+            tracing::warn!("session ended; retry in {s}s (WebUI save reconnects immediately)");
+            // 睡眠可被 WebUI 保存打断：打断后按 redial 走（立即重拨+重置 backoff）。
+            // 传 seen=redial_seen：subscribe 间隙到达的 bump 也算打断，不丢。
+            if sleep_backoff_or_redial(std::time::Duration::from_secs(s), redial_tx.subscribe(), redial_seen).await {
+                reconnects += 1;
+                backoff = vec![1u64, 2, 5, 10, 30, 60];
+                {
+                    let mut st = status.write().await;
+                    st.online = false;
+                    st.reconnects = reconnects;
+                    st.last_error = Some("redial requested".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                redial_seen = *redial_tx.borrow();
+                continue;
+            }
         }
     }
 }
@@ -535,6 +587,58 @@ async fn open_udp_stream(ctx: Arc<Ctx>, sid: u32, port: u16) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+        use std::time::Duration;
+
+    /// RED: backoff 睡眠必须可被 redial 打断。
+    /// 现场：session 刚失败，主循环进 30s+ 睡眠，此时 WebUI 点保存 bump。
+    /// 判定函数 sleep_backoff_or_redial：redial 到达即早返 true。
+    #[tokio::test]
+    async fn backoff_sleep_is_interruptible_by_redial() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        // 无 bump：睡满（用 50ms 代表，便于测试）
+        let t0 = std::time::Instant::now();
+        let woke = sleep_backoff_or_redial(Duration::from_millis(50), rx.clone(), 0).await;
+        assert!(!woke);
+        assert!(t0.elapsed() >= Duration::from_millis(50));
+        // 睡眠中到达的 bump：30s 睡眠也必须毫秒级打断
+        let h = tokio::spawn(async move {
+            sleep_backoff_or_redial(Duration::from_secs(30), rx, 0).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send_replace(1);
+        let woke = tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("redial must interrupt backoff")
+            .unwrap();
+        assert!(woke, "redial during backoff must interrupt sleep");
+    }
+
+    #[tokio::test]
+    async fn backoff_sleep_catches_pre_subscribe_bump() {
+        // bump 发生在 subscribe 间隙（借出旧句柄后、新订阅前）：
+        // 新订阅看到的 generation 已变，必须直接判打断，不能再睡。
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        tx.send_replace(7);
+        let woke = sleep_backoff_or_redial(Duration::from_secs(30), rx, 0).await;
+        assert!(woke, "stale-observed generation must count as redial");
+    }
+
+    #[tokio::test]
+    async fn cli_server_overrides_file() {
+        // RED: 启动时显式传 --server，必须优先于文件里的 server。
+        // 现场：文件里是旧地址，CLI 给了新地址，实际拨的应是 CLI 的。
+        // 默认值不算“显式传”：只有用户改了 CLI 默认值才覆盖文件。
+        let dir = std::env::temp_dir().join(format!("nt-agent-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let p = dir.join("agent.toml");
+        tokio::fs::write(&p, "hostname = \"h\"\ntoken = \"t\"\nserver = \"ws://file-old/ws\"\n").await.unwrap();
+        let cfg = load_or_default(p.to_str().unwrap(), "ws://cli-new/ws").await.unwrap();
+        assert_eq!(resolve_initial_url("ws://cli-new/ws", &cfg, true), "ws://cli-new/ws");
+        // 没显式传（还是默认值）：文件优先
+        assert_eq!(resolve_initial_url(super::DEFAULT_AGENT_SERVER, &cfg, false), "ws://file-old/ws");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[tokio::test]
     async fn missing_config_starts_unconfigured() {
