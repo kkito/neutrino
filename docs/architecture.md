@@ -10,17 +10,17 @@
 
 ```mermaid
 flowchart LR
-    U[访问者<br/>浏览器/TCP客户端] -->|HTTPS :7443| N[nginx<br/>TLS卸载+反代]
+    U[访问者<br/>浏览器/TCP客户端] -->|业务流量| N[反向代理<br/>TLS卸载+分流]
     A[管理员<br/>WebUI] --> N
-    N -->|/ws| WS["server /ws 信令<br/>WSS复用 :7440"]
-    N -->|业务域名| HTTP["server HTTP入口<br/>Host路由 :7080"]
+    N -->|/ws| WS["server 信令通道<br/>WSS连接复用"]
+    N -->|业务域名| HTTP["server HTTP入口<br/>按Host路由"]
     U -->|TCP/UDP直连| TCP["server TCP/UDP入口<br/>按端口监听"]
     HTTP -.->|Open + 数据帧| WS
     TCP -.->|Open + 数据帧| WS
     WS <==>|单条WSS出站<br/>hello/register| AG["agent<br/>内网出站长连"]
-    AG -->|拨本地| L1[内网HTTP<br/>gogs/owncloud]
-    AG -->|拨本地| L2[内网TCP<br/>如:51413]
-    AG -->|发本地| L3[内网UDP<br/>datagram透传]
+    AG -->|拨本地| L1[内网HTTP服务]
+    AG -->|拨本地| L2[内网TCP服务]
+    AG -->|发本地| L3[内网UDP服务]
     WEB["server WebUI+API<br/>总览/隧道/配置"] -.->|Config热下发| WS
     WEB -.->|读写| ST[(state.json<br/>流量+密码)]
 ```
@@ -47,7 +47,7 @@ sequenceDiagram
     SR->>AG: 路由就绪(建表+lazy监听)
 ```
 
-### 2. HTTP 穿透（最常用：gogs/owncloud）
+### 2. HTTP 穿透（最常用）
 
 ```mermaid
 sequenceDiagram
@@ -55,15 +55,15 @@ sequenceDiagram
     participant SR as server
     participant AG as agent
     participant L as 内网HTTP服务
-    C->>SR: GET Host: git.nat.kkito.cn
+    C->>SR: GET Host: 业务域名
     SR->>AG: Open{kind=http,host}
-    AG->>L: 拨 127.0.0.1:port
+    AG->>L: 拨本地端口
     L->>AG: 响应字节流
     AG->>SR: Binary数据帧
     SR->>C: 写回(XFP已注入)
 ```
 
-### 3. TCP/HTTPS 透传（如 51413、TLS 不解密）
+### 3. TCP/HTTPS 透传（TLS 不解密）
 
 ```mermaid
 sequenceDiagram
@@ -74,9 +74,10 @@ sequenceDiagram
     C->>SR: 连 remote_port
     SR->>AG: Open{kind=tcp,port}
     AG->>L: 拨本地端口(原样透传)
-    L<->>AG: 双向字节流
-    AG<->>SR: Binary数据帧
-    SR<->>C: 双向字节流
+    L->>AG: 内网发往客户端字节流
+    AG->>L: 客户端发往内网字节流
+    AG->>SR: Binary数据帧(双向)
+    SR->>C: 写回访问者
 ```
 
 任一方向 EOF 即发 `Close` 收尾（`select` 非 `join`，避免两端互等死锁）。
@@ -87,9 +88,9 @@ sequenceDiagram
 sequenceDiagram
     participant SR as server
     participant AG as agent
-    SR->>AG: Ping(每15s,测RTT)
+    SR->>AG: Ping(定时,测RTT)
     AG->>SR: Pong
-    Note over AG: 断线指数退避重连<br/>1/2/5/10/30/60s,重发hello+register
+    Note over AG: 断线指数退避重连,重发hello+register
     SR->>AG: Config热下发(不断WSS)
     AG->>SR: ConfigAck,原子替换路由
 ```
