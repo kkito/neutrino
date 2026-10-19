@@ -72,7 +72,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         ..Default::default()
     }));
     // bumped by WebUI to force an immediate redial (settings save / button)
-    let (redial_tx, mut redial_rx) = tokio::sync::watch::channel(0u64);
+    let (redial_tx, redial_rx) = tokio::sync::watch::channel(0u64);
     if !web.is_empty() {
         // persist web password hash under agent data file
         let data_path = format!("{config_path}.webpass");
@@ -145,16 +145,26 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         };
         *cur.lock().await = None;
         reconnects += 1;
+        let redial = err == "redial requested";
         {
             let mut st = status.write().await;
             st.online = false;
             st.reconnects = reconnects;
             st.last_error = Some(err);
         }
-        // immediate redial (watcher already aborted); just reset backoff
-        backoff = vec![1u64, 2, 5, 10, 30, 60];
-        // small debounce so rapid double-clicks don't spin
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if redial {
+            // user-triggered: immediate redial, reset backoff
+            backoff = vec![1u64, 2, 5, 10, 30, 60];
+            // small debounce so rapid double-clicks don't spin
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        } else {
+            let s = backoff.first().cloned().unwrap_or(60);
+            if backoff.len() > 1 {
+                backoff.remove(0);
+            }
+            tracing::warn!("session ended; retry in {s}s");
+            tokio::time::sleep(std::time::Duration::from_secs(s)).await;
+        }
     }
 }
 
