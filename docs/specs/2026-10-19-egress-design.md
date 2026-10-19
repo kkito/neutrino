@@ -1,6 +1,6 @@
 # neutrino egress（出网代理）设计
 
-日期： 2026-10-19 ｜ 状态： 草稿待评审 ｜ 需求来源： 通用 TCP 出口（内网经 server 出口访问公网）
+日期： 2026-10-19 ｜ 状态： 已实现（一期 HTTP，commit 076a3c9） ｜ 需求来源： 通用 TCP 出口（内网经 server 出口访问公网）
 
 ## 1. 背景与目标
 
@@ -74,6 +74,8 @@ sequenceDiagram
 
 - server 默认支持 egress，无需额外开端口、无需开启开关：收到 `ClientMsg::Open{kind:"egress"}` 即 `TcpStream::connect(host:port)`，拨号超时 30s，后接现有 pump。CONNECT 无端口默认 80；DNS 完全 server 侧解析。
 - server WebUI：agent 行显示"egress 开/关"状态（只读，开关在 agent 侧）。访问控制（白名单/按 agent 授权）作为后续增强，首期不做门禁。
+- **实现偏差（2026-10-19）**：server WebUI 只读状态未做——需扩展 Register 协议上报 egress 开关，延期到二期；一期 egress 状态只在 agent 本地 WebUI 可见。
+  另两处实现级修复：① server 加 `pending` 早到缓存（Open 与首包背靠背乱序）+ 泵启动 drain；② eof 标记走 outbox 同通道空包保序（原 ctl Close{eof} 与数据通道 select 乱序致空 BODY，见 e2e 注释）。
 
 ### 3.3 协议变更
 
