@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+libc = "0.2"
 thiserror = "1"
 toml = "0.8"
 chrono = "0.4"

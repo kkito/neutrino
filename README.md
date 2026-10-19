@@ -42,11 +42,20 @@ agent 本地错误配置被期望态覆盖（含回推同步本地路由表）�
 cargo build
 ./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2ll --desired ./data/desired.toml &
 ./target/debug/neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml.example --web 127.0.0.1:8080 &
-# 隧道在 server WebUI 里建（/ → 隧道 → +新增隧道），agent 无需配 proxies
 curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7080/   # 透到 agent 本地
 open http://127.0.0.1:7440/                                # server WebUI
 open http://127.0.0.1:8080/                                # agent 本地 WebUI（默认 admin/neutrino123）
 ```
+
+## 后台运行（裸跑，不用 systemd/podman 时）
+
+```bash
+./neutrino server --detach --pid-file ./neutrino.pid   # 日志默认 <data>/neutrino.log，打印 pid 即退出
+./neutrino agent --detach --config agent.toml          # 日志默认 ./neutrino-agent.log
+kill $(cat neutrino.pid)                               # 停服
+```
+
+`--log-file` 可改路径；Windows 下退化为普通后台进程。
 
 ## 部署到 natproxy（server）
 
