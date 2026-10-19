@@ -22,6 +22,8 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     }
     let ps = state::load_state(data).await;
     let ds = crate::common::desired::DesiredStore::load(desired);
+    // 公网端口：--listen 尾段端口，供 HTTP fallback 连接行 public_port 用
+    let public_port: u16 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let shared: S = Arc::new(Shared {
         password_hash: RwLock::new(ps.password_hash),
         totals: RwLock::new(ps.totals),
@@ -29,8 +31,14 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         data_dir: data.to_string(),
         desired: RwLock::new(HashMap::new()),
         desired_path: desired.to_string(),
+        public_port,
         ..Default::default()
     });
+    // traffic 读回（无文件/坏文件从空开始，load_traffic 内部记日志）
+    {
+        let p = state::traffic_path(data);
+        state::load_traffic(&shared, &p).await;
+    }
     // fill desired from store
     {
         let all = ds.all();
@@ -38,6 +46,48 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     }
     let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());
+    // 60s traffic tick：累计增量 push + 落盘 traffic.json
+    {
+        let s = shared.clone();
+        let data = data.to_string();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                iv.tick().await;
+                {
+                    let ag = s.agents.read().await;
+                    let mut tr = s.traffic.write().await;
+                    let mut lt = s.last_total.write().await;
+                    let mut pushed: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for h in ag.values() {
+                        for p in &h.info.proxies {
+                            if !p.enabled {
+                                continue;
+                            }
+                            let k = state::traffic_key(&h.info.hostname, &p.name);
+                            let cur = (h.info.rx_bytes, h.info.tx_bytes);
+                            let prev = lt.get(&k).cloned().unwrap_or(cur);
+                            let q = tr.entry(k.clone()).or_default();
+                            if pushed.contains(&k) {
+                                // 同 hostname 多 agent 共 key：增量合并到本轮队尾一点
+                                if let Some(b) = q.back_mut() {
+                                    let d = state::minute_delta(prev, cur);
+                                    b.0 += d.0;
+                                    b.1 += d.1;
+                                }
+                            } else {
+                                state::tick_one(q, prev, cur);
+                                pushed.insert(k.clone());
+                            }
+                            lt.insert(k, cur);
+                        }
+                    }
+                }
+                let p = state::traffic_path(&data);
+                state::save_traffic(&s, &p).await;
+            }
+        });
+    }
     // periodic persist
     {
         let s = shared.clone();

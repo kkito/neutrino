@@ -1,7 +1,7 @@
 //! server 全局状态：Shared/AgentInfo/路由表/持久化 + 小纯函数。
 use crate::common::proto::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -44,6 +44,58 @@ pub(crate) struct Shared {
     pub(crate) data_dir: String,
     pub(crate) desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,
     pub(crate) desired_path: String,
+    /// 分钟流量点：key = "hostname/proxy名" -> VecDeque<(rx增量,tx增量)>，cap 43200（30天）
+    pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>,
+    /// 上分钟累计快照：key 同 traffic，用于算增量
+    pub(crate) last_total: RwLock<HashMap<String, (u64, u64)>>,
+    /// 当前连接快照：key = conn id（Task3 连接插桩消费）
+    #[allow(dead_code)]
+    pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
+    /// --listen 解析出的公网端口（Task3 HTTP fallback 连接行用）
+    #[allow(dead_code)]
+    pub(crate) public_port: u16,
+}
+
+/// 30天分钟点上限
+pub(crate) const TRAFFIC_CAP: usize = 43_200;
+/// 当前连接表上限（超了挤掉 id 最小的）；Task3 连接插桩消费
+#[allow(dead_code)]
+pub(crate) const CONNS_CAP: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConnInfo {
+    pub(crate) id: u64,
+    pub(crate) proto: String, // "http"|"tcp"|"https"|"udp"
+    pub(crate) peer: String,  // 外部 ip:port
+    pub(crate) public_port: u16,
+    pub(crate) agent: String,
+    pub(crate) tunnel: String,
+    pub(crate) remote_port: u16,
+    pub(crate) target: String, // local_ip:local_port
+    pub(crate) since: i64,
+    pub(crate) rx: u64,
+    pub(crate) tx: u64,
+}
+
+pub(crate) fn traffic_key(hostname: &str, name: &str) -> String {
+    format!("{hostname}/{name}")
+}
+
+/// 增量（饱和减，防累计回绕/重置）
+pub(crate) fn minute_delta(prev: (u64, u64), cur: (u64, u64)) -> (u64, u64) {
+    (cur.0.saturating_sub(prev.0), cur.1.saturating_sub(prev.1))
+}
+
+/// 后 n 个点求和（Task4 /api/traffic hour/day 加总用）
+#[allow(dead_code)]
+pub(crate) fn rollup(points: &VecDeque<(u64, u64)>, n: usize) -> (u64, u64) {
+    points.iter().rev().take(n).fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
+}
+
+pub(crate) fn trim_traffic(v: &mut VecDeque<(u64, u64)>) {
+    while v.len() > TRAFFIC_CAP {
+        v.pop_front();
+    }
 }
 
 pub(crate) fn log_ev(s: &S, e: String) {
@@ -135,6 +187,48 @@ pub(crate) async fn load_state(data_dir: &str) -> Persisted {
     }
 }
 
+pub(crate) fn traffic_path(data_dir: &str) -> String {
+    format!("{data_dir}/traffic.json")
+}
+
+/// 启动读回 traffic.json：无文件直接从空开始；坏 json 记一条日志、内存不动。
+pub(crate) async fn load_traffic(s: &S, path: &str) {
+    let Ok(txt) = tokio::fs::read_to_string(path).await else {
+        return;
+    };
+    let Ok(m): Result<HashMap<String, Vec<(u64, u64)>>, _> = serde_json::from_str(&txt) else {
+        log_ev_err(s, "traffic load failed: bad json".into());
+        return;
+    };
+    let mut t = s.traffic.write().await;
+    for (k, v) in m {
+        let mut q: VecDeque<(u64, u64)> = v.into_iter().collect();
+        trim_traffic(&mut q);
+        t.insert(k, q);
+    }
+}
+
+pub(crate) async fn save_traffic(s: &S, path: &str) {
+    let t = s.traffic.read().await;
+    let m: HashMap<&String, Vec<(u64, u64)>> =
+        t.iter().map(|(k, q)| (k, q.iter().cloned().collect())).collect();
+    if let Ok(txt) = serde_json::to_string(&m) {
+        let _ = tokio::fs::write(path, txt).await;
+    }
+}
+
+/// tick 一步：算增量、push 队尾、裁剪。返回本分钟增量。
+pub(crate) fn tick_one(
+    q: &mut VecDeque<(u64, u64)>,
+    prev: (u64, u64),
+    cur: (u64, u64),
+) -> (u64, u64) {
+    let d = minute_delta(prev, cur);
+    q.push_back(d);
+    trim_traffic(q);
+    d
+}
+
 pub(crate) async fn save_state(s: &S) {
     let totals = s.totals.read().await.clone();
     let password_hash = s.password_hash.read().await.clone();
@@ -178,6 +272,18 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
     #[test]
+    fn traffic_pure_fns() {
+        // Task1 基座：key/增量/加总/裁剪纯函数
+        assert_eq!(super::traffic_key("h", "web"), "h/web");
+        assert_eq!(super::minute_delta((100, 200), (150, 250)), (50, 50));
+        assert_eq!(super::minute_delta((100, 200), (90, 250)), (0, 50)); // 回绕饱和
+        let v: VecDeque<(u64, u64)> = (0..10).map(|i| (i, i * 2)).collect();
+        assert_eq!(super::rollup(&v, 3), (7 + 8 + 9, 14 + 16 + 18));
+        let mut big: VecDeque<(u64, u64)> = (0..43_300).map(|i| (i as u64, 0)).collect();
+        super::trim_traffic(&mut big);
+        assert_eq!(big.len(), 43_200);
+    }
+    #[test]
     fn ev_stamp_keeps_wall_clock_offset() {
         // 根因→修法：push_ev 曾用 chrono::Utc::now()，WebUI 日志时间比系统本地慢 8h
         //（如 natproxy HKT 18:00 打成 10:00）。format_ev 取本地 wall clock，
@@ -201,6 +307,23 @@ mod tests {
         assert!(v[0].ends_with("hello"));
     }
 
+    #[tokio::test]
+    async fn traffic_json_roundtrip_and_bad_file() {
+        let dir = std::env::temp_dir().join(format!("nt-traf-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let p = dir.join("traffic.json").to_str().unwrap().to_string();
+        let s: S = Arc::new(Shared::default());
+        s.traffic.write().await.insert("h/web".into(), [(1u64, 2u64)].into_iter().collect());
+        super::save_traffic(&s, &p).await;
+        let s2: S = Arc::new(Shared::default());
+        super::load_traffic(&s2, &p).await;
+        assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
+        // 坏文件：不动内存、不 panic
+        tokio::fs::write(&p, b"[[[broken").await.unwrap();
+        super::load_traffic(&s2, &p).await;
+        assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
     #[test]
     fn resolve_prefers_desired() {
         let want = vec![ProxyConfig {
