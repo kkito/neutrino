@@ -275,6 +275,88 @@ async fn e2e_tcp_passthrough() {
     let _ = env;
 }
 
+/// 旧代码无 /api/traffic、/api/conns（404 即红）；断言抓：conns 行出现/消失、traffic 接口可用。
+/// 取舍：分钟 tick 在 e2e 等不起（60s），有点不断言，累计由 state 单测覆盖。
+#[tokio::test]
+async fn e2e_traffic_and_conns() {
+    // echo backend
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"tc\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n"
+    ))
+    .await;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let jwt = login(&env.web_base).await;
+    let c = reqwest::Client::new();
+    let get = |path: String| {
+        let c = c.clone();
+        let base = env.web_base.clone();
+        let jwt = jwt.clone();
+        async move {
+            c.get(format!("{base}{path}")).bearer_auth(&jwt).send().await.unwrap()
+        }
+    };
+    // traffic 接口可用（旧代码 404）
+    let r = get("/api/traffic?tunnel=all&gran=min&n=10".into()).await;
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = r.json().await.unwrap();
+    assert!(j.get("points").is_some(), "{j:?}");
+    // 建连并发包 -> conns 出现行
+    let mut conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    conn.write_all(b"hello-conns").await.unwrap();
+    let mut b = vec![0u8; 32];
+    let _ = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut b)).await.unwrap().unwrap();
+    let mut found = false;
+    for _ in 0..40 {
+        let r = get("/api/conns".into()).await;
+        assert_eq!(r.status(), 200);
+        let j: serde_json::Value = r.json().await.unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if arr.iter().any(|x| x["tunnel"] == "tc" && x["public_port"] == rport) {
+            found = true;
+            // 列齐全：外部/公网端口/隧道/agent/内网目标
+            let x = arr.iter().find(|x| x["tunnel"] == "tc").unwrap();
+            assert!(x["peer"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "{x:?}");
+            assert!(x["agent"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "{x:?}");
+            assert!(x["target"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "{x:?}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(found, "conns should show the tcp connection");
+    // 断开后行消失（轮询，上限 8s）
+    drop(conn);
+    let mut gone = false;
+    for _ in 0..40 {
+        let r = get("/api/conns".into()).await;
+        let j: serde_json::Value = r.json().await.unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if !arr.iter().any(|x| x["tunnel"] == "tc") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(gone, "conns row should disappear after close");
+    let _ = env;
+}
+
 #[tokio::test]
 async fn e2e_udp_and_hot_config() {
     // udp echo backend
