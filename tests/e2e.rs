@@ -28,7 +28,7 @@ struct Env {
     _ag: tokio::process::Child,
 }
 
-async fn boot(proxies_toml: &str) -> Env {
+async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> Env {
     let ws_port = free_port();
     let http_port = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
@@ -41,6 +41,11 @@ async fn boot(proxies_toml: &str) -> Env {
     .await
     .unwrap();
     let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    if let Some(d) = desired_toml {
+        tokio::fs::write(&desired_path, d).await.unwrap();
+    }
     let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
     let srv = tokio::process::Command::new(&bin)
         .args([
@@ -51,6 +56,8 @@ async fn boot(proxies_toml: &str) -> Env {
             &format!("127.0.0.1:{http_port}"),
             "--data",
             data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
             "--token",
             "s3cret",
         ])
@@ -76,6 +83,22 @@ async fn boot(proxies_toml: &str) -> Env {
         _srv: srv,
         _ag: ag,
     }
+}
+
+async fn boot(proxies_toml: &str) -> Env {
+    boot_with_desired(proxies_toml, None).await
+}
+
+async fn http_get_via(env: &Env, host: &str) -> String {
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
+        .await
+        .unwrap();
+    c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = vec![];
+    c.read_to_end(&mut out).await.unwrap();
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn login(base: &str) -> String {
@@ -270,4 +293,97 @@ async fn e2e_udp_and_hot_config() {
         .await
         .unwrap();
     assert_eq!(r.status(), 404);
+}
+
+#[tokio::test]
+async fn e2e_desired_crud_flows_to_agent() {
+    // backend: fixed body
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                let body = "desired-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // agent boots with NO local proxies; desired comes from server WebUI
+    let env = boot("").await;
+    let jwt = login(&env.web_base).await;
+    let c = reqwest::Client::new();
+    // before: 404
+    assert!(http_get_via(&env, "d.e2e.test").await.contains("404"));
+    // WebUI creates tunnel via desired CRUD
+    let r = c
+        .post(format!("{}/api/desired/e2e", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"proxies": [
+            {"name": "web", "type": "http", "local_ip": "127.0.0.1",
+             "local_port": bport, "domains": ["d.e2e.test"]}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // after: flows through
+    assert!(http_get_via(&env, "d.e2e.test").await.contains("desired-ok"));
+    // persisted?
+    let j: serde_json::Value = c
+        .get(format!("{}/api/desired/e2e", env.web_base))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(j["proxies"][0]["name"], "web");
+    let _ = env;
+}
+
+#[tokio::test]
+async fn e2e_restart_covered_by_desired() {
+    // backend on good port
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                let body = "covered-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // agent reports a WRONG local proxy, but server desired.toml wins
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"web\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"c.e2e.test\"]\n"
+    );
+    let env = boot_with_desired(
+        &format!(
+            "[[proxies]]\nname=\"wrong\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port=1\ndomains=[\"c.e2e.test\"]\n"
+        ),
+        Some(&desired),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(http_get_via(&env, "c.e2e.test").await.contains("covered-ok"));
+    let _ = env;
 }

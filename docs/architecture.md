@@ -18,23 +18,28 @@ flowchart TB
         WS["信令通道 /ws<br/>WSS连接复用"]
         HTTP["HTTP入口<br/>按Host路由"]
         TCP["TCP/UDP入口<br/>按端口监听"]
-        WEB["WebUI + API<br/>总览/隧道/配置"]
+        WEB["WebUI + API<br/>总览/隧道表单/日志"]
+        DS[(desired.toml<br/>期望隧道·唯一源头)]
         ST[(state.json<br/>流量+密码)]
         HTTP -.->|Open + 数据帧| WS
         TCP -.->|Open + 数据帧| WS
         WEB -.->|Config热下发| WS
         WEB -.->|读写| ST
+        WEB <-.->|CRUD| DS
+        DS -.->|register覆盖+在线下发| WS
     end
 
     subgraph AGT[client machine · 内网]
         direction TB
         AG["neutrino agent<br/>单条WSS出站长连"]
+        AW["agent本地WebUI<br/>状态/只读隧道/改口令"]
         L1[内网HTTP服务]
         L2[内网TCP服务]
         L3[内网UDP服务]
         AG -->|拨本地| L1
         AG -->|拨本地| L2
         AG -->|发本地| L3
+        AW -.->|读状态| AG
     end
 
     subgraph RP[nginx 反向代理 · 可选]
@@ -60,7 +65,8 @@ flowchart TB
 - HTTP 按 `Host` 路由、可注入 `X-Forwarded-Proto`；TCP/UDP 按 `remote_port` 路由（lazy 监听）；
   HTTPS 当 TCP 透传、不解密。
 - WebUI 与全部 API 由 server 直出（页面编译进二进制），反向代理仅可选承担 TLS 卸载与分流，
-  直连 server 端口同样可用。
+  直连 server 端口同样可用。agent 本地另有只读 WebUI（`--web` 开启，默认 admin/neutrino123），
+  看上行状态与生效中隧道（标"由 server 下发"），改上行地址需重启生效。
 
 ## 典型场景
 
@@ -73,6 +79,7 @@ sequenceDiagram
     AG->>SR: WSS握手 + hello{token}
     SR->>AG: welcome(校验token)
     AG->>SR: register{proxies[]}
+    SR->>AG: 期望态覆盖(Config回推,agent重register)
     SR->>AG: 路由就绪(建表+lazy监听)
 ```
 
@@ -124,5 +131,6 @@ sequenceDiagram
     AG->>SR: ConfigAck,原子替换路由
 ```
 
-管理员在 WebUI `POST /api/config` 推送新隧道列表，在途 stream 继续 draining；
+管理员在 WebUI 隧道页增删改（`GET/POST /api/desired/:hostname` 落盘期望态），在线即下发，
+离线等 register 时覆盖；`POST /api/config` 保留为高级直推；
 `POST /api/tunnels/:agent/:name/enabled` 即时启停单个隧道。

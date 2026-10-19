@@ -21,28 +21,31 @@
 | tcp 透传 | 同上 `type=tcp`（如 51413），lazy listen |
 | udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话 120s 过期；agent 用 connected UDP 透本地 |
 | WebUI 登录 | bcrypt（`genhash` 生成，存 `state.json`；空=初装 admin/welcome2ll）+ HS256 JWT（HttpOnly cookie `nt_session` + Bearer 双通道），未登录 `/api/*` 401 |
-| 总览/隧道/日志/配置 | `web/index.html` 原生单页：RTT/流量/在线时长；启用/禁用开关；JSON 推送热更新；最近 500 事件 |
-| 配置热更新 | `POST /api/config {hostname?,agent_id?,proxies}` → `ServerMsg::Config` → agent 原子替换+重 register，不断 WSS；在途 stream 继续 draining |
+| 双 WebUI | server `web/index.html`（总览/隧道表单/日志）+ agent `--web` 本地页（上行状态/只读隧道/改口令），同视觉 token，深色模式 |
+| 期望态（server 为准）| `desired.toml`（`[[agents.<hostname]]]`，结构同 ProxyConfig）→ WebUI `GET/POST /api/desired/:hostname` 增删改 → 在线即下发 `Config`，离线 register 时覆盖+回推同步；agent 本地 proxies 忽略 |
 | 多 agent | domain/port → agent 列表轮询；`state.json` 落盘 totals+password_hash（30s + 断线时） |
 
 ## 测试
 
 ```bash
-cargo test            # 14 单元（帧/路由/XFP/JWT/state） + 3 e2e（http+XFP+鉴权 / tcp透传 / udp+热更新+toggle404）
+cargo test            # 17 单元（帧/路由/XFP/JWT/state/期望态/校验） + 5 e2e
 ```
 
 e2e 用 `CARGO_BIN_EXE_neutrino` 起真 server/agent 子进程（`kill_on_drop`，无残留），随机端口，
 覆盖：Host 路由、未知域名 404、XFP 注入、401 门禁、cookie 颁发、tcp 回声、udp 回声、
-`POST /api/config` 清空推送、`toggle` 不存在隧道 404。
+`POST /api/config` 清空推送、`toggle` 不存在隧道 404、WebUI 建隧道即时打通+落盘、
+agent 本地错误配置被期望态覆盖（含回推同步本地路由表）。
 
 ## 本地验证
 
 ```bash
 cargo build
-./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2ll &
-./target/debug/neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml.example &
+./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2ll --desired ./data/desired.toml &
+./target/debug/neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml.example --web 127.0.0.1:8080 &
+# 隧道在 server WebUI 里建（/ → 隧道 → +新增隧道），agent 无需配 proxies
 curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7080/   # 透到 agent 本地
-open http://127.0.0.1:7440/                                # WebUI
+open http://127.0.0.1:7440/                                # server WebUI
+open http://127.0.0.1:8080/                                # agent 本地 WebUI（默认 admin/neutrino123）
 ```
 
 ## 部署到 natproxy（server）

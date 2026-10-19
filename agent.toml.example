@@ -1,17 +1,7 @@
+# agent 上线配置。隧道以 server 的 desired.toml 为准，此处 proxies 仅兼容保留（有值会被忽略）。
 hostname = "minipc7s"
 token = "welcome2ll"
 
-[[proxies]]
-name = "gogs-web-nat"
-type = "http"
-local_ip = "172.28.0.50"
-local_port = 3000
-domains = ["git.nat.kkito.cn"]
-set_x_forwarded_proto = "https"
-
-[[proxies]]
-name = "transmission-web"
-type = "http"
-local_ip = "172.28.0.10"
-local_port = 9091
-domains = ["tm.nat.kkito.cn"]
+# 启动本地 WebUI（可选）：
+# neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml \
+#   --web 127.0.0.1:8080 --web-user admin --web-pass neutrino123

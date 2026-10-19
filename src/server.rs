@@ -524,6 +524,11 @@ async fn on_register(s: &S, agent_id: &str, hostname: &str, reported: Vec<ProxyC
     let proxies = resolve_proxies(want.clone(), reported);
     if want.is_some() {
         log_ev(s, format!("agent '{hostname}' desired overlay applied ({} proxies)", proxies.len()));
+        // sync the agent's local routing table: it dials by its own copy,
+        // so push the overlaid list back (agent re-Registers on Config).
+        if let Some(ctl) = s.agents.read().await.get(agent_id).map(|h| h.ctl.clone()) {
+            let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+        }
     }
     apply_proxies_for_agent(s, agent_id, &proxies).await;
     log_ev(
