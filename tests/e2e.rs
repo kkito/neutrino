@@ -28,6 +28,18 @@ struct Env {
     _ag: tokio::process::Child,
 }
 
+/// e2e 子进程输出策略：负向用例（非法 TOML reload 等）会故意触发 server
+/// ERROR 日志，默认吞掉让 `make test` 输出干净；NT_E2E_LOUD=1 时透出排障。
+/// 注意 tracing 默认写 stdout（非 stderr），所以 stdout/stderr 一起吞。
+/// WebUI 日志页（/api/logs 走内存 events）不受影响，照常可查。
+fn e2e_stdio() -> std::process::Stdio {
+    if std::env::var("NT_E2E_LOUD").is_ok() {
+        std::process::Stdio::inherit()
+    } else {
+        std::process::Stdio::null()
+    }
+}
+
 async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> Env {
     let ws_port = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
@@ -47,6 +59,8 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
     }
     let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
     let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
         .args([
             "server",
             "--listen",
@@ -63,6 +77,8 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
         .unwrap();
     wait_for(&format!("127.0.0.1:{ws_port}")).await;
     let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
         .args([
             "agent",
             "--server",
@@ -426,6 +442,8 @@ async fn e2e_agent_webui_upstream_edit_redials() {
     let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
     let web_addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
         .args([
             "agent",
             "--server",
@@ -724,6 +742,8 @@ async fn desired_reload_from_file() {
     tokio::fs::write(&desired_path, "").await.unwrap(); // 初始空文件
     let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
     let mut srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
         .args([
             "server",
             "--listen",
@@ -740,6 +760,8 @@ async fn desired_reload_from_file() {
         .unwrap();
     wait_for(&format!("127.0.0.1:{ws_port}")).await;
     let mut ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
         .args([
             "agent",
             "--server",
