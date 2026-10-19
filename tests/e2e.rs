@@ -353,6 +353,49 @@ async fn e2e_desired_crud_flows_to_agent() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     // after: flows through
     assert!(http_get_via(&env, "d.e2e.test").await.contains("desired-ok"));
+
+    // basic auth: 配了 basic_auth 后，无口令 401、有口令放行
+    let r = c
+        .post(format!("{}/api/desired/e2e", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"proxies": [
+            {"name": "web", "type": "http", "local_ip": "127.0.0.1",
+             "local_port": bport, "domains": ["d.e2e.test"],
+             "basic_auth": "bob:s3cret"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 无口令 -> 401 + WWW-Authenticate
+    let r401 = reqwest::Client::new()
+        .get(format!("{}/", env.web_base))
+        .header("Host", "d.e2e.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r401.status(), 401);
+    assert!(r401.headers().contains_key("www-authenticate"));
+    // 对口令 -> 放行
+    let ok = reqwest::Client::new()
+        .get(format!("{}/", env.web_base))
+        .header("Host", "d.e2e.test")
+        .basic_auth("bob", Some("s3cret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert!(ok.text().await.unwrap().contains("desired-ok"));
+    // 错口令 -> 401
+    let bad = reqwest::Client::new()
+        .get(format!("{}/", env.web_base))
+        .header("Host", "d.e2e.test")
+        .basic_auth("bob", Some("wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 401);
     // persisted?
     let j: serde_json::Value = c
         .get(format!("{}/api/desired/e2e", env.web_base))

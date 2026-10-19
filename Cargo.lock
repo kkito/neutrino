@@ -1062,15 +1062,17 @@ dependencies = [
 
 [[package]]
 name = "neutrino"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
  "axum-test",
+ "base64 0.22.1",
  "bcrypt",
  "chrono",
  "clap",
  "futures-util",
+ "http",
  "jsonwebtoken",
  "libc",
  "reqwest",

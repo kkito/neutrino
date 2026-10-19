@@ -85,6 +85,7 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 <label id="l-port" class="hidden">公网端口 remote_port</label><input id="f-port" class="hidden" type="number" placeholder="如 2222">
 <label>目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）</label><input id="f-ip" value="127.0.0.1">
 <label>目标端口（agent 本机视角）</label><input id="f-lport" type="number" placeholder="如 80">
+<label>入口 Basic 认证（可选，http 隧道：浏览器先弹框登录才放行；格式 user:pass，transmission 这类无登录页的最合适。留空=不校验）</label><input id="f-basic" placeholder="如 admin:一串随机口令" autocomplete="off">
 <label><input type="checkbox" id="f-en" checked> 启用</label>
 <div class="row" style="margin-top:16px;justify-content:flex-end">
 <button class="btn ghost" onclick="closeForm()">取消</button>
@@ -144,7 +145,7 @@ function typeFields(){
   document.getElementById('f-port').classList.toggle('hidden',isHttp);
 }
 function openForm(){ editing=null; document.getElementById('formtitle').textContent='新增隧道';
-  for(const id of ['f-name','f-dom','f-ip','f-lport']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
   document.getElementById('f-en').checked=true; typeFields();
   document.getElementById('formwrap').classList.remove('hidden'); }
 function closeForm(){ document.getElementById('formwrap').classList.add('hidden'); }
@@ -154,18 +155,21 @@ function editRow(x){ editing=x.name;
   document.getElementById('f-type').value=x.type||'http'; typeFields();
   document.getElementById('f-dom').value=(x.domains||[]).join(',');
   document.getElementById('f-port').value=x.remote_port||'';
+  document.getElementById('f-basic').value=x.basic_auth||'';
   const tgt=(x.target||'').split(':'); document.getElementById('f-ip').value=tgt[0]||'127.0.0.1';
   document.getElementById('f-lport').value=tgt[1]||'';
   document.getElementById('f-en').checked=!!x.enabled;
   document.getElementById('formwrap').classList.remove('hidden'); }
 function curProxy(){
   const t=document.getElementById('f-type').value;
+  const basic=document.getElementById('f-basic').value.trim();
   const p={name:document.getElementById('f-name').value.trim(),type:t,
     local_ip:document.getElementById('f-ip').value.trim()||'127.0.0.1',
     local_port:parseInt(document.getElementById('f-lport').value||'0'),
     domains:t==='http'?document.getElementById('f-dom').value.split(',').map(s=>s.trim()).filter(Boolean):[],
     remote_port:t==='http'?0:parseInt(document.getElementById('f-port').value||'0'),
     enabled:document.getElementById('f-en').checked};
+  if(t==='http'&&basic) p.basic_auth=basic;
   return p;
 }
 async function saveForm(){

@@ -1,5 +1,6 @@
 //! Control + data frame protocol (JSON Text + Binary [stream:u32 BE][payload]).
 use serde::{Deserialize, Serialize};
+use http;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -64,8 +65,35 @@ pub struct ProxyConfig {
     pub remote_port: u16,
     #[serde(default)]
     pub set_x_forwarded_proto: Option<String>,
+    /// http 隧道入口 basic auth：`user:pass` 明文（仅内存+desired.toml 落盘，
+    /// server 在透传前校验，agent 侧不感知）。缺省 None = 不校验。
+    #[serde(default)]
+    pub basic_auth: Option<String>,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+}
+
+/// 校验 http 入口 Authorization: Basic 头。`expected` 为 `user:pass` 明文。
+/// 无 expected（None/空）= 不校验直接放行；有则必须精确匹配。
+pub fn check_basic_auth(headers: &http::HeaderMap, expected: Option<&str>) -> bool {
+    let exp = expected.unwrap_or("").trim();
+    if exp.is_empty() {
+        return true;
+    }
+    let got = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let b64 = match got.strip_prefix("Basic ") {
+        Some(b) => b.trim(),
+        None => return false,
+    };
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    decoded.as_deref() == Some(exp)
 }
 
 /// Encode binary data frame: [stream_id: u32 BE][payload]

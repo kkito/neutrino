@@ -66,6 +66,7 @@ mod tests {
                 domains: vec!["a.test".into()],
                 remote_port: 0,
                 set_x_forwarded_proto: None,
+            basic_auth: None,
                 enabled: true,
             }],
         );

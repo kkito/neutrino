@@ -556,7 +556,9 @@ async fn on_register(s: &S, agent_id: &str, hostname: &str, reported: Vec<ProxyC
 }
 
 // route pickers (LB)
-async fn pick_http(s: &S, host: &str) -> Option<(String, Option<String>)> {
+/// http 入口路由：返回 (agent_id, 隧道配置快照)。快照里带 basic_auth，
+/// 调用方在透传前用 check_basic_auth 校验，不通过直接 401。
+async fn pick_http(s: &S, host: &str) -> Option<(String, crate::proto::ProxyConfig)> {
     // simple round-robin: rotate the candidate vec under write lock
     let aid = {
         let mut dom = s.domains.write().await;
@@ -568,20 +570,20 @@ async fn pick_http(s: &S, host: &str) -> Option<(String, Option<String>)> {
         v.push(aid.clone());
         aid
     };
-    // find xfp for this agent+host
+    // find proxy snapshot for this agent+host (xfp + basic_auth live here)
     let ag = s.agents.read().await;
-    let xfp = ag.get(&aid).and_then(|h| {
+    let proxy = ag.get(&aid).and_then(|h| {
         h.info
             .proxies
             .iter()
             .find(|p| {
                 p.enabled && p.domains.iter().any(|d| d.eq_ignore_ascii_case(host))
             })
-            .and_then(|p| p.set_x_forwarded_proto.clone())
-    });
+            .cloned()
+    })?;
     // only return live agents
     if ag.contains_key(&aid) {
-        Some((aid, xfp))
+        Some((aid, proxy))
     } else {
         None
     }
@@ -668,13 +670,24 @@ async fn fallback_http_ingress(
     // 分流判定见 route_fallback：注意不能给 `/` 注册精确路由，否则
     // curl/e2e 常用的 `GET / + Host: 隧道域名` 会被 WebUI 抢走。
     let tunneled = pick_http(&s, &host).await;
-    let (aid, xfp) = match route_fallback(&host, tunneled.is_some()) {
+    let (aid, proxy) = match route_fallback(&host, tunneled.is_some()) {
         FallbackRoute::Tunnel => tunneled.unwrap(),
         FallbackRoute::WebUi => return index_page().await.into_response(),
         FallbackRoute::NotFound => {
             return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response()
         }
     };
+    let xfp = proxy.set_x_forwarded_proto.clone();
+    // http 隧道入口 basic auth：配了 basic_auth 才校验，无 Authorization/错口令直接 401。
+    // 浏览器收到 WWW-Authenticate 会弹登录框；校验在 server 侧做，agent/内网服务无感知。
+    if !crate::proto::check_basic_auth(&parts.headers, proxy.basic_auth.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, format!("Basic realm=\"{}\"", proxy.name))],
+            "auth required\n",
+        )
+            .into_response();
+    }
     // 重建原始请求头字节流（含 XFP 注入），body 拼回去
     let version = match parts.version {
         ::axum::http::Version::HTTP_10 => "HTTP/1.0",
@@ -802,6 +815,7 @@ fn async_stream_lite(
 
 /// 旧独立端口 http_ingress 已并入上面的 axum fallback（同端口 Host 路由）。
 /// 保留此函数体作裸 TCP 透传参考，当前不再被调用。
+/// 注意：basic auth 校验只在 axum fallback 生效；此旧路径若重新启用，需补同样校验。
 #[allow(dead_code)]
 async fn http_ingress(bind: &str, s: S) -> anyhow::Result<()> {
     let lis = TcpListener::bind(bind).await?;
@@ -817,11 +831,12 @@ async fn http_ingress(bind: &str, s: S) -> anyhow::Result<()> {
             };
             buf.truncate(n);
             let host = extract_host(&String::from_utf8_lossy(&buf));
-            let Some((aid, xfp)) = pick_http(&s, &host).await else {
+            let Some((aid, proxy)) = pick_http(&s, &host).await else {
                 let r = "HTTP/1.1 404 Not Found\r\ncontent-length: 15\r\nconnection: close\r\n\r\nno such tunnel\n";
                 let _ = inbound.write_all(r.as_bytes()).await;
                 return;
             };
+            let xfp = proxy.set_x_forwarded_proto.clone();
             let head = match xfp {
                 Some(p) => inject_xfp(&buf, &p),
                 None => buf,
@@ -1366,6 +1381,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn basic_auth_gate() {
+        use crate::proto::check_basic_auth;
+        fn h(auth: Option<&str>) -> http::HeaderMap {
+            let mut m = http::HeaderMap::new();
+            if let Some(a) = auth {
+                m.insert(http::header::AUTHORIZATION, a.parse().unwrap());
+            }
+            m
+        }
+        // 没配 = 直接放行
+        assert!(check_basic_auth(&h(None), None));
+        assert!(check_basic_auth(&h(None), Some("")));
+        // 配了：无头/错 scheme/错口令都拒绝，只有精确 user:pass 放行
+        let exp = Some("admin:s3cret");
+        assert!(!check_basic_auth(&h(None), exp));
+        assert!(!check_basic_auth(&h(Some("Bearer xxx")), exp));
+        assert!(!check_basic_auth(&h(Some("Basic YWRtaW46d3Jvbmc=")), exp)); // admin:wrong
+        assert!(check_basic_auth(&h(Some("Basic YWRtaW46czNjcmV0")), exp)); // admin:s3cret
+        // serde 兼容：老配置没 basic_auth 字段也能解析，默认 None
+        let p: crate::proto::ProxyConfig = serde_json::from_str(
+            r#"{"name":"w","type":"http","local_ip":"127.0.0.1","local_port":80,"domains":["a.test"]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.basic_auth, None);
+    }
+
+    #[test]
     fn desired_validation() {
         let ok_http = ProxyConfig {
             name: "w".into(),
@@ -1375,6 +1417,7 @@ mod tests {
             domains: vec!["a.test".into()],
             remote_port: 0,
             set_x_forwarded_proto: None,
+            basic_auth: None,
             enabled: true,
         };
         assert!(validate_proxy(&ok_http).is_ok());
@@ -1402,6 +1445,7 @@ mod tests {
             domains: vec![],
             remote_port: 0,
             set_x_forwarded_proto: None,
+            basic_auth: None,
             enabled: true,
         }];
         assert_eq!(resolve_proxies(Some(want.clone()), vec![]).len(), 1);
@@ -1548,6 +1592,7 @@ mod tests {
             domains: vec!["a.test".into()],
             remote_port: 0,
             set_x_forwarded_proto: None,
+            basic_auth: None,
             enabled: true,
         };
         // 已收敛：不再 push

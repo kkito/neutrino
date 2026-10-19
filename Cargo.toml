@@ -1,6 +1,6 @@
 [package]
 name = "neutrino"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
+http = "1"
+base64 = "0.22"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tungstenite = "0.26"
 futures-util = "0.3"
