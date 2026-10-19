@@ -632,11 +632,15 @@ async fn fallback_http_ingress(
         .next()
         .unwrap_or("")
         .to_lowercase();
-    // `/` 归属判定：隧道域名 -> 透传给 agent；未知点分域名 -> 404；
-    // 否则（裸 IP / 无 Host）-> WebUI。注意 curl/e2e 常用 `GET / + Host: 隧道域名`，
-    // 故不能给 `/` 注册精确路由，统一走 fallback 按 Host 分流。
+    // `/` 归属判定：隧道域名 -> 透传给 agent；未知域名 -> 404；
+    // 裸 IP/localhost/空 Host -> WebUI（注意 127.0.0.1 本身带点，不能按有无点判断）。
+    // 注意 curl/e2e 常用 `GET / + Host: 隧道域名`，故不能给 `/` 注册精确路由，
+    // 统一走 fallback 按 Host 分流。
     let tunneled = pick_http(&s, &host).await;
     let Some((aid, xfp)) = tunneled else {
+        if host.is_empty() || host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+            return index_page().await.into_response();
+        }
         if host.contains('.') {
             return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response();
         }
