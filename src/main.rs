@@ -22,6 +22,9 @@ enum Cmd {
         http_in: String,
         #[arg(long, default_value = "./data")]
         data: String,
+        /// desired tunnels file (hostname -> proxies)
+        #[arg(long, default_value = "./data/desired.toml")]
+        desired: String,
         /// pre-shared token (or env NEUTRINO_TOKEN)
         #[arg(long, default_value = "welcome2ll")]
         token: String,
@@ -49,11 +52,12 @@ async fn main() -> anyhow::Result<()> {
             listen,
             http_in,
             data,
+            desired,
             token,
         } => {
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token).await
+            server::run(&listen, &http_in, &data, &token, &desired).await
         }
         Cmd::Agent { server, config } => agent::run(&server, &config).await,
         Cmd::Genhash { password } => {

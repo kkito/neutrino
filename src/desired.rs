@@ -37,6 +37,9 @@ impl DesiredStore {
     pub fn get(&self, host: &str) -> Vec<ProxyConfig> {
         self.data.get(host).cloned().unwrap_or_default()
     }
+    pub fn all(&self) -> HashMap<String, Vec<ProxyConfig>> {
+        self.data.clone()
+    }
     pub fn set(&mut self, host: String, v: Vec<ProxyConfig>) {
         self.data.insert(host, v);
     }

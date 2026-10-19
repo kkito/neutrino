@@ -58,6 +58,50 @@ struct Shared {
     outbox: RwLock<HashMap<String, mpsc::UnboundedSender<(u32, Vec<u8>)>>>,
     totals: RwLock<HashMap<String, (u64, u64)>>, // hostname -> (rx,tx) persisted
     data_dir: String,
+    desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,
+    desired_path: String,
+}
+
+/// If server holds desired proxies for this hostname, they win over what the
+/// agent reported; otherwise fall back to the reported list.
+fn resolve_proxies(desired: Option<Vec<ProxyConfig>>, reported: Vec<ProxyConfig>) -> Vec<ProxyConfig> {
+    desired.unwrap_or(reported)
+}
+
+/// Replace one agent's routes (domains + ports + info) with `proxies`.
+async fn apply_proxies_for_agent(s: &S, aid: &str, proxies: &[ProxyConfig]) {
+    {
+        let mut dom = s.domains.write().await;
+        dom.retain(|_, v| !v.contains(&aid.to_string()));
+        for p in proxies.iter().filter(|p| p.enabled) {
+            for d in &p.domains {
+                let e = dom.entry(d.to_lowercase()).or_default();
+                if !e.contains(&aid.to_string()) {
+                    e.push(aid.to_string());
+                }
+            }
+        }
+    }
+    {
+        let mut tp = s.tcp_ports.write().await;
+        tp.retain(|_, v| !v.contains(&aid.to_string()));
+        for p in proxies.iter().filter(|p| p.enabled && p.remote_port > 0) {
+            let e = tp.entry(p.remote_port).or_default();
+            if !e.contains(&aid.to_string()) {
+                e.push(aid.to_string());
+            }
+        }
+    }
+    if let Some(h) = s.agents.write().await.get_mut(aid) {
+        h.info.proxies = proxies.to_vec();
+    }
+    for p in proxies.iter().filter(|p| p.enabled && p.remote_port > 0) {
+        if p.ptype == "udp" {
+            ensure_udp_listener(s, p.remote_port).await;
+        } else {
+            ensure_tcp_listener(s, p.remote_port).await;
+        }
+    }
 }
 
 type S = Arc<Shared>;
@@ -223,16 +267,24 @@ async fn save_state(s: &S) {
 }
 
 // ================= run =================
-pub async fn run(listen: &str, http_in: &str, data: &str, token: &str) -> anyhow::Result<()> {
+pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: &str) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     let ps = load_state(data).await;
+    let ds = crate::desired::DesiredStore::load(desired);
     let shared: S = Arc::new(Shared {
         password_hash: RwLock::new(ps.password_hash),
         totals: RwLock::new(ps.totals),
         jwt_secret: uuid::Uuid::new_v4().to_string(),
         data_dir: data.to_string(),
+        desired: RwLock::new(HashMap::new()),
+        desired_path: desired.to_string(),
         ..Default::default()
     });
+    // fill desired from store
+    {
+        let all = ds.all();
+        *shared.desired.write().await = all;
+    }
     let token = Arc::new(token.to_string());
     {
         let s = shared.clone();
@@ -466,44 +518,13 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     log_ev(&s, format!("agent '{hostname}' disconnected"));
 }
 
-async fn on_register(s: &S, agent_id: &str, hostname: &str, proxies: Vec<ProxyConfig>) {
-    if let Some(h) = s.agents.write().await.get_mut(agent_id) {
-        h.info.proxies = proxies.clone();
+async fn on_register(s: &S, agent_id: &str, hostname: &str, reported: Vec<ProxyConfig>) {
+    let want = s.desired.read().await.get(hostname).cloned();
+    let proxies = resolve_proxies(want.clone(), reported);
+    if want.is_some() {
+        log_ev(s, format!("agent '{hostname}' desired overlay applied ({} proxies)", proxies.len()));
     }
-    {
-        let mut dom = s.domains.write().await;
-        for p in proxies.iter().filter(|p| p.enabled) {
-            for d in &p.domains {
-                let e = dom.entry(d.to_lowercase()).or_default();
-                if !e.contains(&agent_id.to_string()) {
-                    e.push(agent_id.to_string());
-                }
-            }
-        }
-    }
-    // tcp/https/udp remote ports: claim + lazy listen
-    let mut want_tcp = vec![];
-    let mut want_udp = vec![];
-    {
-        let mut tp = s.tcp_ports.write().await;
-        for p in proxies.iter().filter(|p| p.enabled && p.remote_port > 0) {
-            let e = tp.entry(p.remote_port).or_default();
-            if !e.contains(&agent_id.to_string()) {
-                e.push(agent_id.to_string());
-            }
-            if p.ptype == "udp" {
-                want_udp.push(p.remote_port);
-            } else {
-                want_tcp.push(p.remote_port);
-            }
-        }
-    }
-    for port in want_tcp {
-        ensure_tcp_listener(s, port).await;
-    }
-    for port in want_udp {
-        ensure_udp_listener(s, port).await;
-    }
+    apply_proxies_for_agent(s, agent_id, &proxies).await;
     log_ev(
         s,
         format!("agent '{hostname}' registered {} proxies", proxies.len()),
@@ -988,40 +1009,7 @@ async fn api_config(
         let _ = ctl.send(ServerMsg::Config {
             proxies: r.proxies.clone(),
         });
-        // optimistic local update + re-route (full replace for that agent)
-        {
-            let mut dom = s.domains.write().await;
-            dom.retain(|_, v| !v.contains(aid));
-            for p in r.proxies.iter().filter(|p| p.enabled) {
-                for d in &p.domains {
-                    let e = dom.entry(d.to_lowercase()).or_default();
-                    if !e.contains(aid) {
-                        e.push(aid.clone());
-                    }
-                }
-            }
-        }
-        {
-            let mut tp = s.tcp_ports.write().await;
-            tp.retain(|_, v| !v.contains(aid));
-            for p in r.proxies.iter().filter(|p| p.enabled && p.remote_port > 0) {
-                let e = tp.entry(p.remote_port).or_default();
-                if !e.contains(aid) {
-                    e.push(aid.clone());
-                }
-            }
-        }
-        if let Some(hh) = s.agents.write().await.get_mut(aid) {
-            hh.info.proxies = r.proxies.clone();
-        }
-        // lazy-listen new ports
-        for p in r.proxies.iter().filter(|p| p.enabled && p.remote_port > 0) {
-            if p.ptype == "udp" {
-                ensure_udp_listener(&s, p.remote_port).await;
-            } else {
-                ensure_tcp_listener(&s, p.remote_port).await;
-            }
-        }
+        apply_proxies_for_agent(&s, aid, &r.proxies).await;
         log_ev(&s, format!("config pushed to '{hostname}' ({} proxies)", r.proxies.len()));
     }
     Json(serde_json::json!({"ok": true, "pushed": targets.len()})).into_response()
@@ -1074,19 +1062,7 @@ async fn api_toggle(
     let _ = ctl.send(ServerMsg::Config {
         proxies: proxies.clone(),
     });
-    // re-route like api_config
-    {
-        let mut dom = s.domains.write().await;
-        dom.retain(|_, v| !v.contains(&aid));
-        for p in proxies.iter().filter(|p| p.enabled) {
-            for d in &p.domains {
-                let e = dom.entry(d.to_lowercase()).or_default();
-                if !e.contains(&aid) {
-                    e.push(aid.clone());
-                }
-            }
-        }
-    }
+    apply_proxies_for_agent(&s, &aid, &proxies).await;
     log_ev(&s, format!("tunnel {agent}/{name} enabled={}", r.enabled));
     Json(serde_json::json!({"ok": true})).into_response()
 }
@@ -1094,6 +1070,23 @@ async fn api_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_prefers_desired() {
+        let want = vec![ProxyConfig {
+            name: "d".into(),
+            ptype: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 1,
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            enabled: true,
+        }];
+        assert_eq!(resolve_proxies(Some(want.clone()), vec![]).len(), 1);
+        assert_eq!(resolve_proxies(Some(want.clone()), vec![])[0].name, "d");
+        assert!(resolve_proxies(None, vec![]).is_empty());
+    }
 
     #[test]
     fn host_extract() {
