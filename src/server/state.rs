@@ -48,6 +48,16 @@ pub(crate) struct Shared {
 
 pub(crate) fn log_ev(s: &S, e: String) {
     tracing::info!("{e}");
+    push_ev(s, e);
+}
+
+/// 失败路径专用：单次 ERROR + 入 events，避免 log_ev(info) + error 双行刷屏。
+pub(crate) fn log_ev_err(s: &S, e: String) {
+    tracing::error!("{e}");
+    push_ev(s, e);
+}
+
+fn push_ev(s: &S, e: String) {
     if let Ok(mut v) = s.events.try_write() {
         v.push(format!("{} {e}", chrono::Utc::now().format("%m-%d %H:%M:%S")));
         if v.len() > 500 {

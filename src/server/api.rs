@@ -1,7 +1,7 @@
 //! server WebUI API：login/overview/tunnels/logs/config/desired/toggle。
 use crate::common::proto::*;
 use super::auth::{auth_ok, mint_jwt, unauthorized};
-use super::state::{apply_proxies_for_agent, log_ev, AgentInfo, S};
+use super::state::{apply_proxies_for_agent, log_ev, log_ev_err, AgentInfo, S};
 use axum::{extract::{Path, State}, http::{header, HeaderMap, StatusCode}, response::{Html, IntoResponse, Json}};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
@@ -280,8 +280,7 @@ pub(crate) async fn api_desired_reload(
     let text = match std::fs::read_to_string(&s.desired_path) {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("desired reload failed ({}): {e}", s.desired_path);
-            log_ev(&s, format!("desired reload failed: {e}"));
+            log_ev_err(&s, format!("desired reload failed: {e}"));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"ok": false, "reason": e.to_string()})),
@@ -292,8 +291,7 @@ pub(crate) async fn api_desired_reload(
     let (fresh, skipped) = match parse_desired_text(&text) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("desired reload failed ({}): {e}", s.desired_path);
-            log_ev(&s, format!("desired reload failed: {e}"));
+            log_ev_err(&s, format!("desired reload failed: {e}"));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"ok": false, "reason": e})),
