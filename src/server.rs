@@ -323,6 +323,7 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
         .route("/api/logs", get(api_logs))
         .route("/api/config", post(api_config))
         .route("/api/tunnels/:agent/:name/enabled", post(api_toggle))
+        .route("/api/desired/:hostname", get(api_desired_get).post(api_desired_set))
         .with_state((shared, token));
     let lis = TcpListener::bind(listen).await?;
     tracing::info!("server listening ws+webui on {listen}");
@@ -1015,6 +1016,96 @@ async fn api_config(
     Json(serde_json::json!({"ok": true, "pushed": targets.len()})).into_response()
 }
 
+/// Validate one proxy entry from the desired-CRUD form.
+fn validate_proxy(p: &ProxyConfig) -> Result<(), String> {
+    if p.name.is_empty() {
+        return Err("name required".into());
+    }
+    match p.ptype.as_str() {
+        "http" => {
+            if p.domains.is_empty() {
+                return Err("http proxy requires domains".into());
+            }
+            Ok(())
+        }
+        "tcp" | "https" | "udp" => {
+            if p.remote_port == 0 {
+                return Err(format!("{} proxy requires remote_port", p.ptype));
+            }
+            Ok(())
+        }
+        t => Err(format!("unknown type '{t}'")),
+    }
+}
+
+#[derive(Deserialize)]
+struct DesiredReq {
+    proxies: Vec<ProxyConfig>,
+}
+
+/// Read desired proxies for one hostname.
+async fn api_desired_get(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+    Path(hostname): Path<String>,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let proxies = s.desired.read().await.get(&hostname).cloned().unwrap_or_default();
+    Json(serde_json::json!({"proxies": proxies})).into_response()
+}
+
+/// Replace desired proxies: persist to file, apply to routing, push if online.
+async fn api_desired_set(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+    Path(hostname): Path<String>,
+    Json(r): Json<DesiredReq>,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    for p in &r.proxies {
+        if let Err(e) = validate_proxy(p) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": e}))).into_response();
+        }
+    }
+    // persist first; on write failure keep memory untouched
+    {
+        let mut st = crate::desired::DesiredStore::load(&s.desired_path);
+        for (hh, pp) in s.desired.read().await.iter() {
+            if hh != &hostname {
+                st.set(hh.clone(), pp.clone());
+            }
+        }
+        st.set(hostname.clone(), r.proxies.clone());
+        let probe = format!("{}.tmp", st.path);
+        if let Err(e) = std::fs::write(&probe, b"probe") {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": e.to_string()}))).into_response();
+        }
+        let _ = std::fs::remove_file(&probe);
+        st.save();
+    }
+    s.desired.write().await.insert(hostname.clone(), r.proxies.clone());
+    let targets: Vec<(String, mpsc::UnboundedSender<ServerMsg>)> = {
+        s.agents.read().await.values()
+            .filter(|hh| hh.info.hostname == hostname)
+            .map(|hh| (hh.info.agent_id.clone(), hh.ctl.clone()))
+            .collect()
+    };
+    let mut pushed = 0;
+    for (aid, ctl) in &targets {
+        let _ = ctl.send(ServerMsg::Config { proxies: r.proxies.clone() });
+        apply_proxies_for_agent(&s, aid, &r.proxies).await;
+        pushed += 1;
+    }
+    log_ev(&s, format!("desired set for '{hostname}' ({} proxies, pushed {pushed})", r.proxies.len()));
+    Json(serde_json::json!({"ok": true, "pushed": pushed})).into_response()
+}
+
 #[derive(Deserialize)]
 struct ToggleReq {
     enabled: bool,
@@ -1070,6 +1161,33 @@ async fn api_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desired_validation() {
+        let ok_http = ProxyConfig {
+            name: "w".into(),
+            ptype: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            domains: vec!["a.test".into()],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            enabled: true,
+        };
+        assert!(validate_proxy(&ok_http).is_ok());
+        let mut bad = ok_http.clone();
+        bad.domains.clear();
+        assert!(validate_proxy(&bad).is_err());
+        let mut tcp = ok_http.clone();
+        tcp.ptype = "tcp".into();
+        tcp.domains.clear();
+        assert!(validate_proxy(&tcp).is_err());
+        tcp.remote_port = 2222;
+        assert!(validate_proxy(&tcp).is_ok());
+        let mut unk = tcp.clone();
+        unk.ptype = "socks".into();
+        assert!(validate_proxy(&unk).is_err());
+    }
 
     #[test]
     fn resolve_prefers_desired() {
