@@ -48,7 +48,7 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <button id="nav-set" onclick="tab('set')">设置</button></nav>
 <main class="main">
 <section id="sec-ov">
-<div class="topbar"><h2>上行状态</h2><button class="btn ghost" onclick="refresh()">刷新</button></div>
+<div class="topbar"><h2>上行状态</h2><button class="btn ghost" onclick="reconnect()">立即重连</button><button class="btn ghost" onclick="refresh()">刷新</button></div>
 <div class="card"><dl class="kv" id="stat"></dl></div>
 </section>
 <section id="sec-tn" class="hidden">
@@ -58,10 +58,12 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <section id="sec-set" class="hidden">
 <div class="topbar"><h2>设置</h2></div>
 <div class="card" style="max-width:440px">
-<p style="color:var(--mut);font-size:13px">上行 server 地址修改后需重启 agent 生效；管理口令即时生效。</p>
-<label>上行 server 地址（当前）</label><input id="s-server" readonly>
-<label>管理口令（留空=不改）</label><input id="s-pass" type="password" placeholder="新口令">
-<div style="margin-top:16px;text-align:right"><button class="btn" onclick="save()">保存</button></div>
+<p style="color:var(--mut);font-size:13px">上行配置保存后即时重连并落盘到 agent.toml；token 留空=不改。</p>
+<label>上行 server 地址（ws(s)://host:port/ws）</label><input id="s-server" placeholder="ws://127.0.0.1:7440/ws">
+<label>hostname（server 侧期望态用此名下发）</label><input id="s-host" placeholder="如 minipc7s">
+<label>隧道 token（留空=不改）</label><input id="s-token" type="password" placeholder="与 server --token 一致" autocomplete="new-password">
+<label>管理口令（留空=不改）</label><input id="s-pass" type="password" placeholder="新口令" autocomplete="new-password">
+<div style="margin-top:16px;text-align:right"><button class="btn" onclick="save()">保存并重连</button></div>
 </div>
 </section>
 </main></div>
@@ -89,11 +91,14 @@ async function refresh(){
   const on=s.online;
   document.getElementById('stat').innerHTML=
     `<dt>上行</dt><dd>${s.server_url||'-'}</dd>`+
+    `<dt>hostname</dt><dd>${s.hostname||'-'}</dd>`+
     `<dt>连接</dt><dd>${on?'<span class="badge b-ok">在线</span>':'<span class="badge b-warn">连接中…</span>'}</dd>`+
     `<dt>RTT</dt><dd>${s.rtt_ms??'-'} ms</dd>`+
     `<dt>重连次数</dt><dd>${s.reconnects??0}</dd>`+
+    (s.last_error?`<dt>最近错误</dt><dd style="color:var(--danger)">${s.last_error}</dd>`:'')+
     `<dt>生效隧道</dt><dd>${(s.proxies||[]).length} 条</dd>`;
-  document.getElementById('s-server').value=s.server_url||'';
+  if(document.activeElement!==document.getElementById('s-server')) document.getElementById('s-server').value=s.server_url||'';
+  if(document.activeElement!==document.getElementById('s-host')) document.getElementById('s-host').value=s.hostname||'';
   document.getElementById('tunnels').innerHTML='<tr><th>name</th><th>type</th><th>目标</th><th>domains/ports</th><th>状态</th></tr>'+
     (s.proxies||[]).map(p=>{
       const where=`${(p.domains||[]).join(',')}${p.remote_port?':'+p.remote_port:''}`;
@@ -102,9 +107,19 @@ async function refresh(){
   }catch(e){}
 }
 async function save(){
+  const body={};
+  const sv=document.getElementById('s-server').value.trim();
+  const hn=document.getElementById('s-host').value.trim();
+  const tk=document.getElementById('s-token').value;
   const np=document.getElementById('s-pass').value;
-  const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify({new_pass:np||undefined})});
-  if(r.ok){ toast('已保存'+((await r.json()).note||'')); document.getElementById('s-pass').value=''; }
-  else toast('保存失败',true);
+  if(sv) body.server_url=sv; if(hn) body.hostname=hn; if(tk) body.token=tk; if(np) body.new_pass=np;
+  const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
+  if(r.ok){ const j=await r.json(); toast('已保存 '+ (j.note||''));
+    document.getElementById('s-token').value=''; document.getElementById('s-pass').value=''; refresh(); }
+  else { let m=r.status; try{ m=(await r.json()).reason||m; }catch(e){} toast('保存失败: '+m,true); }
+}
+async function reconnect(){
+  const r=await fetch('/api/reconnect',{method:'POST',headers:hdrs()});
+  toast(r.ok?'已发起重连':'重连失败',!r.ok); if(r.ok) refresh();
 }
 </script></body></html>

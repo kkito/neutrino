@@ -10,12 +10,23 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AgentFileConfig {
     hostname: String,
+    #[serde(default)]
     token: String,
     #[serde(default)]
+    server: String,
+    #[serde(default)]
     proxies: Vec<ProxyConfig>,
+}
+
+/// Hot-updatable upstream dial config (WebUI can change without restart).
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub server_url: String,
+    pub hostname: String,
+    pub token: String,
 }
 
 pub use crate::agent_web::AgentStatus;
@@ -37,16 +48,31 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     if !cfg.proxies.is_empty() {
         tracing::warn!("local proxies in {config_path} ignored: server is source of truth");
     }
+    // CLI --server wins only when the file has no `server` key (keeps old
+    // behaviour); afterwards WebUI edits rewrite the file and take effect.
+    let initial_url = if cfg.server.trim().is_empty() {
+        url.to_string()
+    } else {
+        cfg.server.clone()
+    };
+    let upstream = Arc::new(RwLock::new(Upstream {
+        server_url: initial_url.clone(),
+        hostname: cfg.hostname.clone(),
+        token: cfg.token.clone(),
+    }));
     tracing::info!(
-        "agent '{}' -> {url} ({} proxies)",
+        "agent '{}' -> {initial_url} ({} proxies)",
         cfg.hostname,
         cfg.proxies.len()
     );
     // shared status for local WebUI
     let status = Arc::new(RwLock::new(crate::agent_web::AgentStatus {
-        server_url: url.to_string(),
+        server_url: initial_url.clone(),
+        hostname: cfg.hostname.clone(),
         ..Default::default()
     }));
+    // bumped by WebUI to force an immediate redial (settings save / button)
+    let (redial_tx, mut redial_rx) = tokio::sync::watch::channel(0u64);
     if !web.is_empty() {
         // persist web password hash under agent data file
         let data_path = format!("{config_path}.webpass");
@@ -58,51 +84,82 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
                 h
             }
         };
-        let st = status.clone();
         let w = web.to_string();
         let u = web_user.to_string();
         println!("agent local webui: http://{w}/ (user {u})");
         let ph = Arc::new(RwLock::new(hash));
-        tokio::spawn(async move {
-            if let Err(e) = crate::agent_web::serve(&w, u, ph, data_path, st).await {
-                tracing::error!("agent webui died: {e:#}");
-            }
-        });
+        tokio::spawn(crate::agent_web::serve(crate::agent_web::ServeArgs {
+            bind: w,
+            user: u,
+            pass_hash: ph,
+            data_path,
+            status: status.clone(),
+            upstream: upstream.clone(),
+            config_path: config_path.to_string(),
+            redial: redial_tx.clone(),
+        }));
     }
     let mut backoff = vec![1u64, 2, 5, 10, 30, 60];
     let mut reconnects = 0u64;
+    // abort handle for the live session; WebUI redial aborts it so the loop
+    // immediately redials with the new upstream (no waiting, no restart)
+    let cur: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // background watcher: any redial bump aborts the live session
+    {
+        let cur2 = cur.clone();
+        tokio::spawn(async move {
+            let mut rx = redial_rx;
+            // skip the initial value; only future bumps count
+            let mut seen = *rx.borrow_and_update();
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let v = *rx.borrow_and_update();
+                if v != seen {
+                    seen = v;
+                    if let Some(h) = cur2.lock().await.take() {
+                        h.abort();
+                    }
+                }
+            }
+        });
+    }
     loop {
-        match session(url, &cfg, status.clone()).await {
-            Ok(_) => {
-                tracing::info!("session ended, reconnect in 2s");
-                reconnects += 1;
-                {
-                    let mut st = status.write().await;
-                    st.online = false;
-                    st.reconnects = reconnects;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            Err(e) => {
-                let s = backoff.first().cloned().unwrap_or(60);
-                if backoff.len() > 1 {
-                    backoff.remove(0);
-                }
-                reconnects += 1;
-                {
-                    let mut st = status.write().await;
-                    st.online = false;
-                    st.reconnects = reconnects;
-                }
-                tracing::warn!("session error: {e:#}; retry in {s}s");
-                tokio::time::sleep(std::time::Duration::from_secs(s)).await;
-            }
+        // snapshot hot-updatable dial config
+        let up = upstream.read().await.clone();
+        {
+            let mut st = status.write().await;
+            st.server_url = up.server_url.clone();
+            st.hostname = up.hostname.clone();
         }
+        // run session in a task so the watcher can abort it on redial
+        let sess = tokio::spawn(session(up, cfg.clone(), status.clone()));
+        *cur.lock().await = Some(sess.abort_handle());
+        let err = match sess.await {
+            Ok(Ok(())) => String::from("closed"),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(j) if j.is_cancelled() => String::from("redial requested"),
+            Err(j) => format!("task: {j}"),
+        };
+        *cur.lock().await = None;
+        reconnects += 1;
+        {
+            let mut st = status.write().await;
+            st.online = false;
+            st.reconnects = reconnects;
+            st.last_error = Some(err);
+        }
+        // immediate redial (watcher already aborted); just reset backoff
+        backoff = vec![1u64, 2, 5, 10, 30, 60];
+        // small debounce so rapid double-clicks don't spin
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 }
 
-async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::agent_web::AgentStatus>>) -> anyhow::Result<()> {
-    let (ws, _) = connect_async(url).await?;
+async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::agent_web::AgentStatus>>) -> anyhow::Result<()> {
+    let (ws, _) = connect_async(up.server_url.as_str()).await?;
     tracing::info!("ws connected");
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -125,11 +182,11 @@ async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::age
             .send(Message::Text(serde_json::to_string(m).unwrap().into()))
             .map_err(|e| anyhow::anyhow!("{e}"))
     };
-    // hello
+    // hello (hot-updatable hostname/token from WebUI)
     send(&ClientMsg::Hello {
-        hostname: cfg.hostname.clone(),
+        hostname: up.hostname.clone(),
         version: VERSION.into(),
-        token: cfg.token.clone(),
+        token: up.token.clone(),
     })?;
     // welcome (15s)
     let welcome: ServerMsg = match tokio::time::timeout(
@@ -152,6 +209,7 @@ async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::age
     {
         let mut st = status.write().await;
         st.online = true;
+        st.last_error = None;
     }
     send(&ClientMsg::Register {
         proxies: cfg.proxies.clone(),
@@ -184,7 +242,12 @@ async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::age
         let msg = msg?;
         match msg {
             Message::Text(t) => match serde_json::from_str::<ServerMsg>(&t) {
-                Ok(ServerMsg::Pong { .. }) => {}
+                Ok(ServerMsg::Pong { ts }) => {
+                    // server echoes our Ping ts (unix secs); coarse RTT is fine
+                    let now = chrono::Utc::now().timestamp();
+                    let ms = ((now - ts).max(0) as u64).saturating_mul(1000);
+                    status.write().await.rtt_ms = Some(ms);
+                }
                 Ok(ServerMsg::Open {
                     stream,
                     kind,
@@ -199,6 +262,11 @@ async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::age
                             tracing::warn!("open stream {stream} failed: {e:#}");
                         }
                     });
+                }
+                Ok(ServerMsg::Ping { ts }) => {
+                    let _ = out_tx.send(Message::Text(
+                        serde_json::to_string(&ClientMsg::Pong { ts }).unwrap().into(),
+                    ));
                 }
                 Ok(ServerMsg::Close { stream, .. }) => {
                     ctx.streams.write().await.remove(&stream);
