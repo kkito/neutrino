@@ -24,10 +24,17 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     let ds = crate::common::desired::DesiredStore::load(desired);
     // 公网端口：--listen 尾段端口，供 HTTP fallback 连接行 public_port 用
     let public_port: u16 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    // jwt_secret 持久化：重启复用，登录 cookie 不掉（旧 state 无此字段则生成并落盘）。
+    let fresh_secret = ps.jwt_secret.is_empty();
+    let jwt_secret = if fresh_secret {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        ps.jwt_secret
+    };
     let shared: S = Arc::new(Shared {
         password_hash: RwLock::new(ps.password_hash),
         totals: RwLock::new(ps.totals),
-        jwt_secret: uuid::Uuid::new_v4().to_string(),
+        jwt_secret: jwt_secret.clone(),
         data_dir: data.to_string(),
         desired: RwLock::new(HashMap::new()),
         desired_path: desired.to_string(),
@@ -43,6 +50,10 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     {
         let all = ds.all();
         *shared.desired.write().await = all;
+    }
+    // 新生成的 secret 立刻落盘，避免首次启动崩溃后 secret 漂移。
+    if fresh_secret {
+        state::save_state(&shared).await;
     }
     let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());

@@ -24,6 +24,7 @@ async fn wait_for(addr: &str) {
 struct Env {
     http_port: u16,
     web_base: String,
+    data_dir: std::path::PathBuf,
     _srv: tokio::process::Child, // kill_on_drop -> cleaned up at test end
     _ag: tokio::process::Child,
 }
@@ -93,6 +94,7 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
     Env {
         http_port: ws_port, // HTTP 入站与 ws+WebUI 同端口（Host 路由）
         web_base: format!("http://127.0.0.1:{ws_port}"),
+        data_dir: data,
         _srv: srv,
         _ag: ag,
     }
@@ -354,6 +356,61 @@ async fn e2e_traffic_and_conns() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(gone, "conns row should disappear after close");
+    let _ = env;
+}
+
+/// 旧代码行为：刷新页=内存 token 丢->401 登出；server 重启=jwt_secret 重生->cookie 作废。
+/// 断言抓：纯 cookie（无 Bearer）可访问；同 data_dir 重启 server 后 cookie 仍有效。
+#[tokio::test]
+async fn e2e_cookie_survives_refresh_and_restart() {
+    let env = boot("").await;
+    let c = reqwest::Client::builder().cookie_store(true).build().unwrap();
+    // 登录拿 cookie（cookie_store 自动存 nt_session）
+    let r = c
+        .post(format!("{}/api/login", env.web_base))
+        .json(&serde_json::json!({"user": "admin", "pass": "welcome2neutrino"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 刷新等价：不带 Bearer、只带 cookie -> 200（旧代码 401）
+    let r = c.get(format!("{}/api/overview", env.web_base)).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    // server 重启（同 data_dir，jwt_secret 落盘复用）-> cookie 仍有效
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mut env = env;
+    env._srv.kill().await.unwrap();
+    let _ = env._srv.wait().await;
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{}", env.http_port),
+            "--data",
+            env.data_dir.to_str().unwrap(),
+            "--desired",
+            // boot 时 desired.toml 与 data 同级（dir 下），data 是 dir/data
+            env.data_dir.join("../desired.toml").to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    env._srv = srv;
+    wait_for(&format!("127.0.0.1:{}", env.http_port)).await;
+    let mut ok = false;
+    for _ in 0..40 {
+        let r = c.get(format!("{}/api/overview", env.web_base)).send().await.unwrap();
+        if r.status() == 200 {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "cookie should survive server restart");
     let _ = env;
 }
 

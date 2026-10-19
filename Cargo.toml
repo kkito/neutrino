@@ -19,6 +19,7 @@ tower-http = { version = "0.5", features = ["fs", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonwebtoken = "9"
+
 bcrypt = "0.15"
 axum-test = "17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
@@ -31,3 +32,7 @@ thiserror = "1"
 toml = "0.8"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# e2e cookie 续登测试用（主包不开 cookies 避免二进制膨胀）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json", "cookies"] }

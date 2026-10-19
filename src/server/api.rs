@@ -494,6 +494,15 @@ mod tests {
         assert_eq!(r2[0], (180 * 60, 180 * 30));
     }
     #[test]
+    fn webui_survives_refresh() {
+        // 根因→修法：刷新丢登录因 token 只在内存 + fetch 不带 cookie。
+        // 断言抓：boot 续登逻辑 + 全 fetch 带 credentials + 登录存 sessionStorage。
+        let html = include_str!("../../web/index.html");
+        assert!(html.contains("credentials:'same-origin'"), "fetch must carry cookie");
+        assert!(html.contains("sessionStorage"), "token fallback missing");
+        assert!(html.contains("/api/overview"), "boot probe missing");
+    }
+    #[test]
     fn webui_has_traffic_conns_tabs() {
         let html = include_str!("../../web/index.html");
         assert!(html.contains("sec-tr"), "missing traffic section");

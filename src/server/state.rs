@@ -184,6 +184,8 @@ pub(crate) struct Persisted {
     pub(crate) totals: HashMap<String, (u64, u64)>,
     #[serde(default)]
     pub(crate) password_hash: String,
+    #[serde(default)]
+    pub(crate) jwt_secret: String,
 }
 
 pub(crate) async fn load_state(data_dir: &str) -> Persisted {
@@ -242,6 +244,7 @@ pub(crate) async fn save_state(s: &S) {
     let p = Persisted {
         totals,
         password_hash,
+        jwt_secret: s.jwt_secret.clone(),
     };
     let path = format!("{}/state.json", s.data_dir);
     if let Ok(txt) = serde_json::to_string_pretty(&p) {
@@ -260,6 +263,24 @@ mod tests {
         let p: Persisted = serde_json::from_str(r#"{"totals":{"h":[1,2]}}"#).unwrap();
         assert_eq!(p.totals["h"], (1, 2));
         assert!(p.password_hash.is_empty());
+        assert!(p.jwt_secret.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jwt_secret_persists_across_restart() {
+        // 根因→修法：jwt_secret 曾每次启动 new_v4，重启后旧 cookie/token 全作废。
+        // 必须落盘复用：旧 state.json 无此字段时为空（兼容），运行时生成后 save/load 回来不变。
+        let dir = std::env::temp_dir().join(format!("nt-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let s: S = Arc::new(Shared {
+            data_dir: dir.to_str().unwrap().into(),
+            jwt_secret: "sec-abc".into(),
+            ..Default::default()
+        });
+        save_state(&s).await;
+        let back = load_state(dir.to_str().unwrap()).await;
+        assert_eq!(back.jwt_secret, "sec-abc");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

@@ -136,11 +136,12 @@ async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
   const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({user,pass})});
   if(r.ok){ const j=await r.json(); auth=j.token||'';
+    try{ if(auth) sessionStorage.setItem('nt_auth',auth); }catch(e){}
     document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');
     refresh();setInterval(refresh,5000);
   } else document.getElementById('loginmsg').textContent='login failed';
 }
-async function need(u){ const r=await fetch(u,{headers:hdrs()}); if(r.status===401){location.reload();throw 0;} return r.json(); }
+async function need(u){ const r=await fetch(u,{headers:hdrs(),credentials:'same-origin'}); if(r.status===401){location.reload();throw 0;} return r.json(); }
 async function refresh(){
   try{
   const o=await need('/api/overview');
@@ -225,12 +226,13 @@ async function loadConns(){
 async function loadDesired(showMsg){
   const h=document.getElementById('hostsel').value;
   if(!h) return;
-  const d=await need('/api/desired/'+encodeURIComponent(h));
+  const d=await need('/api/desired/'+encodeURIComponent(h)); // need 自带 credentials
+
   desiredCache=d.proxies||[];
   if(showMsg!==false) toast(`已加载 ${h} 的 ${desiredCache.length} 条期望配置`);
 }
 async function reloadDesired(){
-  const r=await fetch('/api/desired/reload',{method:'POST',headers:hdrs(true)});
+  const r=await fetch('/api/desired/reload',{method:'POST',headers:hdrs(true),credentials:'same-origin'});
   const j=await r.json().catch(()=>({}));
   if(r.ok&&j.ok){ toast(`已重载 ${j.reloaded} 条，跳过 ${j.skipped} 条，推送 ${j.pushed} 个 agent`); refresh(); }
   else toast('重载失败: '+(j.reason||r.status),true);
@@ -282,7 +284,7 @@ async function saveForm(){
   const i=list.findIndex(q=>q.name===(editing||p.name));
   if(editing&&editing!==p.name) { const j=list.findIndex(q=>q.name===editing); if(j>=0) list.splice(j,1); }
   if(i>=0) list[i]=p; else list.push(p);
-  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),body:JSON.stringify({proxies:list})});
+  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),credentials:'same-origin',body:JSON.stringify({proxies:list})});
   if(r.ok){ toast('已保存并下发'); closeForm(); refresh(); }
   else { const j=await r.json().catch(()=>({})); toast('保存失败: '+(j.reason||r.status),true); }
 }
@@ -290,19 +292,30 @@ async function delRow(name){
   const h=document.getElementById('hostsel').value;
   if(!confirm('删除隧道 '+name+'？')) return;
   const list=desiredCache.filter(q=>q.name!==name);
-  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),body:JSON.stringify({proxies:list})});
+  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),credentials:'same-origin',body:JSON.stringify({proxies:list})});
   if(r.ok){ toast('已删除'); refresh(); } else toast('删除失败',true);
 }
 async function toggle(agent,name,enabled){
-  const r=await fetch(`/api/tunnels/${agent}/${name}/enabled`,{method:'POST',headers:hdrs(true),body:JSON.stringify({enabled})});
+  const r=await fetch(`/api/tunnels/${agent}/${name}/enabled`,{method:'POST',headers:hdrs(true),credentials:'same-origin',body:JSON.stringify({enabled})});
   if(!r.ok) toast('toggle failed',true); else refresh();
 }
 async function pushConfig(){
   const agent=document.getElementById('cfgagent').value;
   let body; try{ body=JSON.parse(document.getElementById('cfgjson').value); }catch(e){ toast('JSON 非法',true); return; }
   body.hostname=body.hostname||agent||undefined; body.agent_id=body.agent_id||undefined;
-  const r=await fetch('/api/config',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
+  const r=await fetch('/api/config',{method:'POST',headers:hdrs(true),credentials:'same-origin',body:JSON.stringify(body)});
   document.getElementById('cfgmsg').textContent=r.ok?'已推送':'推送失败 '+r.status;
   if(r.ok) refresh();
 }
+// 刷新续登：cookie（nt_session, HttpOnly）浏览器自动带，内存 token 丢了也能续；
+// 同 tab 回退 sessionStorage（cookie 被清但 tab 未关时）。任一失败才回登录页。
+(async function boot(){
+  try{ auth=sessionStorage.getItem('nt_auth')||''; }catch(e){ auth=''; }
+  try{
+    const r=await fetch('/api/overview',{headers:hdrs(),credentials:'same-origin'});
+    if(!r.ok) return;
+    document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');
+    refresh();setInterval(refresh,5000);
+  }catch(e){}
+})();
 </script></body></html>
