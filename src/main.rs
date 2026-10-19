@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod desired;
 pub mod proto;
 pub mod server;
 
