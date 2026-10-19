@@ -61,7 +61,8 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 <section id="sec-tn" class="hidden">
 <div class="topbar"><h2>隧道</h2>
 <select id="hostsel" onchange="loadDesired()"></select>
-<button class="btn" onclick="openForm()">+ 新增隧道</button></div>
+<button class="btn" onclick="openForm()">+ 新增隧道</button>
+<button class="btn ghost" onclick="reloadDesired()">从文件重载</button></div>
 <div class="card"><table id="tunnels"></table></div>
 <details><summary>高级：JSON 直推（热更新，不断线）</summary>
 <div class="card"><div class="row">
@@ -136,6 +137,12 @@ async function loadDesired(showMsg){
   const d=await need('/api/desired/'+encodeURIComponent(h));
   desiredCache=d.proxies||[];
   if(showMsg!==false) toast(`已加载 ${h} 的 ${desiredCache.length} 条期望配置`);
+}
+async function reloadDesired(){
+  const r=await fetch('/api/desired/reload',{method:'POST',headers:hdrs(true)});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok&&j.ok){ toast(`已重载 ${j.reloaded} 条，跳过 ${j.skipped} 条，推送 ${j.pushed} 个 agent`); refresh(); }
+  else toast('重载失败: '+(j.reason||r.status),true);
 }
 function typeFields(){
   const t=document.getElementById('f-type').value, isHttp=(t==='http');
