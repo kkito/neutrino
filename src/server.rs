@@ -187,7 +187,7 @@ struct Claims {
     exp: i64,
 }
 
-fn mint_jwt(secret: &str) -> String {
+pub(crate) fn mint_jwt(secret: &str) -> String {
     let c = Claims {
         sub: "admin".into(),
         exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp(),
@@ -200,7 +200,7 @@ fn mint_jwt(secret: &str) -> String {
     .unwrap_or_default()
 }
 
-fn verify_jwt(secret: &str, token: &str) -> bool {
+pub(crate) fn verify_jwt(secret: &str, token: &str) -> bool {
     jsonwebtoken::decode::<Claims>(
         token,
         &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),

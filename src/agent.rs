@@ -18,6 +18,8 @@ struct AgentFileConfig {
     proxies: Vec<ProxyConfig>,
 }
 
+pub use crate::agent_web::AgentStatus;
+
 struct Ctx {
     proxies: RwLock<Vec<ProxyConfig>>,
     streams: RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -27,27 +29,69 @@ struct Ctx {
     out: mpsc::UnboundedSender<Message>,
 }
 
-pub async fn run(url: &str, config_path: &str) -> anyhow::Result<()> {
+pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pass: &str) -> anyhow::Result<()> {
     let raw = tokio::fs::read_to_string(config_path).await.map_err(|e| {
         anyhow::anyhow!("read {config_path}: {e} (see agent.toml.example)")
     })?;
     let cfg: AgentFileConfig = toml::from_str(&raw)?;
+    if !cfg.proxies.is_empty() {
+        tracing::warn!("local proxies in {config_path} ignored: server is source of truth");
+    }
     tracing::info!(
         "agent '{}' -> {url} ({} proxies)",
         cfg.hostname,
         cfg.proxies.len()
     );
+    // shared status for local WebUI
+    let status = Arc::new(RwLock::new(crate::agent_web::AgentStatus {
+        server_url: url.to_string(),
+        ..Default::default()
+    }));
+    if !web.is_empty() {
+        // persist web password hash under agent data file
+        let data_path = format!("{config_path}.webpass");
+        let hash = match tokio::fs::read_to_string(&data_path).await {
+            Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
+            _ => {
+                let h = bcrypt::hash(web_pass, bcrypt::DEFAULT_COST)?;
+                let _ = tokio::fs::write(&data_path, &h).await;
+                h
+            }
+        };
+        let st = status.clone();
+        let w = web.to_string();
+        let u = web_user.to_string();
+        let ph = Arc::new(RwLock::new(hash));
+        tokio::spawn(async move {
+            if let Err(e) = crate::agent_web::serve(&w, u, ph, data_path, st).await {
+                tracing::error!("agent webui died: {e:#}");
+            }
+        });
+    }
     let mut backoff = vec![1u64, 2, 5, 10, 30, 60];
+    let mut reconnects = 0u64;
     loop {
-        match session(url, &cfg).await {
+        match session(url, &cfg, status.clone()).await {
             Ok(_) => {
                 tracing::info!("session ended, reconnect in 2s");
+                reconnects += 1;
+                {
+                    let mut st = status.write().await;
+                    st.online = false;
+                    st.reconnects = reconnects;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(e) => {
                 let s = backoff.first().cloned().unwrap_or(60);
                 if backoff.len() > 1 {
                     backoff.remove(0);
+                }
+                reconnects += 1;
+                {
+                    let mut st = status.write().await;
+                    st.online = false;
+                    st.reconnects = reconnects;
                 }
                 tracing::warn!("session error: {e:#}; retry in {s}s");
                 tokio::time::sleep(std::time::Duration::from_secs(s)).await;
@@ -56,7 +100,7 @@ pub async fn run(url: &str, config_path: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn session(url: &str, cfg: &AgentFileConfig) -> anyhow::Result<()> {
+async fn session(url: &str, cfg: &AgentFileConfig, status: Arc<RwLock<crate::agent_web::AgentStatus>>) -> anyhow::Result<()> {
     let (ws, _) = connect_async(url).await?;
     tracing::info!("ws connected");
     let (mut sink, mut stream) = ws.split();
@@ -104,6 +148,10 @@ async fn session(url: &str, cfg: &AgentFileConfig) -> anyhow::Result<()> {
         _ => anyhow::bail!("expect welcome"),
     };
     tracing::info!("welcomed, heartbeat {interval}s");
+    {
+        let mut st = status.write().await;
+        st.online = true;
+    }
     send(&ClientMsg::Register {
         proxies: cfg.proxies.clone(),
     })?;
@@ -156,6 +204,10 @@ async fn session(url: &str, cfg: &AgentFileConfig) -> anyhow::Result<()> {
                 }
                 Ok(ServerMsg::Config { proxies }) => {
                     *ctx.proxies.write().await = proxies.clone();
+                    {
+                        let mut st = status.write().await;
+                        st.proxies = proxies.clone();
+                    }
                     let _ = out_tx.send(Message::Text(
                         serde_json::to_string(&ClientMsg::ConfigAck { ok: true })
                             .unwrap()
