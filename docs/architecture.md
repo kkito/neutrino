@@ -9,23 +9,47 @@
 ## 架构图
 
 ```mermaid
-flowchart LR
-    U[访问者<br/>浏览器/TCP客户端] --> HTTP["server HTTP入口<br/>按Host路由"]
-    U -->|TCP/UDP直连| TCP["server TCP/UDP入口<br/>按端口监听"]
-    A[管理员<br/>WebUI] --> WEB["server WebUI+API<br/>总览/隧道/配置"]
-    AG2[agent<br/>内网出站] --> WS["server 信令通道<br/>WSS连接复用"]
-    N["反向代理(可选)<br/>TLS卸载+分流"] -.->|/ws, WebUI| WS
-    N -.->|业务域名| HTTP
+flowchart TB
+    U[访问者<br/>浏览器/TCP客户端]
+    A[管理员<br/>浏览器]
+
+    subgraph SRV[neutrino server · 公网]
+        direction TB
+        WS["信令通道 /ws<br/>WSS连接复用"]
+        HTTP["HTTP入口<br/>按Host路由"]
+        TCP["TCP/UDP入口<br/>按端口监听"]
+        WEB["WebUI + API<br/>总览/隧道/配置"]
+        ST[(state.json<br/>流量+密码)]
+        HTTP -.->|Open + 数据帧| WS
+        TCP -.->|Open + 数据帧| WS
+        WEB -.->|Config热下发| WS
+        WEB -.->|读写| ST
+    end
+
+    subgraph AGT[client machine · 内网]
+        direction TB
+        AG["neutrino agent<br/>单条WSS出站长连"]
+        L1[内网HTTP服务]
+        L2[内网TCP服务]
+        L3[内网UDP服务]
+        AG -->|拨本地| L1
+        AG -->|拨本地| L2
+        AG -->|发本地| L3
+    end
+
+    subgraph RP[nginx 反向代理 · 可选]
+        direction TB
+        N["TLS卸载 + 分流<br/>直连端口同样可用"]
+    end
+
+    U --> HTTP
+    U --> TCP
+    A --> WEB
+    AG <==>|hello/register| WS
     U -.->|经反代| N
     A -.->|经反代| N
-    HTTP -.->|Open + 数据帧| WS
-    TCP -.->|Open + 数据帧| WS
-    WS <==>|单条WSS出站<br/>hello/register| AG["agent<br/>内网出站长连"]
-    AG -->|拨本地| L1[内网HTTP服务]
-    AG -->|拨本地| L2[内网TCP服务]
-    AG -->|发本地| L3[内网UDP服务]
-    WEB -.->|Config热下发| WS
-    WEB -.->|读写| ST[(state.json<br/>流量+密码)]
+    N -.->|/ws, WebUI| WS
+    N -.->|业务域名| HTTP
 ```
 
 关键点：
