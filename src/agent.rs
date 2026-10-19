@@ -91,7 +91,9 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     }));
     // bumped by WebUI to force an immediate redial (settings save / button)
     let (redial_tx, redial_rx) = tokio::sync::watch::channel(0u64);
-    if !web.is_empty() {
+    if web.is_empty() {
+        println!("agent local webui disabled (enable with --web 127.0.0.1:8080)");
+    } else {
         // persist web password hash under agent data file
         let data_path = format!("{config_path}.webpass");
         let hash = match tokio::fs::read_to_string(&data_path).await {
