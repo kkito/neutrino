@@ -21,7 +21,7 @@ cargo test --test e2e <name>       # 跑单个 e2e
 ## 铁律：TDD 修 bug / 加功能
 1. **先写失败测试（RED）**：单测放对应模块 `mod tests`，回归放 `tests/e2e.rs`。必须亲眼看到它红，且红的原因是"行为缺失"（不是笔误）。修复前回退验证：临时关掉修复，测试必须变红（如 `overlay log count 250: Register/Config loop!`）。
 2. **最小实现（GREEN）**：只让测试变绿，不顺手重构、不加功能。纯判定逻辑抽成无 IO 纯函数（如 `route_fallback`、`needs_config_push`、`merge_upstream_toml`、`parse_response_head`）再测。
-3. **全绿 + 零 warning**：`cargo test`（30+7）全过，`cargo build` 无 warning。e2e 允许重试的时间断言用轮询+上限（如 40×200ms），不用固定 sleep 赌竞态。
+3. **改完必须验证**：`make build`（已配 `RUSTFLAGS="-D warnings"`，任何 warning 直接变 error 中断）+ `make test`（30+7）全过才算完。e2e 允许重试的时间断言用轮询+上限（如 40×200ms），不用固定 sleep 赌竞态。
 4. **再提交**：注释写清"根因→修法"（参考 `Register -> Config -> Register ping-pong` 那次），e2e 注释写清"旧代码如何复现、断言抓什么"。
 
 ## 易踩坑（已有回归用例，别再犯）

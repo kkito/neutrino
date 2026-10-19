@@ -13,7 +13,7 @@ test:
 	cargo test
 
 build:
-	cargo build
+	RUSTFLAGS="-D warnings" cargo build
 	@ls -lh target/debug/$(BIN)
 
 release:
