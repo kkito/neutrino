@@ -285,6 +285,7 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
         let all = ds.all();
         *shared.desired.write().await = all;
     }
+    let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());
     {
         let s = shared.clone();
@@ -327,6 +328,14 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
         .with_state((shared, token));
     let lis = TcpListener::bind(listen).await?;
     tracing::info!("server listening ws+webui on {listen}");
+    println!("neutrino-server running:");
+    println!("  ws+webui     : http://{listen}/");
+    println!("  http-ingress : http://{http_in}/");
+    if need_init {
+        println!("  web login    : admin / welcome2ll (默认, 首次登录后请改口令)");
+    } else {
+        println!("  web login    : admin / (已设置的口令)");
+    }
     axum::serve(lis, app).await?;
     Ok(())
 }

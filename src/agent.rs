@@ -61,6 +61,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         let st = status.clone();
         let w = web.to_string();
         let u = web_user.to_string();
+        println!("agent local webui: http://{w}/ (user {u})");
         let ph = Arc::new(RwLock::new(hash));
         tokio::spawn(async move {
             if let Err(e) = crate::agent_web::serve(&w, u, ph, data_path, st).await {
