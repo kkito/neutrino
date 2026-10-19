@@ -13,12 +13,12 @@ flowchart TB
     U[访问者<br/>浏览器/TCP客户端]
     A[管理员<br/>浏览器]
 
-    subgraph SRV[neutrino server · 公网]
+    subgraph SRV[neutrino server · 公网 · 单端口 --listen]
         direction TB
-        WS["信令通道 /ws<br/>WSS连接复用"]
-        HTTP["HTTP入口<br/>按Host路由"]
+        WS["信令通道 /ws<br/>WSS连接复用（agent 出站长连）"]
+        HTTP["HTTP隧道<br/>同端口 Host 路由到 agent"]
         TCP["TCP/UDP入口<br/>按端口监听"]
-        WEB["WebUI + API<br/>总览/隧道表单/日志"]
+        WEB["WebUI + API<br/>/ + /api（裸IP/无点Host）"]
         DS[(desired.toml<br/>期望隧道·唯一源头)]
         ST[(state.json<br/>流量+密码)]
         HTTP -.->|Open + 数据帧| WS
@@ -53,8 +53,8 @@ flowchart TB
     AG <==>|hello/register| WS
     U -.->|经反代| N
     A -.->|经反代| N
-    N -.->|/ws, WebUI| WS
-    N -.->|业务域名| HTTP
+    N -.->|tunnel 域 + /ws + WebUI| WS
+    N -.->|业务域名 Host| HTTP
 ```
 
 关键点：
@@ -62,8 +62,9 @@ flowchart TB
 - **控制帧**走 WSS Text JSON（`hello/register/ping/pong/open/close/config`），**数据帧**走 WSS Binary
   `[stream_id:u32 BE][payload]`，server 用偶数 id。TCP/HTTP 每连接一个 stream 全双工；
   UDP 每个 peer 一个 stream，每帧即一个 datagram。
-- HTTP 按 `Host` 路由、可注入 `X-Forwarded-Proto`；TCP/UDP 按 `remote_port` 路由（lazy 监听）；
-  HTTPS 当 TCP 透传、不解密。
+- HTTP（与 ws/WebUI 同端口 `--listen`）：axum 先匹配 `/ws`、`/api/*`，其余按 `Host` 路由到隧道 agent
+  （隧道域名→透传，未知点分域名→`404 no such tunnel`，裸 IP/无点→WebUI）；TCP/UDP 仍按 `remote_port` 独立监听；
+  HTTPS 当 TCP 透传、不解密。`--http-in` 已废弃（传入仅 warn 忽略）。
 - WebUI 与全部 API 由 server 直出（页面编译进二进制），反向代理仅可选承担 TLS 卸载与分流，
   直连 server 端口同样可用。agent 本地另有只读 WebUI（`--web` 开启，默认 admin/neutrino123），
   看上行状态与生效中隧道（标"由 server 下发"），改上行地址需重启生效。

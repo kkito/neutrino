@@ -16,7 +16,7 @@
 | 需求 | 实现 |
 |---|---|
 | WSS 单长连接+token+重连+双向心跳+RTT | agent 指数退避重连；双方 ping/pong；server 侧 `rtt_ms` 进 overview |
-| http Host 路由 | `http_ingress` 按 `Host` 查多 agent 轮询；`set_x_forwarded_proto` 改写请求头（owncloud 用） |
+| http Host 路由（与 ws/WebUI 同端口） | 同一 `--listen` 端口：`/`+无点 Host→WebUI，隧道域名 Host→agent 轮询；`set_x_forwarded_proto` 改写请求头（owncloud 用）。`--http-in` 已废弃（传入 warn 忽略） |
 | https 透传 | `type=https` + `remote_port`：server TCP listen，agent 按 `remote_port` 匹配本地 TLS 端口透传（不解密） |
 | tcp 透传 | 同上 `type=tcp`（如 51413），lazy listen |
 | udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话 120s 过期；agent 用 connected UDP 透本地 |
@@ -40,10 +40,10 @@ agent 本地错误配置被期望态覆盖（含回推同步本地路由表）�
 
 ```bash
 cargo build
-./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2neutrino --desired ./data/desired.toml &
+./target/debug/neutrino server --listen 127.0.0.1:7440 --token welcome2neutrino --desired ./data/desired.toml &
 ./target/debug/neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml.example --web 127.0.0.1:8080 &
-curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7080/   # 透到 agent 本地
-open http://127.0.0.1:7440/                                # server WebUI
+curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7440/   # 隧道域名 Host → 透到 agent 本地
+open http://127.0.0.1:7440/                                # server WebUI（裸 IP/无点 Host）
 open http://127.0.0.1:8080/                                # agent 本地 WebUI（默认 admin/neutrino123）
 ```
 
@@ -62,11 +62,11 @@ kill $(cat neutrino.pid)                               # 停服
 ```bash
 cargo build --release
 scp target/release/neutrino root@natproxy:/root/nastools/tunnel/
-NEUTRINO_TOKEN=welcome2neutrino ./neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --data ./data
+NEUTRINO_TOKEN=welcome2neutrino ./neutrino server --listen 127.0.0.1:7440 --data ./data
 ```
 
-nginx 用 `deploy/tunnel-nginx.conf`：`tunnel.nat.kkito.cn/ws`→7440（Upgrade 头+1d 超时），
-WebUI `/`→7440，业务域→7080；tcp/udp 端口 podman `-p 51413:51413[/udp]`。
+nginx 用 `deploy/tunnel-nginx.conf`：单 upstream `127.0.0.1:7440`（`/`+WebUI、`Upgrade` 透传给 `/ws`、业务域名按 Host 路由到隧道，一条 `location /` 全收；配合 `map $http_upgrade $connection_upgrade`）。
+tcp/udp 隧道仍按 `remote_port` 独立监听，podman 侧 `-p 51413:51413[/udp]`。
 
 ## 部署到 snail（agent）
 

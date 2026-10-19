@@ -30,7 +30,6 @@ struct Env {
 
 async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> Env {
     let ws_port = free_port();
-    let http_port = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let cfg_path = dir.join("agent.toml");
@@ -52,8 +51,6 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
             "server",
             "--listen",
             &format!("127.0.0.1:{ws_port}"),
-            "--http-in",
-            &format!("127.0.0.1:{http_port}"),
             "--data",
             data.to_str().unwrap(),
             "--desired",
@@ -78,7 +75,7 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
         .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     Env {
-        http_port,
+        http_port: ws_port, // HTTP 入站与 ws+WebUI 同端口（Host 路由）
         web_base: format!("http://127.0.0.1:{ws_port}"),
         _srv: srv,
         _ag: ag,

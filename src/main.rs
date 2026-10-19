@@ -21,7 +21,8 @@ enum Cmd {
     Server {
         #[arg(long, default_value = "127.0.0.1:7440")]
         listen: String,
-        #[arg(long, default_value = "127.0.0.1:7080")]
+        /// deprecated alias: HTTP 入站已并入 --listen 同端口（Host 路由）；传入仅 warn 忽略
+        #[arg(long, default_value = "")]
         http_in: String,
         #[arg(long, default_value = "./data")]
         data: String,

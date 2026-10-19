@@ -1,7 +1,11 @@
-//! Server side: /ws (agent multiplex) + http/tcp/udp ingress + WebUI + state.
+/// server 监听：ws + WebUI + HTTP 入站同端口。axum Router 先匹配
+/// `/ws`、`/api/*`、`/`（WebUI）；未命中的 Host 走下面的 `fallback`，
+/// 按隧道域名路由到 agent（`no such tunnel` 即该域名未配置）。
+/// `--http-in` 仅兼容保留（有值会被忽略并 warn）。
 use crate::proto::*;
 use axum::{
-    extract::{ws::Message as WsMsg, ws::WebSocket, Path, State, WebSocketUpgrade},
+    body::Body,
+    extract::{ws::Message as WsMsg, ws::WebSocket, Path, Request, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
@@ -267,8 +271,11 @@ async fn save_state(s: &S) {
 }
 
 // ================= run =================
-pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: &str) -> anyhow::Result<()> {
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
+    if !_http_in.is_empty() {
+        tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
+    }
     let ps = load_state(data).await;
     let ds = crate::desired::DesiredStore::load(desired);
     let shared: S = Arc::new(Shared {
@@ -287,15 +294,6 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
     }
     let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());
-    {
-        let s = shared.clone();
-        let http_in = http_in.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = http_ingress(&http_in, s).await {
-                tracing::error!("http ingress died: {e:#}");
-            }
-        });
-    }
     // periodic persist
     {
         let s = shared.clone();
@@ -317,7 +315,6 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
     }
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/", get(index_page))
         .route("/api/login", post(api_login))
         .route("/api/overview", get(api_overview))
         .route("/api/tunnels", get(api_tunnels))
@@ -325,12 +322,14 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
         .route("/api/config", post(api_config))
         .route("/api/tunnels/:agent/:name/enabled", post(api_toggle))
         .route("/api/desired/:hostname", get(api_desired_get).post(api_desired_set))
+        // 注意：`/` 不单独注册精确路由，否则带隧道 Host 访问 `/` 会被它抢走；
+        // 统一走 fallback 按 Host 分流（WebUI vs 隧道）。
+        .fallback(fallback_http_ingress)
         .with_state((shared, token));
     let lis = TcpListener::bind(listen).await?;
-    tracing::info!("server listening ws+webui on {listen}");
+    tracing::info!("server listening ws+webui+http-ingress on {listen}");
     println!("neutrino-server running:");
-    println!("  ws+webui     : http://{listen}/");
-    println!("  http-ingress : http://{http_in}/");
+    println!("  listen : http://{listen}/  (Host=业务域->隧道, /=WebUI, /ws=agent)");
     if need_init {
         println!("  web login    : admin / welcome2neutrino (默认, 首次登录后请改口令)");
     } else {
@@ -614,6 +613,162 @@ fn next_sid() -> u32 {
     ((STREAM_CTR.fetch_add(1, Ordering::Relaxed) as u32).wrapping_mul(2)).wrapping_add(2)
 }
 
+/// axum `/*key` 通配路由：已注册的 `/ws`、`/api/*`、精确 `/` 优先匹配；
+/// 其余路径按 Host 路由到隧道 agent。整包转发给 agent，响应流式回写；
+/// 未知域名 404（`no such tunnel`），无点 Host（裸 IP 访问）落到 WebUI。
+async fn fallback_http_ingress(
+    State((s, _)): State<(S, Arc<String>)>,
+    req: Request,
+) -> impl IntoResponse {
+    use axum::body::to_bytes;
+    let (parts, body) = req.into_parts();
+    let host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    // `/` 归属判定：隧道域名 -> 透传给 agent；未知点分域名 -> 404；
+    // 否则（裸 IP / 无 Host）-> WebUI。注意 curl/e2e 常用 `GET / + Host: 隧道域名`，
+    // 故不能给 `/` 注册精确路由，统一走 fallback 按 Host 分流。
+    let tunneled = pick_http(&s, &host).await;
+    let Some((aid, xfp)) = tunneled else {
+        if host.contains('.') {
+            return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response();
+        }
+        return index_page().await.into_response();
+    };
+    // 重建原始请求头字节流（含 XFP 注入），body 拼回去
+    let version = match parts.version {
+        ::axum::http::Version::HTTP_10 => "HTTP/1.0",
+        _ => "HTTP/1.1",
+    };
+    let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let mut head = format!("{} {} {version}\r\n", parts.method, path).into_bytes();
+    for (k, v) in parts.headers.iter() {
+        if k.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
+            continue;
+        }
+        head.extend_from_slice(format!("{}: {}\r\n", k, v.to_str().unwrap_or("")).as_bytes());
+    }
+    if let Some(p) = &xfp {
+        head.extend_from_slice(format!("X-Forwarded-Proto: {p}\r\n").as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
+    let body_bytes = to_bytes(body, 8 * 1024 * 1024).await.unwrap_or_default();
+    head.extend_from_slice(&body_bytes);
+    let sid = next_sid();
+    let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (ctl, out) = {
+        let ag = s.agents.read().await;
+        let ob = s.outbox.read().await;
+        match (ag.get(&aid), ob.get(&aid)) {
+            (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+            _ => return (StatusCode::BAD_GATEWAY, "agent gone\n").into_response(),
+        }
+    };
+    if let Some(h) = s.agents.read().await.get(&aid) {
+        h.incoming.write().await.insert(sid, dtx);
+    }
+    let _ = ctl.send(ServerMsg::Open {
+        stream: sid,
+        kind: "http".into(),
+        host,
+        port: 0,
+    });
+    if out.send((sid, head)).is_err() {
+        return (StatusCode::BAD_GATEWAY, "agent gone\n").into_response();
+    }
+    // 等 agent 回包（首个响应头），超时 30s
+    let first = tokio::time::timeout(Duration::from_secs(30), drx.recv()).await;
+    let first = match first {
+        Ok(Some(b)) => b,
+        _ => {
+            if let Some(h) = s.agents.read().await.get(&aid) {
+                h.incoming.write().await.remove(&sid);
+            }
+            let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "timeout".into() });
+            return (StatusCode::BAD_GATEWAY, "upstream timeout\n").into_response();
+        }
+    };
+    // 简单解析状态行 + 头，body 用流式 Body 拼后续帧
+    let (status, resp_headers, prefix) = parse_response_head(&first);
+    let s2 = s.clone();
+    let stream = async_stream_lite(s2, aid, sid, ctl, drx, prefix);
+    let mut resp = axum::response::Response::builder().status(status);
+    for (k, v) in resp_headers {
+        resp = resp.header(k, v);
+    }
+    resp.body(Body::from_stream(stream)).unwrap().into_response()
+}
+
+/// 最小 HTTP 响应头解析：返回 (status, headers, 首包剩余 body 前缀)。
+fn parse_response_head(buf: &[u8]) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let pos = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let (hdr, rest) = match pos {
+        Some(i) => (&buf[..i], buf[i + 4..].to_vec()),
+        None => (buf, vec![]),
+    };
+    let text = String::from_utf8_lossy(hdr);
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut headers = vec![];
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().to_lowercase();
+            // hop-by-hop 头由 hyper 接管，去掉避免冲突
+            if matches!(k.as_str(), "transfer-encoding" | "connection" | "keep-alive" | "upgrade") {
+                continue;
+            }
+            headers.push((k, v.trim().to_string()));
+        }
+    }
+    (status, headers, rest)
+}
+
+/// 后续响应帧 -> axum Body 流；流结束即发 Close 并清理 stream 注册。
+fn async_stream_lite(
+    s: S,
+    aid: String,
+    sid: u32,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+    drx: mpsc::UnboundedReceiver<Vec<u8>>, // async_stream_lite 内消费
+    prefix: Vec<u8>,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
+    use futures_util::stream::{once, unfold};
+    use futures_util::StreamExt;
+    let pre = if prefix.is_empty() {
+        futures_util::stream::empty().boxed()
+    } else {
+        once(async { Ok(axum::body::Bytes::from(prefix)) }).boxed()
+    };
+    let rest = unfold(Some((s, aid, sid, ctl, drx)), |st| async {
+        let (s, aid, sid, ctl, mut drx) = st?;
+        match drx.recv().await {
+            Some(chunk) => Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx)))),
+            None => {
+                if let Some(h) = s.agents.read().await.get(&aid) {
+                    h.incoming.write().await.remove(&sid);
+                }
+                let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "eof".into() });
+                None
+            }
+        }
+    });
+    pre.chain(rest)
+}
+
+/// 旧独立端口 http_ingress 已并入上面的 axum fallback（同端口 Host 路由）。
+/// 保留此函数体作裸 TCP 透传参考，当前不再被调用。
+#[allow(dead_code)]
 async fn http_ingress(bind: &str, s: S) -> anyhow::Result<()> {
     let lis = TcpListener::bind(bind).await?;
     tracing::info!("http ingress on {bind}");
