@@ -40,11 +40,29 @@ struct Ctx {
     out: mpsc::UnboundedSender<Message>,
 }
 
+async fn load_or_default(config_path: &str, url: &str) -> anyhow::Result<AgentFileConfig> {
+    match tokio::fs::read_to_string(config_path).await {
+        Ok(raw) => Ok(toml::from_str(&raw)?),
+        // config 文件缺失也允许启动：用 CLI --server + 默认 hostname/token 先跑，
+        // 用户稍后在本地 WebUI 里填上行地址，保存即落盘+重连。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!("{config_path} not found, starting unconfigured (set upstream via WebUI); see agent.toml.example");
+            Ok(AgentFileConfig {
+                hostname: std::env::var("HOSTNAME")
+                    .ok()
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or_else(|| "agent".into()),
+                token: String::new(),
+                server: url.to_string(),
+                proxies: vec![],
+            })
+        }
+        Err(e) => Err(anyhow::anyhow!("read {config_path}: {e} (see agent.toml.example)")),
+    }
+}
+
 pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pass: &str) -> anyhow::Result<()> {
-    let raw = tokio::fs::read_to_string(config_path).await.map_err(|e| {
-        anyhow::anyhow!("read {config_path}: {e} (see agent.toml.example)")
-    })?;
-    let cfg: AgentFileConfig = toml::from_str(&raw)?;
+    let cfg: AgentFileConfig = load_or_default(config_path, url).await?;
     if !cfg.proxies.is_empty() {
         tracing::warn!("local proxies in {config_path} ignored: server is source of truth");
     }
@@ -468,4 +486,16 @@ async fn open_udp_stream(ctx: Arc<Ctx>, sid: u32, port: u16) -> anyhow::Result<(
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_config_starts_unconfigured() {
+        let cfg = load_or_default("/nonexistent-dir-xyz/agent.toml", "ws://x:7440/ws").await.unwrap();
+        assert_eq!(cfg.server, "ws://x:7440/ws");
+        assert!(cfg.proxies.is_empty());
+    }
 }
