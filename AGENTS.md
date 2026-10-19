@@ -30,6 +30,14 @@ cargo test --test e2e <name>       # 跑单个 e2e
 3. **改完必须验证**：`make build`（已配 `RUSTFLAGS="-D warnings"`，任何 warning 直接变 error 中断）+ `make test`（30+7）全过才算完。e2e 允许重试的时间断言用轮询+上限（如 40×200ms），不用固定 sleep 赌竞态。
 4. **再提交**：注释写清"根因→修法"（参考 `Register -> Config -> Register ping-pong` 那次），e2e 注释写清"旧代码如何复现、断言抓什么"。
 
+## 部署（natproxy server 二进制）
+- linux 二进制只走 GitHub Actions：打 tag `v*` 触发 `.github/workflows/release.yml`
+  （musl static，产物 `neutrino-x86_64-unknown-linux-musl.tar.gz`，见 GitHub Release），
+  下载解压到 `/root/nastools/tunnel/neutrino` 再 `systemctl restart tunnel-server`。
+- 别 `scp` 本机 `target/release/neutrino`（macOS arm64，server 上 203/EXEC 起不来；
+  2026-10-20 已踩过一次把线上二进制覆盖掉）；本地也别折腾 musl cross（缺 musl-gcc，ring 编不过）。
+- 本地 `make build` + `make test` 全绿即可，部署等 CI 产物。
+
 ## 易踩坑（已有回归用例，别再犯）
 - `/` 不能注册精确路由：`GET / + Host: 隧道域名` 会被 WebUI 抢走，统一走 fallback 按 Host 分流。
 - 裸 IP/`localhost`/空 Host 走 WebUI（`127.0.0.1` 带点，不能按"有点=隧道"判），未知点分域名才 404。

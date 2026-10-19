@@ -99,6 +99,74 @@ fn route_fallback(host: &str, tunneled: bool) -> FallbackRoute {
     FallbackRoute::WebUi
 }
 
+/// HTTP 连接守卫：handler future 被取消（首包等待期下游断开）或响应 Body 被
+/// drop（流式回写中途断开）时，unfold 状态/局部变量随之 drop，此处用 try_write
+/// 同步清理 conns 行 + incoming 注册并补发 Close。根因→修法：旧代码 remove 只写
+/// 在流尾回调/超时两处，Body 中途被丢弃则清理永不执行，conns 越积越多
+///（natproxy 现场 56 行僵尸）。正常走完也经此路径，幂等重复清理无害。
+struct HttpConnGuard {
+    s: S,
+    aid: String,
+    sid: u32,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+}
+impl Drop for HttpConnGuard {
+    fn drop(&mut self) {
+        let (s, aid, sid, ctl) = (self.s.clone(), self.aid.clone(), self.sid, self.ctl.clone());
+        // 同步路径拿不到锁时起后台任务补删，不阻塞 drop。
+        // 借用隔离：try 守卫只活在块内，先算 bool 再 spawn，避免借用跨 move。
+        let bg_conns = {
+            match s.conns.try_write() {
+                Ok(mut m) => {
+                    m.remove(&(sid as u64));
+                    false
+                }
+                Err(_) => true,
+            }
+        };
+        if bg_conns {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.conns.write().await.remove(&(sid as u64));
+            });
+        }
+        let inc = {
+            match s.agents.try_read() {
+                Ok(ag) => ag.get(&aid).map(|h| h.incoming.clone()),
+                Err(_) => None,
+            }
+        };
+        match inc {
+            Some(inc) => {
+                let bg = {
+                    match inc.try_write() {
+                        Ok(mut m) => {
+                            m.remove(&sid);
+                            false
+                        }
+                        Err(_) => true,
+                    }
+                };
+                if bg {
+                    tokio::spawn(async move {
+                        inc.write().await.remove(&sid);
+                    });
+                }
+            }
+            None => {
+                // agents 锁忙：后台补删
+                let s2 = s.clone();
+                tokio::spawn(async move {
+                    if let Some(h) = s2.agents.read().await.get(&aid) {
+                        h.incoming.write().await.remove(&sid);
+                    }
+                });
+            }
+        }
+        let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "eof".into() });
+    }
+}
+
 /// axum fallback：已注册的 `/ws`、`/api/*` 优先匹配；
 /// 其余路径按 Host 路由到隧道 agent。整包转发给 agent，响应流式回写；
 /// 未知域名 404（`no such tunnel`），裸 IP/localhost 访问落到 WebUI。
@@ -192,6 +260,9 @@ pub(crate) async fn fallback_http_ingress(
             },
         );
     }
+    // 守卫活过两个阶段：①首包等待期 handler future 被取消→drop 清理；
+    // ②响应建成后 move 进 Body 流，中途断开流被 drop→清理。正常走完也经此路径。
+    let guard = std::sync::Arc::new(HttpConnGuard { s: s.clone(), aid: aid.clone(), sid, ctl: ctl.clone() });
     let _ = ctl.send(ServerMsg::Open {
         stream: sid,
         kind: "http".into(),
@@ -199,6 +270,7 @@ pub(crate) async fn fallback_http_ingress(
         port: 0,
     });
     if out.send((sid, head)).is_err() {
+        drop(guard);
         return (StatusCode::BAD_GATEWAY, "agent gone\n").into_response();
     }
     // 等 agent 回包（首个响应头），超时 30s
@@ -206,18 +278,14 @@ pub(crate) async fn fallback_http_ingress(
     let first = match first {
         Ok(Some(b)) => b,
         _ => {
-            if let Some(h) = s.agents.read().await.get(&aid) {
-                h.incoming.write().await.remove(&sid);
-            }
-            s.conns.write().await.remove(&(sid as u64));
-            let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "timeout".into() });
+            drop(guard);
             return (StatusCode::BAD_GATEWAY, "upstream timeout\n").into_response();
         }
     };
     // 简单解析状态行 + 头，body 用流式 Body 拼后续帧
     let (status, resp_headers, prefix) = parse_response_head(&first);
     let s2 = s.clone();
-    let stream = async_stream_lite(s2, aid, sid, ctl, drx, prefix);
+    let stream = async_stream_lite(s2, aid, sid, ctl, drx, prefix, guard);
     let mut resp = axum::response::Response::builder().status(status);
     for (k, v) in resp_headers {
         resp = resp.header(k, v);
@@ -254,7 +322,7 @@ fn parse_response_head(buf: &[u8]) -> (StatusCode, Vec<(String, String)>, Vec<u8
     (status, headers, rest)
 }
 
-/// 后续响应帧 -> axum Body 流；流结束即发 Close 并清理 stream 注册。
+/// 后续响应帧 -> axum Body 流；_guard 随 Body 活、断开被 drop 即清理（正常走完经 guard 的多次幂等清理）。
 fn async_stream_lite(
     s: S,
     aid: String,
@@ -262,6 +330,7 @@ fn async_stream_lite(
     ctl: mpsc::UnboundedSender<ServerMsg>,
     drx: mpsc::UnboundedReceiver<Vec<u8>>, // async_stream_lite 内消费
     prefix: Vec<u8>,
+    _guard: std::sync::Arc<HttpConnGuard>,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
     use futures_util::stream::{once, unfold};
     use futures_util::StreamExt;
@@ -270,24 +339,17 @@ fn async_stream_lite(
     } else {
         once(async { Ok(axum::body::Bytes::from(prefix)) }).boxed()
     };
-    let rest = unfold(Some((s, aid, sid, ctl, drx)), |st| async {
-        let (s, aid, sid, ctl, mut drx) = st?;
+    let rest = unfold(Some((s, aid, sid, ctl, drx, _guard)), |st| async {
+        let (s, aid, sid, ctl, mut drx, _guard) = st?;
         match drx.recv().await {
             Some(chunk) => {
                 // 连接行 tx 累计（agent->公网字节）
                 if let Some(c) = s.conns.write().await.get_mut(&(sid as u64)) {
                     c.tx += chunk.len() as u64;
                 }
-                Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx))))
+                Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx, _guard))))
             }
-            None => {
-                if let Some(h) = s.agents.read().await.get(&aid) {
-                    h.incoming.write().await.remove(&sid);
-                }
-                s.conns.write().await.remove(&(sid as u64));
-                let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "eof".into() });
-                None
-            }
+            None => None, // 清理由 HttpConnGuard::drop 统一做（正常走完也经此路径）
         }
     });
     pre.chain(rest)
