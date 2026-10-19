@@ -1,8 +1,8 @@
 //! Agent-local WebUI: status + upstream dial config + password change.
 //! Served on --web bind (e.g. 127.0.0.1:8080). Upstream server/hostname/token
 //! edits apply immediately (next redial) and persist to agent.toml.
-use crate::agent::Upstream;
-use crate::proto::ProxyConfig;
+use super::Upstream;
+use crate::common::proto::ProxyConfig;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -84,7 +84,7 @@ fn unauthorized() -> axum::response::Response {
 }
 
 async fn index_page() -> Html<&'static str> {
-    Html(include_str!("../web/agent.html"))
+    Html(include_str!("../../web/agent.html"))
 }
 
 #[derive(Deserialize)]

@@ -1,5 +1,5 @@
 //! Server-side desired tunnel state: hostname -> proxies (TOML persisted).
-use crate::proto::ProxyConfig;
+use super::proto::ProxyConfig;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]

@@ -1,72 +1,14 @@
-//! Agent-local HTTP forward proxy request parsing (pure, no IO).
-//! 根因→修法：egress 首版只做 HTTP，一切从本地监听读到的请求头开始；
-//! CONNECT 与绝对 URI 两种形态在此统一解析成目标 host:port，IO 由 serve 层做。
-
-/// 解析出的代理目标。
-pub enum ProxyTarget {
-    /// CONNECT 隧道：后续字节全透传。
-    Connect { host: String, port: u16 },
-    /// 普通 HTTP 绝对 URI：head 原样转发后透传。
-    Forward {
-        host: String,
-        port: u16,
-        head: Vec<u8>,
-    },
-}
-
-fn split_host_port(h: &str) -> (String, u16) {
-    match h.rsplit_once(':') {
-        Some((hh, p)) => match p.parse::<u16>() {
-            Ok(n) => (hh.trim().to_string(), n),
-            Err(_) => (h.to_string(), 80),
-        },
-        None => (h.to_string(), 80),
-    }
-}
-
-/// 解析代理请求头。返回 (目标, 头长度)。
-/// 头不完整（无 \r\n\r\n）返回 None，调用方继续读；
-/// 非 CONNECT 且非绝对 URI 返回 None，调用方回 400。
-pub fn parse_proxy_request(buf: &[u8]) -> Option<(ProxyTarget, usize)> {
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let head = std::str::from_utf8(&buf[..end]).ok()?;
-    let mut lines = head.lines();
-    let req = lines.next()?;
-    let mut parts = req.split_whitespace();
-    let (m, target) = (parts.next()?, parts.next()?);
-    if m.eq_ignore_ascii_case("CONNECT") {
-        let (h, p) = split_host_port(target);
-        Some((ProxyTarget::Connect { host: h, port: p }, end))
-    } else {
-        // 普通 HTTP：只接受绝对 URI（GET http://host/path ...）
-        let after = target.split("://").nth(1)?;
-        let hostport = after.split('/').next()?;
-        if hostport.is_empty() {
-            return None;
-        }
-        let (h, p) = split_host_port(hostport);
-        Some((
-            ProxyTarget::Forward {
-                host: h,
-                port: p,
-                head: buf[..end].to_vec(),
-            },
-            end,
-        ))
-    }
-}
-
-
+//! agent 出网代理 IO：本地监听 + WSS 建流 + 双向泵（解析见 common::egress_parse）。
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::agent::EgressHttp;
+use super::EgressHttp;
 /// egress 回包路由表：sid -> 本地连接写通道。
 /// 与 Ctx.streams 分离（egress 由 agent 主动发起，session 的 Binary 分发查完 Ctx 再查此表）。
-pub fn egress_streams(
+pub(crate) fn egress_streams(
 ) -> &'static RwLock<std::collections::HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>> {
     static T: std::sync::LazyLock<
         RwLock<std::collections::HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -74,17 +16,17 @@ pub fn egress_streams(
     &T
 }
 
-use crate::agent_web::AgentStatus;
-use crate::proto::ClientMsg;
+use super::web::AgentStatus;
+use crate::common::proto::ClientMsg;
 
 /// 出站通道持有者：session 建连后注入 out_tx，断开置 None。
 /// egress 连接 WSS 断开时 fail-fast（直接 502），重连后自动恢复。
-pub type OutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Message>>>>;
+pub(crate) type OutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Message>>>>;
 
 /// agent egress 本地监听。端口被占只 warn + 状态标红，不影响 WSS 主链。
 /// 根因→修法：监听 task 与 session/WSS 主链解耦，bind 失败直接返回，
 /// 调用方（run/热重启）只更新 status.egress_err，不 abort 主循环。
-pub async fn serve_egress(bind: String, http: EgressHttp, out: OutHolder, status: Arc<RwLock<AgentStatus>>) {
+pub(crate) async fn serve_egress(bind: String, http: EgressHttp, out: OutHolder, status: Arc<RwLock<AgentStatus>>) {
     // 状态先行：WebUI 立即可见监听目标
     {
         let mut st = status.write().await;
@@ -142,7 +84,7 @@ async fn handle_conn(
             return Ok(());
         }
     }
-    let Some((target, hlen)) = crate::egress::parse_proxy_request(&buf) else {
+    let Some((target, hlen)) = crate::common::egress_parse::parse_proxy_request(&buf) else {
         let _ = inbound
             .write_all(b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n")
             .await;
@@ -161,12 +103,12 @@ async fn handle_conn(
         std::sync::LazyLock::new(|| std::sync::atomic::AtomicU32::new(1));
     let sid = CTR.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1;
     let (host, port, connect) = match target {
-        crate::egress::ProxyTarget::Connect { host, port } => (host, port, true),
-        crate::egress::ProxyTarget::Forward { host, port, .. } => (host, port, false),
+        crate::common::egress_parse::ProxyTarget::Connect { host, port } => (host, port, true),
+        crate::common::egress_parse::ProxyTarget::Forward { host, port, .. } => (host, port, false),
     };
     // 在 Open 之前先把回包通道注册到全局表（server 回包+Close 靠它路由）
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
-    crate::egress::egress_streams().write().await.insert(sid, dtx);
+    egress_streams().write().await.insert(sid, dtx);
     let open = ClientMsg::Open {
         stream: sid,
         kind: "egress".into(),
@@ -177,7 +119,7 @@ async fn handle_conn(
         .send(Message::Text(serde_json::to_string(&open).unwrap().into()))
         .is_err()
     {
-        crate::egress::egress_streams().write().await.remove(&sid);
+        egress_streams().write().await.remove(&sid);
         let _ = inbound
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n")
             .await;
@@ -186,11 +128,11 @@ async fn handle_conn(
     if !connect {
         // Forward：原 head 经 Binary 发给 server（由 server 端泵写给公网目标）
         let head = buf[..hlen].to_vec();
-        let _ = tx.send(Message::Binary(crate::proto::encode_data(sid, &head).into()));
+        let _ = tx.send(Message::Binary(crate::common::proto::encode_data(sid, &head).into()));
         // head 之后已读的多余字节（pipeline）也一并转发
         if buf.len() > hlen {
             let _ = tx.send(Message::Binary(
-                crate::proto::encode_data(sid, &buf[hlen..]).into(),
+                crate::common::proto::encode_data(sid, &buf[hlen..]).into(),
             ));
         }
     }
@@ -203,7 +145,7 @@ async fn handle_conn(
             .await
             .is_err()
         {
-            crate::egress::egress_streams().write().await.remove(&sid);
+            egress_streams().write().await.remove(&sid);
             return Ok(());
         }
     }
@@ -215,7 +157,7 @@ async fn handle_conn(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if tx2
-                        .send(Message::Binary(crate::proto::encode_data(sid, &b[..n]).into()))
+                        .send(Message::Binary(crate::common::proto::encode_data(sid, &b[..n]).into()))
                         .is_err()
                     {
                         break;
@@ -243,7 +185,7 @@ async fn handle_conn(
         _ = to_server => {}
         _ = from_server => {}
     }
-    crate::egress::egress_streams().write().await.remove(&sid);
+    egress_streams().write().await.remove(&sid);
     let e = ClientMsg::Close {
         stream: sid,
         reason: "eof".into(),
@@ -252,35 +194,3 @@ async fn handle_conn(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn connect_with_port() {
-        let (t, _) = parse_proxy_request(
-            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-        )
-        .unwrap();
-        assert!(matches!(t, ProxyTarget::Connect{host,port} if host=="example.com" && port==443));
-    }
-
-    #[test]
-    fn connect_no_port_defaults_80() {
-        let (t, _) = parse_proxy_request(b"CONNECT example.com HTTP/1.1\r\n\r\n").unwrap();
-        assert!(matches!(t, ProxyTarget::Connect{port:80,..}));
-    }
-
-    #[test]
-    fn get_absolute_uri() {
-        let raw = b"GET http://example.com/path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let (t, n) = parse_proxy_request(raw).unwrap();
-        assert_eq!(n, raw.len());
-        assert!(matches!(t, ProxyTarget::Forward{host,port:80,..} if host=="example.com"));
-    }
-
-    #[test]
-    fn incomplete_returns_none() {
-        assert!(parse_proxy_request(b"CONNECT exa").is_none());
-    }
-}

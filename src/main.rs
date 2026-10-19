@@ -1,11 +1,8 @@
 pub mod agent;
-pub mod agent_web;
-pub mod desired;
-pub mod egress;
-pub mod proto;
+pub mod common;
 pub mod server;
 
-pub(crate) use server::{mint_jwt as server_mint_jwt, verify_jwt as server_auth_verify};
+pub(crate) use server::auth::{mint_jwt as server_mint_jwt, verify_jwt as server_auth_verify};
 
 use clap::{Parser, Subcommand};
 

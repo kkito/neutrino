@@ -1,0 +1,595 @@
+//! server 入站：fallback Host 分流 + TCP/UDP 监听 + 透传泵。
+use crate::common::proto::*;
+use super::http_util::{extract_host, inject_xfp};
+use super::state::{log_ev, S};
+use axum::{body::Body, extract::{Request, State}, http::{header, StatusCode}, response::IntoResponse};
+use std::{collections::HashMap, sync::{atomic::{AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, UdpSocket}, sync::mpsc};
+
+/// http 入口路由：返回 (agent_id, 隧道配置快照)。快照里带 basic_auth，
+/// 调用方在透传前用 check_basic_auth 校验，不通过直接 401。
+async fn pick_http(s: &S, host: &str) -> Option<(String, crate::common::proto::ProxyConfig)> {
+    // simple round-robin: rotate the candidate vec under write lock
+    let aid = {
+        let mut dom = s.domains.write().await;
+        let v = dom.get_mut(&host.to_lowercase())?;
+        if v.is_empty() {
+            return None;
+        }
+        let aid = v.remove(0);
+        v.push(aid.clone());
+        aid
+    };
+    // find proxy snapshot for this agent+host (xfp + basic_auth live here)
+    let ag = s.agents.read().await;
+    let proxy = ag.get(&aid).and_then(|h| {
+        h.info
+            .proxies
+            .iter()
+            .find(|p| {
+                p.enabled && p.domains.iter().any(|d| d.eq_ignore_ascii_case(host))
+            })
+            .cloned()
+    })?;
+    // only return live agents
+    if ag.contains_key(&aid) {
+        Some((aid, proxy))
+    } else {
+        None
+    }
+}
+
+async fn pick_port(s: &S, port: u16, kind: &str) -> Option<String> {
+    let mut tp = s.tcp_ports.write().await;
+    let v = tp.get_mut(&port)?;
+    if v.is_empty() {
+        return None;
+    }
+    // try each candidate until a live one with matching proxy type found
+    for _ in 0..v.len() {
+        let aid = v.remove(0);
+        v.push(aid.clone());
+        let ag = s.agents.read().await;
+        let ok = ag.get(&aid).map(|h| {
+            h.info.proxies.iter().any(|p| {
+                p.enabled
+                    && p.remote_port == port
+                    && (p.ptype == kind
+                        || (kind == "tcp" && p.ptype == "https")
+                        || (kind == "https" && p.ptype == "tcp"))
+            })
+        });
+        if ok == Some(true) {
+            return Some(aid);
+        }
+    }
+    None
+}
+
+// ================= http ingress =================
+static STREAM_CTR: std::sync::LazyLock<AtomicUsize> =
+    std::sync::LazyLock::new(|| AtomicUsize::new(0));
+
+fn next_sid() -> u32 {
+    // even ids from server; wrap-safe
+    ((STREAM_CTR.fetch_add(1, Ordering::Relaxed) as u32).wrapping_mul(2)).wrapping_add(2)
+}
+
+/// 单端口 fallback 路由判定：tunneled=true 表示该 Host 命中某 agent 隧道。
+/// - 命中隧道 -> 透传给 agent（无论路径）
+/// - 未命中 + 裸 IP/localhost/空 Host -> WebUI（方便直接打开 IP:端口看管理页）
+/// - 未命中 + 其他（点分域名） -> 404 `no such tunnel`
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackRoute {
+    Tunnel,
+    WebUi,
+    NotFound,
+}
+
+fn route_fallback(host: &str, tunneled: bool) -> FallbackRoute {
+    if tunneled {
+        return FallbackRoute::Tunnel;
+    }
+    if host.is_empty() || host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+        return FallbackRoute::WebUi;
+    }
+    if host.contains('.') {
+        return FallbackRoute::NotFound;
+    }
+    FallbackRoute::WebUi
+}
+
+/// axum fallback：已注册的 `/ws`、`/api/*` 优先匹配；
+/// 其余路径按 Host 路由到隧道 agent。整包转发给 agent，响应流式回写；
+/// 未知域名 404（`no such tunnel`），裸 IP/localhost 访问落到 WebUI。
+pub(crate) async fn fallback_http_ingress(
+    State((s, _)): State<(S, Arc<String>)>,
+    req: Request,
+) -> impl IntoResponse {
+    use axum::body::to_bytes;
+    let (parts, body) = req.into_parts();
+    let host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    // 分流判定见 route_fallback：注意不能给 `/` 注册精确路由，否则
+    // curl/e2e 常用的 `GET / + Host: 隧道域名` 会被 WebUI 抢走。
+    let tunneled = pick_http(&s, &host).await;
+    let (aid, proxy) = match route_fallback(&host, tunneled.is_some()) {
+        FallbackRoute::Tunnel => tunneled.unwrap(),
+        FallbackRoute::WebUi => return super::api::index_page().await.into_response(),
+        FallbackRoute::NotFound => {
+            return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response()
+        }
+    };
+    let xfp = proxy.set_x_forwarded_proto.clone();
+    // http 隧道入口 basic auth：配了 basic_auth 才校验，无 Authorization/错口令直接 401。
+    // 浏览器收到 WWW-Authenticate 会弹登录框；校验在 server 侧做，agent/内网服务无感知。
+    if !crate::common::proto::check_basic_auth(&parts.headers, proxy.basic_auth.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, format!("Basic realm=\"{}\"", proxy.name))],
+            "auth required\n",
+        )
+            .into_response();
+    }
+    // 重建原始请求头字节流（含 XFP 注入），body 拼回去
+    let version = match parts.version {
+        ::axum::http::Version::HTTP_10 => "HTTP/1.0",
+        _ => "HTTP/1.1",
+    };
+    let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let mut head = format!("{} {} {version}\r\n", parts.method, path).into_bytes();
+    for (k, v) in parts.headers.iter() {
+        if k.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
+            continue;
+        }
+        head.extend_from_slice(format!("{}: {}\r\n", k, v.to_str().unwrap_or("")).as_bytes());
+    }
+    if let Some(p) = &xfp {
+        head.extend_from_slice(format!("X-Forwarded-Proto: {p}\r\n").as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
+    let body_bytes = to_bytes(body, 8 * 1024 * 1024).await.unwrap_or_default();
+    head.extend_from_slice(&body_bytes);
+    let sid = next_sid();
+    let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (ctl, out) = {
+        let ag = s.agents.read().await;
+        let ob = s.outbox.read().await;
+        match (ag.get(&aid), ob.get(&aid)) {
+            (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+            _ => return (StatusCode::BAD_GATEWAY, "agent gone\n").into_response(),
+        }
+    };
+    if let Some(h) = s.agents.read().await.get(&aid) {
+        h.incoming.write().await.insert(sid, dtx);
+    }
+    let _ = ctl.send(ServerMsg::Open {
+        stream: sid,
+        kind: "http".into(),
+        host,
+        port: 0,
+    });
+    if out.send((sid, head)).is_err() {
+        return (StatusCode::BAD_GATEWAY, "agent gone\n").into_response();
+    }
+    // 等 agent 回包（首个响应头），超时 30s
+    let first = tokio::time::timeout(Duration::from_secs(30), drx.recv()).await;
+    let first = match first {
+        Ok(Some(b)) => b,
+        _ => {
+            if let Some(h) = s.agents.read().await.get(&aid) {
+                h.incoming.write().await.remove(&sid);
+            }
+            let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "timeout".into() });
+            return (StatusCode::BAD_GATEWAY, "upstream timeout\n").into_response();
+        }
+    };
+    // 简单解析状态行 + 头，body 用流式 Body 拼后续帧
+    let (status, resp_headers, prefix) = parse_response_head(&first);
+    let s2 = s.clone();
+    let stream = async_stream_lite(s2, aid, sid, ctl, drx, prefix);
+    let mut resp = axum::response::Response::builder().status(status);
+    for (k, v) in resp_headers {
+        resp = resp.header(k, v);
+    }
+    resp.body(Body::from_stream(stream)).unwrap().into_response()
+}
+
+/// 最小 HTTP 响应头解析：返回 (status, headers, 首包剩余 body 前缀)。
+fn parse_response_head(buf: &[u8]) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let pos = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let (hdr, rest) = match pos {
+        Some(i) => (&buf[..i], buf[i + 4..].to_vec()),
+        None => (buf, vec![]),
+    };
+    let text = String::from_utf8_lossy(hdr);
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut headers = vec![];
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().to_lowercase();
+            // hop-by-hop 头由 hyper 接管，去掉避免冲突
+            if matches!(k.as_str(), "transfer-encoding" | "connection" | "keep-alive" | "upgrade") {
+                continue;
+            }
+            headers.push((k, v.trim().to_string()));
+        }
+    }
+    (status, headers, rest)
+}
+
+/// 后续响应帧 -> axum Body 流；流结束即发 Close 并清理 stream 注册。
+fn async_stream_lite(
+    s: S,
+    aid: String,
+    sid: u32,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+    drx: mpsc::UnboundedReceiver<Vec<u8>>, // async_stream_lite 内消费
+    prefix: Vec<u8>,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
+    use futures_util::stream::{once, unfold};
+    use futures_util::StreamExt;
+    let pre = if prefix.is_empty() {
+        futures_util::stream::empty().boxed()
+    } else {
+        once(async { Ok(axum::body::Bytes::from(prefix)) }).boxed()
+    };
+    let rest = unfold(Some((s, aid, sid, ctl, drx)), |st| async {
+        let (s, aid, sid, ctl, mut drx) = st?;
+        match drx.recv().await {
+            Some(chunk) => Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx)))),
+            None => {
+                if let Some(h) = s.agents.read().await.get(&aid) {
+                    h.incoming.write().await.remove(&sid);
+                }
+                let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "eof".into() });
+                None
+            }
+        }
+    });
+    pre.chain(rest)
+}
+
+/// 旧独立端口 http_ingress 已并入上面的 axum fallback（同端口 Host 路由）。
+/// 保留此函数体作裸 TCP 透传参考，当前不再被调用。
+/// 注意：basic auth 校验只在 axum fallback 生效；此旧路径若重新启用，需补同样校验。
+#[allow(dead_code)]
+async fn http_ingress(bind: &str, s: S) -> anyhow::Result<()> {
+    let lis = TcpListener::bind(bind).await?;
+    tracing::info!("http ingress on {bind}");
+    loop {
+        let (mut inbound, _peer) = lis.accept().await?;
+        let s = s.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16384];
+            let n = match inbound.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.truncate(n);
+            let host = extract_host(&String::from_utf8_lossy(&buf));
+            let Some((aid, proxy)) = pick_http(&s, &host).await else {
+                let r = "HTTP/1.1 404 Not Found\r\ncontent-length: 15\r\nconnection: close\r\n\r\nno such tunnel\n";
+                let _ = inbound.write_all(r.as_bytes()).await;
+                return;
+            };
+            let xfp = proxy.set_x_forwarded_proto.clone();
+            let head = match xfp {
+                Some(p) => inject_xfp(&buf, &p),
+                None => buf,
+            };
+            // reserve stream id + register queue BEFORE Open so no race
+            let sid = next_sid();
+            let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (ctl, out) = {
+                let ag = s.agents.read().await;
+                let ob = s.outbox.read().await;
+                match (ag.get(&aid), ob.get(&aid)) {
+                    (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+                    _ => return,
+                }
+            };
+            if let Some(h) = s.agents.read().await.get(&aid) {
+                h.incoming.write().await.insert(sid, dtx);
+            }
+            let _ = ctl.send(ServerMsg::Open {
+                stream: sid,
+                kind: "http".into(),
+                host,
+                port: 0,
+            });
+            if out.send((sid, head)).is_err() {
+                return;
+            }
+            let (mut ri, mut wi) = inbound.into_split();
+            let out2 = out.clone();
+            let to_agent = tokio::spawn(async move {
+                let mut b = vec![0u8; 32 * 1024];
+                loop {
+                    let n = ri.read(&mut b).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    out2
+                        .send((sid, b[..n].to_vec()))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                anyhow::Ok(())
+            });
+            let from_agent = async {
+                while let Some(chunk) = drx.recv().await {
+                    wi.write_all(&chunk).await?;
+                }
+                anyhow::Ok::<()>(())
+            };
+            tokio::select! {
+                r = to_agent => { let _ = r.unwrap(); }
+                r = from_agent => { let _ = r; }
+            }
+            if let Some(h) = s.agents.read().await.get(&aid) {
+                h.incoming.write().await.remove(&sid);
+            }
+            let _ = ctl.send(ServerMsg::Close {
+                stream: sid,
+                reason: "eof".into(),
+            });
+        });
+    }
+}
+
+// ================= tcp ingress (per remote_port, lazy) =================
+pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
+    if s.tcp_listening.read().await.contains(&port) {
+        return;
+    }
+    s.tcp_listening.write().await.insert(port);
+    let s2 = s.clone();
+    tokio::spawn(async move {
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(lis) => {
+                tracing::info!("tcp ingress on 0.0.0.0:{port}");
+                log_ev(&s2, format!("tcp listening :{port}"));
+                loop {
+                    let Ok((inbound, _)) = lis.accept().await else {
+                        continue;
+                    };
+                    let s3 = s2.clone();
+                    tokio::spawn(async move {
+                        let Some(aid) =
+                            pick_port(&s3, port, "tcp").await
+                        else {
+                            return;
+                        };
+                        let sid = next_sid();
+                        let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        let (ctl, out) = {
+                            let ag = s3.agents.read().await;
+                            let ob = s3.outbox.read().await;
+                            match (ag.get(&aid), ob.get(&aid)) {
+                                (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+                                _ => return,
+                            }
+                        };
+                        if let Some(h) = s3.agents.read().await.get(&aid) {
+                            h.incoming.write().await.insert(sid, dtx);
+                        }
+                        let _ = ctl.send(ServerMsg::Open {
+                            stream: sid,
+                            kind: "tcp".into(),
+                            host: String::new(),
+                            port,
+                        });
+                        let (mut ri, mut wi) = inbound.into_split();
+                        let out2 = out.clone();
+                        let to_agent = tokio::spawn(async move {
+                            let mut b = vec![0u8; 32 * 1024];
+                            loop {
+                                let n = ri.read(&mut b).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                out2
+                                    .send((sid, b[..n].to_vec()))
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            anyhow::Ok(())
+                        });
+                        let from_agent = async {
+                            while let Some(chunk) = drx.recv().await {
+                                wi.write_all(&chunk).await?;
+                            }
+                            anyhow::Ok::<()>(())
+                        };
+                        tokio::select! {
+                            r = to_agent => { let _ = r.unwrap(); }
+                            r = from_agent => { let _ = r; }
+                        }
+                        if let Some(h) = s3.agents.read().await.get(&aid) {
+                            h.incoming.write().await.remove(&sid);
+                        }
+                        let _ = ctl.send(ServerMsg::Close {
+                            stream: sid,
+                            reason: "eof".into(),
+                        });
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("tcp bind :{port} failed: {e:#}");
+                s2.tcp_listening.write().await.remove(&port);
+            }
+        }
+    });
+}
+
+// ================= udp ingress (per remote_port, session per peer) =================
+pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
+    if s.udp_listening.read().await.contains(&port) {
+        return;
+    }
+    s.udp_listening.write().await.insert(port);
+    let s2 = s.clone();
+    tokio::spawn(async move {
+        let sock = match UdpSocket::bind(("0.0.0.0", port)).await {
+            Ok(x) => Arc::new(x),
+            Err(e) => {
+                tracing::warn!("udp bind :{port} failed: {e:#}");
+                s2.udp_listening.write().await.remove(&port);
+                return;
+            }
+        };
+        tracing::info!("udp ingress on 0.0.0.0:{port}");
+        log_ev(&s2, format!("udp listening :{port}"));
+        // peer -> (stream_id, last_seen)
+        let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant)> = HashMap::new();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            // expire old sessions
+            sessions.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(120));
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let sid = match sessions.get_mut(&peer) {
+                Some((id, t)) => {
+                    *t = Instant::now();
+                    *id
+                }
+                None => {
+                    let Some(aid) = pick_port(&s2, port, "udp").await else {
+                        continue;
+                    };
+                    let id = next_sid();
+                    let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    let (ctl, out) = {
+                        let ag = s2.agents.read().await;
+                        let ob = s2.outbox.read().await;
+                        match (ag.get(&aid), ob.get(&aid)) {
+                            (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+                            _ => continue,
+                        }
+                    };
+                    if let Some(h) = s2.agents.read().await.get(&aid) {
+                        h.incoming.write().await.insert(id, dtx);
+                    }
+                    let _ = ctl.send(ServerMsg::Open {
+                        stream: id,
+                        kind: "udp".into(),
+                        host: String::new(),
+                        port,
+                    });
+                    // agent->internet pump for this peer
+                    let sock2 = sock.clone();
+                    let s3 = s2.clone();
+                    let aid3 = aid.clone();
+                    tokio::spawn(async move {
+                        while let Some(chunk) = drx.recv().await {
+                            let _ = sock2.send_to(&chunk, peer).await;
+                            if let Some(h) = s3.agents.write().await.get_mut(&aid3)
+                            {
+                                h.info.tx_bytes += chunk.len() as u64;
+                            }
+                        }
+                    });
+                    let _ = out;
+                    sessions.insert(peer, (id, Instant::now()));
+                    id
+                }
+            };
+            // internet -> agent (each datagram = one data frame)
+            let payload = buf[..n].to_vec();
+            // find owner agent of this stream
+            let owner: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>> = {
+                let ag = s2.agents.read().await;
+                let ob = s2.outbox.read().await;
+                // stream registry: scan agents' incoming for sid
+                let mut found = None;
+                for (aid, h) in ag.iter() {
+                    if h.incoming.read().await.contains_key(&sid) {
+                        found = ob.get(aid).cloned();
+                        break;
+                    }
+                }
+                found
+            };
+            if let Some(o) = owner {
+                let _ = o.send((sid, payload.clone()));
+                // rx accounting
+                let mut agm = s2.agents.write().await;
+                for h in agm.values_mut() {
+                    if h.incoming.try_read().map(|m| m.contains_key(&sid)).unwrap_or(false) {
+                        h.info.rx_bytes += payload.len() as u64;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ================= WebUI =================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fallback_routes_tunnel_when_matched() {
+        // 命中隧道：无论路径/Host 形式都透传（WebUI `/` 不抢）
+        assert_eq!(route_fallback("web.e2e.test", true), FallbackRoute::Tunnel);
+        assert_eq!(route_fallback("127.0.0.1", true), FallbackRoute::Tunnel);
+    }
+
+    #[test]
+    fn fallback_routes_webui_for_local() {
+        // 裸 IP（v4/v6，带点也不能误判成隧道域名）/localhost/空 Host -> WebUI
+        assert_eq!(route_fallback("127.0.0.1", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("::1", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("10.0.0.5", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("localhost", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("", false), FallbackRoute::WebUi);
+        // 无点单 label 也落 WebUI（方便局域网 hostname 直访）
+        assert_eq!(route_fallback("intranet", false), FallbackRoute::WebUi);
+    }
+
+    #[test]
+    fn fallback_routes_404_for_unknown_domain() {
+        assert_eq!(route_fallback("nope.test", false), FallbackRoute::NotFound);
+        assert_eq!(route_fallback("git.nat.kkito.cn", false), FallbackRoute::NotFound);
+    }
+
+    #[test]
+    fn response_head_parses_status_headers_body() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nabc";
+        let (status, headers, rest) = parse_response_head(raw);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(rest, b"abc");
+        // hop-by-hop 头被剥掉，业务头保留（小写归一）
+        assert!(headers.iter().any(|(k, v)| k == "content-length" && v == "3"));
+        assert!(!headers.iter().any(|(k, _)| k == "connection" || k == "transfer-encoding"));
+    }
+
+    #[test]
+    fn response_head_tolerates_malformed() {
+        // 无状态行数字 -> 兜底 200；无 CRLFCRLF -> 整包当头、body 为空
+        let (s, _, rest) = parse_response_head(b"garbage");
+        assert_eq!(s, StatusCode::OK);
+        assert!(rest.is_empty());
+        let (s2, _, rest2) = parse_response_head(b"HTTP/1.1 200 OK\r\nX-A: b");
+        assert_eq!(s2, StatusCode::OK);
+        assert!(rest2.is_empty());
+    }
+
+}
