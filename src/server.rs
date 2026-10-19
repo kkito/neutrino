@@ -477,6 +477,9 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                     h.incoming.write().await.remove(&stream);
                                 }
                             }
+                            Ok(ClientMsg::Open { stream, kind, host, port }) if kind == "egress" => {
+                                spawn_egress_dial(&s, &agent_id, stream, host, port, ctl_tx.clone());
+                            }
                             Ok(_) => {}
                             Err(e) => tracing::warn!("bad client frame: {e}"),
                         }
@@ -532,6 +535,108 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
 /// 空==空视为收敛（双方都没隧道时不 push）。
 fn needs_config_push(reported: &[ProxyConfig], want: &[ProxyConfig]) -> bool {
     reported != want
+}
+
+/// egress 目标校验（纯函数，单测覆盖）：空 host / 0 端口拒绝。
+fn valid_egress_target(host: &str, port: u16) -> bool {
+    !host.trim().is_empty() && port != 0
+}
+
+/// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
+/// 根因→修法：与 ingress 对称但方向相反——ingress 是 server 收连接让 agent 拨本地，
+/// egress 是 agent 发 Open 让 server 拨公网；泵结构复用 tcp ingress（incoming/outbox）。
+fn spawn_egress_dial(
+    s: &S,
+    agent_id: &str,
+    sid: u32,
+    host: String,
+    port: u16,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+) {
+    if !valid_egress_target(&host, port) {
+        let _ = ctl.send(ServerMsg::Close {
+            stream: sid,
+            reason: "egress denied: bad target".into(),
+        });
+        return;
+    }
+    let s = s.clone();
+    let aid = agent_id.to_string();
+    tokio::spawn(async move {
+        let up = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
+                let _ = ctl.send(ServerMsg::Close {
+                    stream: sid,
+                    reason: format!("dial refused: {e}"),
+                });
+                return;
+            }
+            Err(_) => {
+                let _ = ctl.send(ServerMsg::Close {
+                    stream: sid,
+                    reason: "dial timeout 30s".into(),
+                });
+                return;
+            }
+        };
+        // 接泵：incoming[sid] 收 agent 发来的 Binary 写给公网；outbox 发 Binary 给 agent。
+        let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let out = {
+            let ag = s.agents.read().await;
+            let ob = s.outbox.read().await;
+            match (ag.get(&aid), ob.get(&aid)) {
+                (Some(_), Some(o)) => o.clone(),
+                _ => {
+                    let _ = ctl.send(ServerMsg::Close {
+                        stream: sid,
+                        reason: "agent gone".into(),
+                    });
+                    return;
+                }
+            }
+        };
+        if let Some(h) = s.agents.read().await.get(&aid) {
+            h.incoming.write().await.insert(sid, dtx);
+        }
+        let (mut ru, mut wu) = up.into_split();
+        let out2 = out.clone();
+        let to_public = tokio::spawn(async move {
+            let mut b = vec![0u8; 32 * 1024];
+            loop {
+                let n = ru.read(&mut b).await?;
+                if n == 0 {
+                    break;
+                }
+                out2
+                    .send((sid, b[..n].to_vec()))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            anyhow::Ok(())
+        });
+        let from_agent = async {
+            while let Some(chunk) = drx.recv().await {
+                wu.write_all(&chunk).await?;
+            }
+            anyhow::Ok::<()>(())
+        };
+        tokio::select! {
+            r = to_public => { let _ = r.unwrap(); }
+            r = from_agent => { let _ = r; }
+        }
+        if let Some(h) = s.agents.read().await.get(&aid) {
+            h.incoming.write().await.remove(&sid);
+        }
+        let _ = ctl.send(ServerMsg::Close {
+            stream: sid,
+            reason: "eof".into(),
+        });
+    });
 }
 
 async fn on_register(s: &S, agent_id: &str, hostname: &str, reported: Vec<ProxyConfig>) {
@@ -1379,6 +1484,14 @@ async fn api_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_target_rejects_empty_host() {
+        assert!(!valid_egress_target("", 80));
+        assert!(!valid_egress_target("   ", 80));
+        assert!(!valid_egress_target("x", 0));
+        assert!(valid_egress_target("example.com", 443));
+    }
 
     #[test]
     fn basic_auth_gate() {
