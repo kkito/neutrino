@@ -113,6 +113,21 @@ fn resolve_initial_url(cli_url: &str, cfg: &AgentFileConfig, cli_explicit: bool)
     }
 }
 
+/// WebUI 热重启读取的当前 [egress.http]（agent.toml 唯一来源）。
+async fn read_egress_file2(path: &str) -> (String, u16, bool) {
+    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+    let h = v.get("egress").and_then(|e| e.get("http"));
+    (
+        h.and_then(|x| x.get("listen_ip"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("0.0.0.0")
+            .to_string(),
+        h.and_then(|x| x.get("listen_port")).and_then(|x| x.as_integer()).unwrap_or(18080) as u16,
+        h.and_then(|x| x.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+    )
+}
+
 /// backoff 睡眠，可被 redial 打断：被打断返回 true（调用方立即重拨）。
 /// seen 为进入睡眠前的 generation：订阅前已到的 bump 也算打断，避免间隙丢失。
 async fn sleep_backoff_or_redial(
@@ -166,14 +181,60 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     }));
     // 出站通道持有者：session 建连后注入，egress 监听经它发 Open/数据。
     let egress_out: crate::egress::OutHolder = Arc::new(RwLock::new(None));
+    // egress 热重启通道：WebUI 保存只 abort/重起本监听，不断 WSS 主链。
+    let (egress_tx, egress_rx) = tokio::sync::watch::channel(0u64);
+    let egress_cur: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     // egress 本地监听（与 WSS 主链解耦：bind 失败/未启用只影响本 task）。
     {
-        let http = cfg.egress.http.clone();
-        let bind = format!("{}:{}", http.listen_ip, http.listen_port);
-        let st = status.clone();
-        let oh = egress_out.clone();
+        let h = tokio::spawn({
+            let http = cfg.egress.http.clone();
+            let bind = format!("{}:{}", http.listen_ip, http.listen_port);
+            let st = status.clone();
+            let oh = egress_out.clone();
+            async move {
+                crate::egress::serve_egress(bind, http, oh, st).await;
+            }
+        });
+        *egress_cur.lock().await = Some(h.abort_handle());
+    }
+    {
+        // 热重启 watcher：bump 即按 agent.toml 最新 [egress.http] 重起监听
+        let cur2 = egress_cur.clone();
+        let st2 = status.clone();
+        let oh2 = egress_out.clone();
+        let cfg_path2 = config_path.to_string();
+        let mut rx = egress_rx;
         tokio::spawn(async move {
-            crate::egress::serve_egress(bind, http, oh, st).await;
+            let mut seen = *rx.borrow_and_update();
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let v = *rx.borrow_and_update();
+                if v == seen {
+                    continue;
+                }
+                seen = v;
+                if let Some(h) = cur2.lock().await.take() {
+                    h.abort();
+                }
+                let (ip, port, en) = read_egress_file2(&cfg_path2).await;
+                let bind = format!("{ip}:{port}");
+                let http = crate::agent::EgressHttp {
+                    listen_ip: ip,
+                    listen_port: port,
+                    enabled: en,
+                };
+                let h = tokio::spawn({
+                    let st = st2.clone();
+                    let oh = oh2.clone();
+                    async move {
+                        crate::egress::serve_egress(bind, http, oh, st).await;
+                    }
+                });
+                *cur2.lock().await = Some(h.abort_handle());
+            }
         });
     }
     // bumped by WebUI to force an immediate redial (settings save / button)
@@ -215,6 +276,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
             upstream: upstream.clone(),
             config_path: config_path.to_string(),
             redial: redial_tx.clone(),
+            egress_reload: egress_tx.clone(),
         }));
     }
     let mut backoff = vec![1u64, 2, 5, 10, 30, 60];

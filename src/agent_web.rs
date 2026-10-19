@@ -41,6 +41,7 @@ pub struct WebState {
     pub pass_hash: Arc<RwLock<String>>,
     pub data_path: String,
     pub secret: String,
+    pub egress_reload: tokio::sync::watch::Sender<u64>,
 }
 
 pub struct ServeArgs {
@@ -52,6 +53,7 @@ pub struct ServeArgs {
     pub upstream: Arc<RwLock<Upstream>>,
     pub config_path: String,
     pub redial: tokio::sync::watch::Sender<u64>,
+    pub egress_reload: tokio::sync::watch::Sender<u64>,
 }
 
 fn auth_ok(h: &HeaderMap, secret: &str) -> bool {
@@ -144,11 +146,15 @@ struct SettingsReq {
     hostname: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    egress_enabled: Option<bool>,
+    #[serde(default)]
+    egress_ip: Option<String>,
+    #[serde(default)]
+    egress_port: Option<u16>,
 }
 
-async fn write_upstream_toml(path: &str, up: &Upstream) -> anyhow::Result<()> {
-    write_upstream_toml_inner(path, up, None).await
-}
+
 
 /// pure merge step (unit-testable): keep existing [[proxies]] etc, refresh
 /// hostname/token/server only. Proxies are server-owned (desired), never
@@ -172,12 +178,64 @@ fn validate_server_url(s: &str) -> bool {
     s.starts_with("ws://") || s.starts_with("wss://")
 }
 
-async fn write_upstream_toml_inner(path: &str, up: &Upstream, raw: Option<String>) -> anyhow::Result<()> {
-    let raw = match raw {
-        Some(r) => r,
-        None => tokio::fs::read_to_string(path).await.unwrap_or_default(),
-    };
-    let v = merge_upstream_toml(&raw, up);
+
+
+/// pure merge step (unit-testable): write [egress.http] without touching
+/// upstream/proxies. Called after merge_upstream_toml on the same value.
+fn merge_egress_toml(mut v: toml::Value, enabled: bool, ip: &str, port: u16) -> toml::Value {
+    if !v.is_table() {
+        v = toml::Value::Table(Default::default());
+    }
+    let t = v.as_table_mut().unwrap();
+    let eg = t
+        .entry("egress".to_string())
+        .or_insert(toml::Value::Table(Default::default()));
+    if !eg.is_table() {
+        *eg = toml::Value::Table(Default::default());
+    }
+    let eht = eg
+        .as_table_mut()
+        .unwrap()
+        .entry("http".to_string())
+        .or_insert(toml::Value::Table(Default::default()));
+    if !eht.is_table() {
+        *eht = toml::Value::Table(Default::default());
+    }
+    let h = eht.as_table_mut().unwrap();
+    h.insert("enabled".into(), toml::Value::Boolean(enabled));
+    h.insert("listen_ip".into(), toml::Value::String(ip.to_string()));
+    h.insert(
+        "listen_port".into(),
+        toml::Value::Integer(port as i64),
+    );
+    v
+}
+
+/// 从 agent.toml 读当前 [egress.http]（缺失给默认值），供 WebUI 部分更新合并。
+async fn read_egress_file(path: &str) -> (bool, String, u16) {
+    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+    let h = v.get("egress").and_then(|e| e.get("http"));
+    (
+        h.and_then(|x| x.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+        h.and_then(|x| x.get("listen_ip"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("0.0.0.0")
+            .to_string(),
+        h.and_then(|x| x.get("listen_port")).and_then(|x| x.as_integer()).unwrap_or(18080) as u16,
+    )
+}
+
+async fn write_settings_toml(
+    path: &str,
+    up: &Upstream,
+    eg: Option<(bool, String, u16)>,
+) -> anyhow::Result<()> {
+    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let mut v = merge_upstream_toml(&raw, up);
+    if let Some((en, ip, port)) = eg {
+        v = merge_egress_toml(v, en, &ip, port);
+    }
     tokio::fs::write(path, toml::to_string_pretty(&v)?).await?;
     Ok(())
 }
@@ -212,6 +270,17 @@ mod tests {
         assert_eq!(v["server"].as_str().unwrap(), "ws://new:7440/ws");
         // 保留的 proxies 不被清空（server 期望态覆盖的是内存，不是文件）
         assert_eq!(v["proxies"][0]["name"].as_str().unwrap(), "web");
+    }
+
+    #[test]
+    fn merge_egress_preserves_and_updates() {
+        let raw = "hostname = \"h\"\ntoken = \"t\"\nserver = \"ws://x/ws\"\n[egress.http]\nlisten_ip = \"127.0.0.1\"\nlisten_port = 18080\nenabled = false\n";
+        let v: toml::Value = toml::from_str(raw).unwrap();
+        let v = merge_egress_toml(v, true, "0.0.0.0", 18080);
+        assert_eq!(v["egress"]["http"]["listen_ip"].as_str().unwrap(), "0.0.0.0");
+        assert!(v["egress"]["http"]["enabled"].as_bool().unwrap());
+        // 上行字段不受影响
+        assert_eq!(v["hostname"].as_str().unwrap(), "h");
     }
 
     #[test]
@@ -278,8 +347,29 @@ async fn api_settings(
                 changed = true;
             }
         }
-        if changed {
-            if let Err(e) = write_upstream_toml(&w.config_path, &up).await {
+        // egress 热更新：只写 [egress.http] + bump reload，不断 WSS 主链
+        let eg = match (r.egress_enabled, r.egress_ip, r.egress_port) {
+            (None, None, None) => None,
+            (en, ip, port) => {
+                let cur = read_egress_file(&w.config_path).await;
+                let enabled = en.unwrap_or(cur.0);
+                let lip = ip.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).unwrap_or(cur.1);
+                let lport = port.unwrap_or(cur.2);
+                if lport == 0 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"ok": false, "reason": "egress 端口非法"})),
+                    )
+                        .into_response();
+                }
+                // 借用结束后再落盘：先 clone 出需要的写回去
+                Some((enabled, lip, lport))
+            }
+        };
+        let need_write = changed || eg.is_some();
+        if need_write {
+            let egv = eg.clone();
+            if let Err(e) = write_settings_toml(&w.config_path, &up, egv).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"ok": false, "reason": format!("落盘失败: {e:#}")})),
@@ -291,9 +381,16 @@ async fn api_settings(
             st.server_url = up.server_url.clone();
             st.hostname = up.hostname.clone();
             st.online = false;
-            let n = w.redial.borrow().wrapping_add(1);
-            w.redial.send_replace(n);
-            notes.push("上行已更新，正在重连".into());
+            if changed {
+                let n = w.redial.borrow().wrapping_add(1);
+                w.redial.send_replace(n);
+                notes.push("上行已更新，正在重连".into());
+            }
+            if eg.is_some() {
+                let n = w.egress_reload.borrow().wrapping_add(1);
+                w.egress_reload.send_replace(n);
+                notes.push("出网代理已更新，监听重启中".into());
+            }
         }
     }
     Json(serde_json::json!({"ok": true, "note": notes.join("；")})).into_response()
@@ -326,6 +423,7 @@ pub async fn serve(args: ServeArgs) {
             pass_hash: args.pass_hash,
             data_path: args.data_path,
             secret: uuid::Uuid::new_v4().to_string(),
+            egress_reload: args.egress_reload,
         });
     match TcpListener::bind(&args.bind).await {
         Ok(lis) => {

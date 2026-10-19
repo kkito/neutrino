@@ -45,6 +45,7 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <nav class="side"><h1>agent</h1>
 <button id="nav-ov" class="on" onclick="tab('ov')">状态</button>
 <button id="nav-tn" onclick="tab('tn')">隧道</button>
+<button id="nav-eg" onclick="tab('eg')">出网代理</button>
 <button id="nav-set" onclick="tab('set')">设置</button></nav>
 <main class="main">
 <section id="sec-ov">
@@ -54,6 +55,19 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <section id="sec-tn" class="hidden">
 <div class="topbar"><h2>生效中的隧道</h2><span class="corner">由 server 下发 · 只读</span></div>
 <div class="card"><table id="tunnels"></table></div>
+</section>
+<section id="sec-eg" class="hidden">
+<div class="topbar"><h2>出网代理（egress）</h2><span class="corner">agent 本地监听 · 不走 server 下发</span></div>
+<div class="card" style="max-width:440px">
+<p style="color:var(--mut);font-size:13px">内网进程配代理指向此监听（如 curl -x），经 WSS 由 server 出口拨公网。保存后只重启本监听，不断 WSS 主链。</p>
+<div id="eg-stat" style="margin-bottom:8px"></div>
+<label>总开关</label>
+<select id="e-on" style="width:100%;padding:8px;border-radius:8px;background:var(--bg);color:var(--txt);border:1px solid var(--line)">
+<option value="off">关闭</option><option value="on">开启</option></select>
+<label>监听 IP（默认 0.0.0.0 全绑；只本机用填 127.0.0.1）</label><input id="e-ip" placeholder="0.0.0.0">
+<label>监听端口</label><input id="e-port" placeholder="18080" inputmode="numeric">
+<div style="margin-top:16px;text-align:right"><button class="btn" onclick="saveEgress()">保存并重启监听</button></div>
+</div>
 </section>
 <section id="sec-set" class="hidden">
 <div class="topbar"><h2>设置</h2></div>
@@ -73,7 +87,7 @@ let auth='';
 function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
   document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
-function tab(t){ for(const x of ['ov','tn','set']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+function tab(t){ for(const x of ['ov','tn','eg','set']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
   document.getElementById('nav-'+x).classList.toggle('on',x===t); } }
 async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
@@ -97,6 +111,13 @@ async function refresh(){
     `<dt>重连次数</dt><dd>${s.reconnects??0}</dd>`+
     (s.last_error?`<dt>最近错误</dt><dd style="color:var(--danger)">${s.last_error}</dd>`:'')+
     `<dt>生效隧道</dt><dd>${(s.proxies||[]).length} 条</dd>`;
+  const egOn=!!s.egress_on;
+  document.getElementById('eg-stat').innerHTML = s.egress_err
+    ? '<span class="badge b-warn">端口被占</span> '+s.egress_err
+    : (egOn ? '<span class="badge b-ok">监听中</span> '+(s.egress_listen||'') : '<span class="badge b-off">未启用</span>');
+  if(document.activeElement!==document.getElementById('e-ip')) document.getElementById('e-ip').value=(s.egress_listen||'').split(':').slice(0,-1).join(':')||'0.0.0.0';
+  if(document.activeElement!==document.getElementById('e-port')) document.getElementById('e-port').value=(s.egress_listen||'').split(':').pop()||'18080';
+  document.getElementById('e-on').value=egOn?'on':'off';
   if(document.activeElement!==document.getElementById('s-server')) document.getElementById('s-server').value=s.server_url||'';
   if(document.activeElement!==document.getElementById('s-host')) document.getElementById('s-host').value=s.hostname||'';
   document.getElementById('tunnels').innerHTML='<tr><th>name</th><th>type</th><th>目标</th><th>domains/ports</th><th>状态</th></tr>'+
@@ -116,6 +137,17 @@ async function save(){
   const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
   if(r.ok){ const j=await r.json(); toast('已保存 '+ (j.note||''));
     document.getElementById('s-token').value=''; document.getElementById('s-pass').value=''; refresh(); }
+  else { let m=r.status; try{ m=(await r.json()).reason||m; }catch(e){} toast('保存失败: '+m,true); }
+}
+async function saveEgress(){
+  const on=document.getElementById('e-on').value==='on';
+  const ip=document.getElementById('e-ip').value.trim();
+  const port=parseInt(document.getElementById('e-port').value.trim(),10);
+  const body={egress_enabled:on};
+  if(ip) body.egress_ip=ip;
+  if(!isNaN(port)) body.egress_port=port;
+  const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
+  if(r.ok){ const j=await r.json(); toast('已保存 '+(j.note||'')); refresh(); }
   else { let m=r.status; try{ m=(await r.json()).reason||m; }catch(e){} toast('保存失败: '+m,true); }
 }
 async function reconnect(){
