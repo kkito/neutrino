@@ -1,8 +1,8 @@
 //! server WebUI API：login/overview/tunnels/logs/config/desired/toggle。
 use crate::common::proto::*;
 use super::auth::{auth_ok, mint_jwt, unauthorized};
-use super::state::{apply_proxies_for_agent, log_ev, log_ev_err, AgentInfo, S};
-use axum::{extract::{Path, State}, http::{header, HeaderMap, StatusCode}, response::{Html, IntoResponse, Json}};
+use super::state::{apply_proxies_for_agent, log_ev, log_ev_err, AgentInfo, ConnInfo, S};
+use axum::{extract::{Path, Query, State}, http::{header, HeaderMap, StatusCode}, response::{Html, IntoResponse, Json}};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
@@ -96,6 +96,108 @@ pub(crate) async fn api_logs(
     }
     let v = s.events.read().await.clone();
     Json(serde_json::json!({"logs": v})).into_response()
+}
+
+/// 分钟点切片：按 gran 把分钟点组成块求和，取后 n 块。返回 (块序列, 每块秒数)。
+/// 根因→修法：hour/day 不另存，由分钟点现算（spec §3）。
+pub(crate) fn slice_points(
+    v: &std::collections::VecDeque<(u64, u64)>,
+    gran: &str,
+    n: usize,
+) -> (Vec<(u64, u64)>, usize) {
+    let per = match gran {
+        "hour" => 60,
+        "day" => 1440,
+        _ => 1,
+    };
+    let flat: Vec<(u64, u64)> = v.iter().cloned().collect();
+    let mut chunks: Vec<(u64, u64)> = flat
+        .rchunks(per)
+        .map(|c| c.iter().fold((0, 0), |(a, b), (x, y)| (a + x, b + y)))
+        .collect();
+    chunks.reverse();
+    let take = chunks.len().min(n);
+    (chunks[chunks.len().saturating_sub(take)..].to_vec(), per)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TrafficQ {
+    #[serde(default)]
+    tunnel: String,
+    #[serde(default = "d_gran")]
+    gran: String,
+    #[serde(default = "d_n")]
+    n: usize,
+}
+fn d_gran() -> String {
+    "min".into()
+}
+fn d_n() -> usize {
+    180
+}
+
+/// GET /api/traffic?tunnel=<key|all>&gran=min|hour|day&n=<N>
+/// tunnel=all/空 = 全部 key 按位对齐相加（agent 汇总前端直接用此口径）。
+pub(crate) async fn api_traffic(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+    Query(q): Query<TrafficQ>,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let gran = match q.gran.as_str() {
+        "hour" | "day" => q.gran.clone(),
+        _ => "min".into(),
+    };
+    let n = q.n.clamp(1, 2000);
+    let step: i64 = match gran.as_str() {
+        "hour" => 3600,
+        "day" => 86400,
+        _ => 60,
+    };
+    let tr = s.traffic.read().await;
+    let keys: Vec<String> = if q.tunnel.is_empty() || q.tunnel == "all" {
+        tr.keys().cloned().collect()
+    } else {
+        vec![q.tunnel.clone()]
+    };
+    let mut series: Vec<(u64, u64)> = vec![];
+    for k in &keys {
+        if let Some(v) = tr.get(k) {
+            let (pts, _) = slice_points(v, &gran, n);
+            if pts.len() > series.len() {
+                series.resize(pts.len(), (0, 0));
+            }
+            let off = series.len() - pts.len();
+            for (i, p) in pts.iter().enumerate() {
+                series[off + i].0 += p.0;
+                series[off + i].1 += p.1;
+            }
+        }
+    }
+    let now = chrono::Local::now().timestamp();
+    let start = now - series.len() as i64 * step;
+    let points: Vec<(i64, u64, u64)> = series
+        .iter()
+        .enumerate()
+        .map(|(i, (r, t))| (start + i as i64 * step, *r, *t))
+        .collect();
+    Json(serde_json::json!({"points": points})).into_response()
+}
+
+/// GET /api/conns：当前连接快照。
+pub(crate) async fn api_conns(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let v: Vec<ConnInfo> = s.conns.read().await.values().cloned().collect();
+    Json(serde_json::json!({"conns": v})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -379,6 +481,18 @@ pub(crate) async fn api_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn traffic_slice_math() {
+        use std::collections::VecDeque;
+        // 180 个分钟点，每点 (60,30)：hour 应=60点求和，day 应=全量求和
+        let v: VecDeque<(u64, u64)> = (0..180).map(|_| (60u64, 30u64)).collect();
+        let (r, _) = super::slice_points(&v, "hour", 2);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], (3600, 1800));
+        let (r2, _) = super::slice_points(&v, "day", 31);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0], (180 * 60, 180 * 30));
+    }
     #[test]
     fn basic_auth_gate() {
         use crate::common::proto::check_basic_auth;

@@ -7,7 +7,7 @@ pub mod state;
 pub mod tunnel;
 
 pub(crate) use state::{Shared, S};
-use api::{api_config, api_desired_get, api_desired_reload, api_desired_set, api_login, api_logs, api_overview, api_toggle, api_tunnels};
+use api::{api_config, api_conns, api_desired_get, api_desired_reload, api_desired_set, api_login, api_logs, api_overview, api_toggle, api_traffic, api_tunnels};
 use ingress::fallback_http_ingress;
 use tunnel::ws_handler;
 use axum::{routing::{get, post}, Router};
@@ -113,6 +113,8 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         .route("/api/overview", get(api_overview))
         .route("/api/tunnels", get(api_tunnels))
         .route("/api/logs", get(api_logs))
+        .route("/api/traffic", get(api_traffic))
+        .route("/api/conns", get(api_conns))
         .route("/api/config", post(api_config))
         .route("/api/tunnels/:agent/:name/enabled", post(api_toggle))
         .route("/api/desired/reload", post(api_desired_reload))

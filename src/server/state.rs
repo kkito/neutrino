@@ -83,8 +83,8 @@ pub(crate) fn minute_delta(prev: (u64, u64), cur: (u64, u64)) -> (u64, u64) {
     (cur.0.saturating_sub(prev.0), cur.1.saturating_sub(prev.1))
 }
 
-/// 后 n 个点求和（/api/traffic hour/day 加总用）
-#[allow(dead_code)] // Task4 切片消费
+/// 后 n 个点求和（聚合口径备用；slice_points 内 rchunks 求和是同口径实现）
+#[allow(dead_code)]
 pub(crate) fn rollup(points: &VecDeque<(u64, u64)>, n: usize) -> (u64, u64) {
     points.iter().rev().take(n).fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
 }
