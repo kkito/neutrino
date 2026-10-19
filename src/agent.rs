@@ -479,7 +479,6 @@ async fn open_stream(
     let local = TcpStream::connect((p.local_ip.as_str(), p.local_port)).await?;
     tracing::debug!("stream {sid} -> {}:{}", p.local_ip, p.local_port);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // drain data that arrived before the Open task ran
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {
         let _ = dtx.send(chunk);
@@ -495,33 +494,209 @@ async fn open_stream(
             }
         }
     });
-    // local -> ws
+    // local -> ws：只有 http（有明确响应边界）才做“读一个响应即收尾”；
+    // tcp/https/裸流按字节透传，任意一方向 EOF 即收尾（旧 select! 逻辑）。
+    // 之前 http 逻辑套在 tcp 上，echo 回包无响应头，被当成“头过大兜底裸流”
+    // 进了 stream_body_until_idle 的 5s 空闲等待——tcp 回声测试挂 10s 超时。
     let ctx3 = ctx.clone();
-    let local_to_ws = tokio::spawn(async move {
-        let mut b = vec![0u8; 32 * 1024];
-        loop {
-            match lr.read(&mut b).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ctx3.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
-                        break;
+    if kind == "http" {
+        let local_to_ws = tokio::spawn(http_response_pump(ctx3, sid, lr));
+        // keep-alive 后端不会 FIN，不能等 ws->local 的 EOF：
+        // 响应读完即收尾（之前 select! 双向等，curl 挂到 keep-alive 超时约 6s）。
+        let _ = local_to_ws.await;
+        ws_to_local.abort();
+    } else {
+        let local_to_ws = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut b = vec![0u8; 32 * 1024];
+            loop {
+                match lr.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if ctx3.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
+                            break;
+                        }
                     }
                 }
             }
+        });
+        tokio::select! {
+            _ = ws_to_local => {}
+            _ = local_to_ws => {}
         }
-    });
-    // either direction EOF ends the stream (join! would wait for BOTH,
-    // but ws->local only ends when server closes the stream, i.e. never
-    // for keep-alive HTTP — that was the hang: curl waited for backend
-    // response EOF while we waited for curl's EOF).
-    tokio::select! {
-        _ = ws_to_local => {}
-        _ = local_to_ws => {}
     }
     ctx.streams.write().await.remove(&sid);
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = ctx2.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
     Ok(())
+}
+
+/// http 响应泵：按 Content-Length / chunked 把“一个响应”读完即收尾。
+/// keep-alive 后端不会 FIN，不能等 EOF（旧代码挂 6s 就是等它）；
+/// 读不到完整头/超预算则按流式透传兜底（靠 server 侧 30s 上游超时）。
+/// lr 所有权移入：读完即结束，无借用问题。
+async fn http_response_pump(ctx: Arc<Ctx>, sid: u32, mut lr: tokio::net::tcp::OwnedReadHalf) {
+    use tokio::io::AsyncReadExt;
+    let mut b = vec![0u8; 32 * 1024];
+    // 首包：必须含完整响应头，否则按裸流透传
+    let mut head = vec![];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(n)) => {
+                head.extend_from_slice(&b[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 64 * 1024 {
+                    break; // 头过大：兜底裸流
+                }
+            }
+        }
+    }
+    let hpos = head.windows(4).position(|w| w == b"\r\n\r\n");
+    let (hlen, body_prefix) = match hpos {
+        Some(i) => (i + 4, head[i + 4..].to_vec()),
+        None => {
+            let _ = ctx.out.send(Message::Binary(encode_data(sid, &head).into()));
+            stream_body_until_idle(ctx.clone(), sid, &mut lr).await;
+            return;
+        }
+    };
+    let hdr_txt = String::from_utf8_lossy(&head[..hlen]);
+    let _ = ctx.out.send(Message::Binary(encode_data(sid, &head).into()));
+    if hdr_txt.lines().any(|l| {
+        matches!(l.split_once(':'), Some((k, v))
+            if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_lowercase().contains("chunked"))
+    }) {
+        // chunked：按块边界读到 0-chunk 即收尾，不靠超时。
+        stream_chunked(ctx.clone(), sid, &mut lr, body_prefix).await;
+        return;
+    }
+    if hdr_txt.lines().any(|l| {
+        matches!(l.split_once(':'), Some((k, v))
+            if k.trim().eq_ignore_ascii_case("connection")
+                && v.to_lowercase().contains("close"))
+    }) {
+        // connection: close：靠 EOF 收尾。
+        stream_body_until_idle(ctx.clone(), sid, &mut lr).await;
+        return;
+    }
+    let want: usize = content_length(&hdr_txt).unwrap_or(0);
+    let mut got = body_prefix.len();
+    let mut extra = want.saturating_sub(got);
+    while extra > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                if ctx.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
+                    break;
+                }
+                got += n;
+                extra = want.saturating_sub(got);
+            }
+        }
+    }
+}
+
+/// 从响应头文本提取 Content-Length（无则 None）。
+fn content_length(hdr: &str) -> Option<usize> {
+    hdr.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case("content-length") {
+            v.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// chunked 响应：按块边界读到 0-chunk 即收尾。
+/// 关键：body_prefix 里可能已含后续块（甚至整个尾部），先消费 prefix 再读网。
+/// 0-chunk 行本身（`0\r\n`）+ 其后 trailer 空行在 prefix 里齐了就直接收尾，
+/// 不再读网——否则 keep-alive 连接上读网会挂到对方超时。
+async fn stream_chunked(ctx: Arc<Ctx>, sid: u32, lr: &mut tokio::net::tcp::OwnedReadHalf, prefix: Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = prefix;
+    loop {
+        // 读到一行块头
+        let line_end = loop {
+            if let Some(i) = buf.windows(2).position(|w| w == b"\r\n") {
+                break i;
+            }
+            let mut b = vec![0u8; 4096];
+            match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                    let _ = ctx.out.send(Message::Binary(encode_data(sid, &buf).into()));
+                    return;
+                }
+                Ok(Ok(n)) => buf.extend_from_slice(&b[..n]),
+            }
+        };
+        let size_line = String::from_utf8_lossy(&buf[..line_end]).to_string();
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16).unwrap_or(usize::MAX);
+        if size == usize::MAX {
+            let _ = ctx.out.send(Message::Binary(encode_data(sid, &buf).into()));
+            stream_body_until_idle(ctx.clone(), sid, lr).await; // 非法块头兜底
+            return;
+        }
+        if size == 0 {
+            // 0-chunk 行 + trailer：能从 buf 里凑够 `\r\n\r\n` 就直接收尾。
+            let after = &buf[line_end + 2..];
+            if after.windows(4).any(|w| w == b"\r\n\r\n") || after == b"\r\n" {
+                let _ = ctx.out.send(Message::Binary(encode_data(sid, &buf).into()));
+            } else {
+                // prefix 里尾部不全：最多再等 1s 凑 trailer，凑不齐也收尾
+                // （trailer 可丢，不能把等待算进响应）。
+                let _ = ctx.out.send(Message::Binary(encode_data(sid, &buf).into()));
+                let mut tail: Vec<u8> = vec![];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    let mut b = vec![0u8; 1024];
+                    while !tail.windows(2).any(|w| w == b"\r\n") && tail.len() < 1024 {
+                        match lr.read(&mut b).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => tail.extend_from_slice(&b[..n]),
+                        }
+                    }
+                })
+                .await;
+            }
+            return;
+        }
+        // 需要 size + 2（尾 CRLF）字节
+        let need = line_end + 2 + size + 2;
+        while buf.len() < need {
+            let mut b = vec![0u8; 32 * 1024];
+            match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                    let _ = ctx.out.send(Message::Binary(encode_data(sid, &buf).into()));
+                    return;
+                }
+                Ok(Ok(n)) => buf.extend_from_slice(&b[..n]),
+            }
+        }
+        // 本块完整：切出来发送，留剩余继续解析（关键：不能整 buf 一次发完就 return，
+        // 否则 0-chunk 还没读到；也不能攒着不发，要边读边发）。
+        let chunk = buf[..need].to_vec();
+        let _ = ctx.out.send(Message::Binary(encode_data(sid, &chunk).into()));
+        buf = buf[need..].to_vec();
+    }
+}
+
+/// 流式透传直到后端 EOF 或 5s 读空闲（chunked/close 连接的收尾方式）。
+async fn stream_body_until_idle(ctx: Arc<Ctx>, sid: u32, lr: &mut tokio::net::tcp::OwnedReadHalf) {
+    let mut b = vec![0u8; 32 * 1024];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lr.read(&mut b)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                if ctx.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// UDP over stream: each Binary frame = one datagram. Agent dials a connected
