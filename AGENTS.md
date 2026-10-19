@@ -4,13 +4,13 @@
 - Rust 单二进制：`neutrino server | agent`（`src/main.rs` 分发）。
 - server 公网单端口 `--listen`（默认 `127.0.0.1:7440`）：`/ws`（agent 信令）+ `/api/*` + `/`（WebUI）+ 隧道域名 Host 透传，三路按 Host 分流（`src/server.rs::route_fallback`）。`--http-in` 已废弃（传了 warn 忽略）。
 - agent 内网出站 WSS 长连，无公网入站。隧道以 server `desired.toml` 为唯一源头，agent 本地 proxies 忽略；agent WebUI（`--web`）只管上行地址/hostname/token。
-- 协议见 `README.md` + `docs/architecture.md` + `docs/specs/`。
+- 协议见 `README.md` + `docs/architecture.md` + `docs/superpowers/specs/`。
 
 ## 文档索引
 - `README.md`：协议/功能对照/本地验证/部署。
 - `docs/architecture.md`：架构与典型流程（含 mermaid 图）。
 - `docs/nginx.md`：natproxy 侧 nginx 接入（管理域/业务域/tcp-udp/验证）。
-- `docs/specs/2026-10-19-dual-webui-design.md`：双 WebUI + 期望态设计。
+- `docs/superpowers/specs/2026-10-19-dual-webui-design.md`：双 WebUI + 期望态设计。
 
 ## 常用命令
 ```bash
