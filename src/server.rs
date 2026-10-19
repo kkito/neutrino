@@ -332,7 +332,7 @@ pub async fn run(listen: &str, http_in: &str, data: &str, token: &str, desired: 
     println!("  ws+webui     : http://{listen}/");
     println!("  http-ingress : http://{http_in}/");
     if need_init {
-        println!("  web login    : admin / welcome2ll (默认, 首次登录后请改口令)");
+        println!("  web login    : admin / welcome2neutrino (默认, 首次登录后请改口令)");
     } else {
         println!("  web login    : admin / (已设置的口令)");
     }
@@ -903,7 +903,7 @@ async fn api_login(
 ) -> impl IntoResponse {
     let h = s.password_hash.read().await.clone();
     let ok = if h.is_empty() {
-        r.user == "admin" && r.pass == "welcome2ll"
+        r.user == "admin" && r.pass == "welcome2neutrino"
     } else {
         r.user == "admin" && bcrypt::verify(&r.pass, &h).unwrap_or(false)
     };

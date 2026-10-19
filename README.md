@@ -20,7 +20,7 @@
 | https 透传 | `type=https` + `remote_port`：server TCP listen，agent 按 `remote_port` 匹配本地 TLS 端口透传（不解密） |
 | tcp 透传 | 同上 `type=tcp`（如 51413），lazy listen |
 | udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话 120s 过期；agent 用 connected UDP 透本地 |
-| WebUI 登录 | bcrypt（`genhash` 生成，存 `state.json`；空=初装 admin/welcome2ll）+ HS256 JWT（HttpOnly cookie `nt_session` + Bearer 双通道），未登录 `/api/*` 401 |
+| WebUI 登录 | bcrypt（`genhash` 生成，存 `state.json`；空=初装 admin/welcome2neutrino）+ HS256 JWT（HttpOnly cookie `nt_session` + Bearer 双通道），未登录 `/api/*` 401 |
 | 双 WebUI | server `web/index.html`（总览/隧道表单/日志）+ agent `--web` 本地页（上行状态/只读隧道/改口令），同视觉 token，深色模式 |
 | 期望态（server 为准）| `desired.toml`（`[[agents.<hostname]]]`，结构同 ProxyConfig）→ WebUI `GET/POST /api/desired/:hostname` 增删改 → 在线即下发 `Config`，离线 register 时覆盖+回推同步；agent 本地 proxies 忽略 |
 | 多 agent | domain/port → agent 列表轮询；`state.json` 落盘 totals+password_hash（30s + 断线时） |
@@ -40,7 +40,7 @@ agent 本地错误配置被期望态覆盖（含回推同步本地路由表）�
 
 ```bash
 cargo build
-./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2ll --desired ./data/desired.toml &
+./target/debug/neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --token welcome2neutrino --desired ./data/desired.toml &
 ./target/debug/neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml.example --web 127.0.0.1:8080 &
 curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7080/   # 透到 agent 本地
 open http://127.0.0.1:7440/                                # server WebUI
@@ -62,7 +62,7 @@ kill $(cat neutrino.pid)                               # 停服
 ```bash
 cargo build --release
 scp target/release/neutrino root@natproxy:/root/nastools/tunnel/
-NEUTRINO_TOKEN=welcome2ll ./neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --data ./data
+NEUTRINO_TOKEN=welcome2neutrino ./neutrino server --listen 127.0.0.1:7440 --http-in 127.0.0.1:7080 --data ./data
 ```
 
 nginx 用 `deploy/tunnel-nginx.conf`：`tunnel.nat.kkito.cn/ws`→7440（Upgrade 头+1d 超时），

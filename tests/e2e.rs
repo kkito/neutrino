@@ -105,7 +105,7 @@ async fn login(base: &str) -> String {
     let c = reqwest::Client::new();
     let r = c
         .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"user": "admin", "pass": "welcome2ll"}))
+        .json(&serde_json::json!({"user": "admin", "pass": "welcome2neutrino"}))
         .send()
         .await
         .unwrap();

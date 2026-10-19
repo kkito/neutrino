@@ -94,7 +94,7 @@ mod tests {
         let m = ClientMsg::Hello {
             hostname: "minipc7s".into(),
             version: "0.1.0".into(),
-            token: "welcome2ll".into(),
+            token: "welcome2neutrino".into(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"t\":\"hello\""));

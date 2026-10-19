@@ -29,7 +29,7 @@ enum Cmd {
         #[arg(long, default_value = "./data/desired.toml")]
         desired: String,
         /// pre-shared token (or env NEUTRINO_TOKEN)
-        #[arg(long, default_value = "welcome2ll")]
+        #[arg(long, default_value = "welcome2neutrino")]
         token: String,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
