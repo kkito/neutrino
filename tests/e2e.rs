@@ -582,3 +582,112 @@ async fn e2e_restart_covered_by_desired() {
     assert!(http_get_via(&env, "c.e2e.test").await.contains("covered-ok"));
     let _ = env;
 }
+
+/// e2e egress 回归：旧代码无 Open{egress} 分支时，此测试挂（代理连上即被挂起/502）。
+/// 断言抓：经 agent 本地代理 CONNECT 到后端，回包含 EGRESS-OK（证明走了 server 出口拨回）。
+#[tokio::test]
+async fn egress_http_proxy_roundtrip() {
+    // 公网目标替身：本机 echo 后端（server 拨它 = 经 server 出口）
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let n = s.read(&mut b).await.unwrap_or(0);
+                eprintln!("E2E-BACKEND got n={n} head={:?}", &b[..n.min(80)]);
+                let body = format!("EGRESS-OK got={n}");
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    let eport = free_port();
+    let env = boot_with_desired(
+        &format!("[egress.http]\nlisten_ip = \"127.0.0.1\"\nlisten_port = {eport}\nenabled = true\n"),
+        None,
+    )
+    .await;
+    // 轮询等 egress 监听就绪（40×200ms 上限，不赌固定 sleep）
+    let mut ok = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "egress proxy never came up");
+    // CONNECT 隧道：curl -x 等价手写
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.unwrap();
+    c.write_all(format!("CONNECT 127.0.0.1:{bport} HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // 本机回环下 200 与后续回包可能粘包到达：只消费到首个 CRLFCRLF，剩余字节留给 body。
+    let mut raw = vec![];
+    let mut tmp = vec![0u8; 4096];
+    loop {
+        let n = c.read(&mut tmp).await.unwrap();
+        assert!(n > 0, "CONNECT closed before established");
+        raw.extend_from_slice(&tmp[..n]);
+        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let hs = String::from_utf8_lossy(&raw).into_owned();
+    assert!(hs.contains("200"), "CONNECT not established: {hs}");
+    let hlen = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let mut out = raw[hlen..].to_vec();
+    // 隧道内发普通 GET，后端应回 EGRESS-OK
+    c.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+    c.read_to_end(&mut out).await.unwrap();
+    let body = String::from_utf8_lossy(&out).into_owned();
+    assert!(body.contains("EGRESS-OK"), "egress roundtrip failed: {body}");
+    let _ = env;
+}
+
+/// e2e egress 拨失败：目标端口无监听，server 应回 Close，本地 CONNECT 隧道随之关闭（非挂起）。
+#[tokio::test]
+async fn egress_dial_refused_close() {
+    let eport = free_port();
+    let dead = free_port(); // 刚取到的空闲端口：无监听
+    let env = boot_with_desired(
+        &format!("[egress.http]\nlisten_ip = \"127.0.0.1\"\nlisten_port = {eport}\nenabled = true\n"),
+        None,
+    )
+    .await;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.unwrap();
+    c.write_all(format!("CONNECT 127.0.0.1:{dead} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // 首版 CONNECT 先回 200，随后 server 拨失败 Close，隧道应在 40×200ms 内关闭
+    let mut buf = vec![0u8; 4096];
+    let mut closed = false;
+    for _ in 0..40 {
+        match tokio::time::timeout(Duration::from_millis(200), c.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(_)) => continue, // 200 头等数据，继续等 EOF
+            _ => continue,
+        }
+    }
+    assert!(closed, "dial-refused stream did not close");
+    let _ = env;
+}

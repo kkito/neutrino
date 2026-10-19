@@ -225,9 +225,17 @@ async fn handle_conn(
         }
     });
     let from_server = async {
-        while let Some(chunk) = drx.recv().await {
-            if wi.write_all(&chunk).await.is_err() {
-                break;
+        loop {
+            match drx.recv().await {
+                Some(chunk) => {
+                    if wi.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    // drx 关闭 = server 发了 eof 标记后删表（或 session Close 清表），正常收尾。
+                    break;
+                }
             }
         }
     };

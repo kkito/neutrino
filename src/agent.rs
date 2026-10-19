@@ -40,7 +40,7 @@ impl Default for EgressHttp {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct EgressCfg {
     #[serde(default)]
-    http: EgressHttp,
+    pub http: EgressHttp,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -538,6 +538,12 @@ async fn session(
                 if let Some((id, payload)) = decode_data(&b) {
                     if let Some(tx) = ctx.streams.read().await.get(&id).cloned() {
                         let _ = tx.send(payload.to_vec());
+                    } else if payload.is_empty()
+                        && crate::egress::egress_streams().read().await.contains_key(&id)
+                    {
+                        // server eof 标记（与数据同 outbox 通道保序）：删表即 drop 唯一
+                        // sender，handle_conn 的 drx 关闭→from_server 结束→连接 teardown。
+                        crate::egress::egress_streams().write().await.remove(&id);
                     } else if let Some(tx) = crate::egress::egress_streams().read().await.get(&id).cloned() {
                         let _ = tx.send(payload.to_vec());
                     } else {

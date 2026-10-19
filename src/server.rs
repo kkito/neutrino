@@ -45,6 +45,9 @@ struct AgentHandle {
     connected_at: chrono::DateTime<chrono::Utc>,
     ctl: mpsc::UnboundedSender<ServerMsg>,
     incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Binary 早到缓存：egress Open 与首包背靠背时，占位注册前的包先存此表，
+    /// 拨号泵启动后 drain 写给公网（与 agent 侧 Ctx.pending 对称）。
+    pending: Arc<RwLock<HashMap<u32, Vec<Vec<u8>>>>>,
 }
 
 #[derive(Default)]
@@ -396,6 +399,8 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     let incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let pending: Arc<RwLock<HashMap<u32, Vec<Vec<u8>>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     // restore persisted counters
     let (prx, ptx) = s.totals.read().await.get(&hostname).cloned().unwrap_or((0, 0));
     {
@@ -415,6 +420,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                 connected_at: chrono::Utc::now(),
                 ctl: ctl_tx.clone(),
                 incoming: incoming.clone(),
+                pending: pending.clone(),
             },
         );
         s.outbox.write().await.insert(agent_id.clone(), out_tx);
@@ -475,6 +481,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                             Ok(ClientMsg::Close { stream, .. }) => {
                                 if let Some(h) = s.agents.read().await.get(&agent_id) {
                                     h.incoming.write().await.remove(&stream);
+                                    h.pending.write().await.remove(&stream);
                                 }
                             }
                             Ok(ClientMsg::Open { stream, kind, host, port }) if kind == "egress" => {
@@ -486,12 +493,19 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                     }
                     WsMsg::Binary(b) => {
                         if let Some((id, payload)) = decode_data(&b) {
-                            let waiter = s.agents.read().await.get(&agent_id).map(|h| h.incoming.clone());
-                            if let Some(st) = waiter {
+                            let waiter = s.agents.read().await.get(&agent_id).map(|h| (h.incoming.clone(), h.pending.clone()));
+                            if let Some((st, pe)) = waiter {
                                 if let Some(tx) = st.read().await.get(&id).cloned() {
                                     let _ = tx.send(payload.to_vec());
                                     if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
                                         h.info.rx_bytes += payload.len() as u64;
+                                    }
+                                } else {
+                                    // 早到（Open 未处理/占位未命中）：缓存，泵启动后 drain。
+                                    let mut p = pe.write().await;
+                                    let e = p.entry(id).or_default();
+                                    if e.len() < 64 {
+                                        e.push(payload.to_vec());
                                     }
                                 }
                             }
@@ -562,6 +576,20 @@ fn spawn_egress_dial(
     }
     let s = s.clone();
     let aid = agent_id.to_string();
+    // 先占位注册 incoming[sid]：agent Open 后会背靠背发 Binary head，
+    // 若等拨号完成才注册，早到的包会被 Binary 分支丢弃（查不到即丢）→ Forward 死锁。
+    // 拨失败/异常时移除占位并回 Close。同步 fn 内用 try_write 非阻塞占位
+    // （ws_loop 持读锁的瞬间极短，失败则退化为旧行为——拨号RTT内大概率已注册）。
+    let (dtx_pre, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+    {
+        if let Ok(ag) = s.agents.try_read() {
+            if let Some(h) = ag.get(agent_id) {
+                if let Ok(mut inc) = h.incoming.try_write() {
+                    inc.insert(sid, dtx_pre);
+                }
+            }
+        }
+    }
     tokio::spawn(async move {
         let up = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -571,6 +599,10 @@ fn spawn_egress_dial(
         {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
+                if let Some(h) = s.agents.read().await.get(&aid) {
+                    h.incoming.write().await.remove(&sid);
+                    h.pending.write().await.remove(&sid);
+                }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: format!("dial refused: {e}"),
@@ -578,6 +610,10 @@ fn spawn_egress_dial(
                 return;
             }
             Err(_) => {
+                if let Some(h) = s.agents.read().await.get(&aid) {
+                    h.incoming.write().await.remove(&sid);
+                    h.pending.write().await.remove(&sid);
+                }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: "dial timeout 30s".into(),
@@ -585,14 +621,17 @@ fn spawn_egress_dial(
                 return;
             }
         };
-        // 接泵：incoming[sid] 收 agent 发来的 Binary 写给公网；outbox 发 Binary 给 agent。
-        let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // 接泵：占位时已注册 incoming[sid]，此处复用 drx 收 agent 发来的 Binary 写给公网；
+        // outbox 发 Binary 给 agent。agent gone 时移除占位。
         let out = {
             let ag = s.agents.read().await;
             let ob = s.outbox.read().await;
             match (ag.get(&aid), ob.get(&aid)) {
                 (Some(_), Some(o)) => o.clone(),
                 _ => {
+                    if let Some(h) = s.agents.read().await.get(&aid) {
+                        h.incoming.write().await.remove(&sid);
+                    }
                     let _ = ctl.send(ServerMsg::Close {
                         stream: sid,
                         reason: "agent gone".into(),
@@ -601,10 +640,25 @@ fn spawn_egress_dial(
                 }
             }
         };
-        if let Some(h) = s.agents.read().await.get(&aid) {
-            h.incoming.write().await.insert(sid, dtx);
-        }
         let (mut ru, mut wu) = up.into_split();
+        // drain 占位前缓存的早到包（先写，保证请求头完整再接实时流）。
+        {
+            let early = s
+                .agents
+                .read()
+                .await
+                .get(&aid)
+                .map(|h| h.pending.clone());
+            if let Some(pe) = early {
+                if let Some(chunks) = pe.write().await.remove(&sid) {
+                    for chunk in chunks {
+                        if wu.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let out2 = out.clone();
         let to_public = tokio::spawn(async move {
             let mut b = vec![0u8; 32 * 1024];
@@ -631,11 +685,13 @@ fn spawn_egress_dial(
         }
         if let Some(h) = s.agents.read().await.get(&aid) {
             h.incoming.write().await.remove(&sid);
+            h.pending.write().await.remove(&sid);
         }
-        let _ = ctl.send(ServerMsg::Close {
-            stream: sid,
-            reason: "eof".into(),
-        });
+        // eof 标记必须与回包数据走同一 outbox 通道（空包=EOF）：若经 ctl 发 Close{eof}，
+        // 两通道在 ws_loop 被 select! 复用会乱序——Close 先到则 agent 误删 egress 表项，
+        // 在途数据查不到表项进 pending 死缓冲，client 得空 BODY（见 egress e2e flaky 根因）。
+        // 同通道保序：数据全到后空包到，agent 删表即 drop sender，handle_conn 正常收尾。
+        let _ = out.send((sid, Vec::new()));
     });
 }
 
