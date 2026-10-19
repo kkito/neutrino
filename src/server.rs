@@ -324,6 +324,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         .route("/api/logs", get(api_logs))
         .route("/api/config", post(api_config))
         .route("/api/tunnels/:agent/:name/enabled", post(api_toggle))
+        .route("/api/desired/reload", post(api_desired_reload))
         .route("/api/desired/:hostname", get(api_desired_get).post(api_desired_set))
         // 注意：`/` 不单独注册精确路由，否则带隧道 Host 访问 `/` 会被它抢走；
         // 统一走 fallback 按 Host 分流（WebUI vs 隧道）。
@@ -1395,6 +1396,36 @@ async fn api_config(
     Json(serde_json::json!({"ok": true, "pushed": targets.len()})).into_response()
 }
 
+/// Parse desired file text into (hostname -> valid proxies, skipped count).
+/// 根因→修法：load 只在启动时调一次，手改文件无感知；重载接口与启动加载共用此纯函数，
+/// 坏 TOML 整单拒绝（内存不动），坏条逐条跳过、好条生效。
+fn parse_desired_text(text: &str) -> Result<(HashMap<String, Vec<ProxyConfig>>, usize), String> {
+    let v: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let agents = v.get("agents").ok_or_else(|| "missing [agents] table".to_string())?;
+    if !agents.is_table() {
+        return Err("agents is not a table".to_string());
+    }
+    let mut fresh: HashMap<String, Vec<ProxyConfig>> = HashMap::new();
+    let mut skipped = 0;
+    for (hostname, val) in agents.as_table().unwrap() {
+        // 文件形状：[[agents.<hostname>]] 数组表，每项直接就是 ProxyConfig（与 data/desired.toml 一致）
+        let list: Vec<ProxyConfig> =
+            serde_json::from_value(serde_json::to_value(val).unwrap_or_default()).unwrap_or_default();
+        let mut good = vec![];
+        for p in list {
+            match validate_proxy(&p) {
+                Ok(()) => good.push(p),
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!("desired reload skip {hostname}/{}: {e}", p.name);
+                }
+            }
+        }
+        fresh.insert(hostname.clone(), good);
+    }
+    Ok((fresh, skipped))
+}
+
 /// Validate one proxy entry from the desired-CRUD form.
 fn validate_proxy(p: &ProxyConfig) -> Result<(), String> {
     if p.name.is_empty() {
@@ -1483,6 +1514,66 @@ async fn api_desired_set(
     }
     log_ev(&s, format!("desired set for '{hostname}' ({} proxies, pushed {pushed})", r.proxies.len()));
     Json(serde_json::json!({"ok": true, "pushed": pushed})).into_response()
+}
+
+/// Reload desired from file: 手改 desired.toml 后点按钮生效（替代重启）。
+/// 根因→修法：load 只在启动时调一次，手改文件无感知；本接口重读全量替换内存，
+/// 不落盘（文件即源）。坏 TOML 内存不动；坏条跳过、好条生效。
+async fn api_desired_reload(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let text = match std::fs::read_to_string(&s.desired_path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("desired reload failed ({}): {e}", s.desired_path);
+            log_ev(&s, format!("desired reload failed: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "reason": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let (fresh, skipped) = match parse_desired_text(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("desired reload failed ({}): {e}", s.desired_path);
+            log_ev(&s, format!("desired reload failed: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "reason": e})),
+            )
+                .into_response();
+        }
+    };
+    let reloaded: usize = fresh.values().map(|v| v.len()).sum();
+    *s.desired.write().await = fresh.clone();
+    // 对在线 agent 按 hostname 推送（复用 api_desired_set 后半段语义，不落盘）
+    let mut pushed = 0;
+    for (hostname, proxies) in &fresh {
+        let targets: Vec<(String, mpsc::UnboundedSender<ServerMsg>)> = {
+            s.agents
+                .read()
+                .await
+                .values()
+                .filter(|hh| hh.info.hostname == *hostname)
+                .map(|hh| (hh.info.agent_id.clone(), hh.ctl.clone()))
+                .collect()
+        };
+        for (aid, ctl) in &targets {
+            let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+            apply_proxies_for_agent(&s, aid, proxies).await;
+            pushed += 1;
+        }
+    }
+    log_ev(&s, format!("desired reloaded ({reloaded} ok, {skipped} skipped, pushed {pushed})"));
+    Json(serde_json::json!({"ok": true, "reloaded": reloaded, "skipped": skipped, "pushed": pushed}))
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1602,6 +1693,33 @@ mod tests {
         let mut unk = tcp.clone();
         unk.ptype = "socks".into();
         assert!(validate_proxy(&unk).is_err());
+    }
+
+    #[test]
+    fn desired_reload_route_beats_hostname_param() {
+        // Axum 路由语义：静态段 /api/desired/reload 优先于 /api/desired/:hostname。
+        // 本测试锁定 run() 内注册顺序（reload 先于 :hostname）：若有人调换顺序导致
+        // reload 被当 hostname 解析，此处即红。旧代码无 reload 路由时 POST 落到
+        // :hostname 的 set 分支（行为缺失即红）。
+        let src = include_str!("server.rs");
+        let reload_pos = src.find("\"/api/desired/reload\"").expect("reload route exists");
+        let param_pos = src.find("\"/api/desired/:hostname\"").expect("hostname route exists");
+        assert!(reload_pos < param_pos, "reload must be registered before :hostname");
+    }
+
+    #[test]
+    fn reload_desired_rejects_bad_toml() {
+        assert!(parse_desired_text("[[[broken").is_err());
+        assert!(parse_desired_text("agents = 123").is_err());
+    }
+
+    #[test]
+    fn reload_desired_skips_invalid_entries() {
+        let text = "[[agents.e2e]]\nname = \"good\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = 80\nremote_port = 2222\nenabled = true\n\n[[agents.e2e]]\nname = \"bad\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = 80\nremote_port = 0\nenabled = true\n";
+        let (fresh, skipped) = parse_desired_text(text).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(fresh["e2e"].len(), 1);
+        assert_eq!(fresh["e2e"][0].name, "good");
     }
 
     #[test]

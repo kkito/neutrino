@@ -18,7 +18,11 @@ impl DesiredStore {
     pub fn load(path: &str) -> Self {
         let data = std::fs::read_to_string(path)
             .ok()
-            .and_then(|s| toml::from_str::<File>(&s).ok())
+            .and_then(|s| {
+                toml::from_str::<File>(&s)
+                    .map_err(|e| tracing::warn!("desired load parse failed ({path}): {e}"))
+                    .ok()
+            })
             .map(|f| f.agents)
             .unwrap_or_default();
         Self {
