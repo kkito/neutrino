@@ -8,6 +8,25 @@
 - 结论先行：**映射本身代码侧现成，零开发**；本篇 §2–§5 是通用做法说明，§6 是待实现的生效方式补齐。
 - 与 egress（出网代理）正交：一个管进（server listen → agent 拨内网），一个管出（agent listen → server 拨公网），复用同一套 stream 泵。
 
+### 流量拓扑
+
+```mermaid
+flowchart LR
+    subgraph PUB[公网]
+        CLI[外部客户端]
+        SRV[server监听remoteport]
+        CLI --> SRV
+    end
+    subgraph LAN[内网]
+        AG[agent拨内网]
+        SVC[内网服务]
+        AG --> SVC
+    end
+    SRV <--> AG
+```
+
+- 外部客户端只感知 `server公网地址:remote_port`；隧道内走 WSS 长连的 stream 泵；agent 再拨一次内网目标。
+
 ## 2. 做法（纯配置）
 
 ### 2.1 server desired（`tunnel/data/desired.toml`，唯一来源）
@@ -40,6 +59,32 @@ enabled = true
 - 外部连接进来 → 按 `remote_port` 选 agent → agent 拨内网 `local_ip:local_port`，双向透传。
 - TCP 是纯字节透传，无应用层语义干扰；UDP 按 peer session 转发。
 - 回滚：desired 里对应条目 `enabled = false`，秒级摘除。
+
+### UML 时序（外部建连 / 数据 / 收尾）
+
+```mermaid
+sequenceDiagram
+    participant CLI as 外部客户端
+    participant SRV as server监听
+    participant AG as agent
+    participant SVC as 内网服务
+    CLI->>SRV: TCP建连到remoteport
+    SRV->>AG: Open建流请求
+    AG->>SVC: TCP拨内网目标
+    alt 拨通
+        SVC->>AG: 内网连接就绪
+        AG->>SRV: 建流成功开始泵数据
+        SRV->>CLI: 连接接纳
+        CLI->>SVC: 上行数据透传
+        SVC->>CLI: 下行数据透传
+    else 拒绝或失败
+        AG->>SRV: Close拒绝原因
+        SRV->>CLI: 关闭外部连接
+    end
+    CLI->>SRV: 半关闭EOF
+    SRV->>AG: Close收尾
+    AG->>SVC: 关闭内网连接
+```
 
 ## 3. 前置条件（基础设施层面，与代码无关）
 
@@ -74,6 +119,28 @@ enabled = true
   - 解析成功但某条 `validate_proxy` 不过 → 逐条 `warn!`（含 hostname/name/原因），**跳过坏条、好条照常生效**，`skipped` 计数返回。
   - 现状 `DesiredStore::load` 解析失败静默 `unwrap_or_default()`，本次顺手让 load 侧也打 warn（保持行为兼容，只加日志）。
 - 鉴权：沿用现有 `auth_ok` + JWT，与其它 `/api/*` 一致。
+
+### UML 时序（重载生效 / 出错）
+
+```mermaid
+sequenceDiagram
+    participant OP as 运维人员
+    participant UI as serverWebUI
+    participant SRV as server
+    participant AG as 在线agent
+    OP->>UI: 改desired文件后点重载
+    UI->>SRV: POST apidesiredreload
+    alt 文件坏
+        SRV->>SRV: error记日志内存不动
+        SRV->>UI: 500加reason
+        UI->>OP: 红字提示旧映射仍有效
+    else 文件好
+        SRV->>SRV: 替换内存逐条校验
+        SRV->>AG: Config推送好条
+        SRV->>UI: ok加reloaded和skipped和pushed
+        UI->>OP: toast显示重载结果
+    end
+```
 
 ### 6.2 前端：server WebUI「从文件重载」按钮
 
