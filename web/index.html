@@ -1,52 +1,202 @@
 <!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>neutrino</title>
-<style>body{font-family:system-ui,sans-serif;max-width:960px;margin:24px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px 10px;text-align:left}h2{margin-top:32px}.ok{color:green}.off{color:#999}pre{background:#f6f6f6;padding:12px;overflow:auto;max-height:300px}button{margin:2px}</style>
+<style>
+:root{--bg:#0f141b;--panel:#182028;--line:#28323d;--txt:#dbe4ee;--mut:#8fa0b3;--accent:#4f9cf0;--ok:#3fb97f;--warn:#e0a23c;--off:#6b7a8c;--danger:#e0655f}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--txt);margin:0}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6f9;--panel:#fff;--line:#dde4ec;--txt:#1c2733;--mut:#64748b}}
+a{color:var(--accent)}
+.layout{display:flex;min-height:100vh}
+.side{width:200px;background:var(--panel);border-right:1px solid var(--line);padding:20px 12px;display:flex;flex-direction:column;gap:4px}
+.side h1{font-size:18px;margin:0 0 16px 8px}
+.side button{background:none;border:0;color:var(--mut);text-align:left;padding:10px 12px;border-radius:8px;font-size:14px;cursor:pointer}
+.side button.on{background:var(--accent);color:#fff}
+.main{flex:1;padding:24px;max-width:1080px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+td,th{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left}
+th{color:var(--mut);font-weight:600}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px}
+.b-ok{background:rgba(63,185,127,.15);color:var(--ok)}
+.b-warn{background:rgba(224,162,60,.15);color:var(--warn)}
+.b-off{background:rgba(107,122,140,.2);color:var(--off)}
+.btn{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer;font-size:14px}
+.btn.ghost{background:none;border:1px solid var(--line);color:var(--txt)}
+.btn.danger{background:var(--danger)}
+.btn:disabled{opacity:.5}
+input,select,textarea{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:14px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:440px;max-width:92vw}
+.modal label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
+.modal input,.modal select{width:100%}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#toast{position:fixed;bottom:24px;right:24px;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:10px 16px;min-width:220px}
+.toast.err{border-left-color:var(--danger)}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;max-height:320px;font-size:12px}
+details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
+.hidden{display:none!important}
+.topbar{display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.topbar h2{margin:0;flex:1}
+</style>
 </head><body>
-<h1>neutrino tunnel</h1>
-<div id="login"><h2>登录</h2>
-<input id="user" value="admin" placeholder="user"> <input id="pass" type="password" placeholder="pass">
-<button onclick="login()">登录</button> <span id="loginmsg"></span></div>
-<div id="app" style="display:none">
-<h2>Agents</h2><table id="agents"></table>
-<h2>Tunnels</h2><table id="tunnels"></table>
-<h2>下发配置（热更新，不断线）</h2>
-<p>agent: <input id="cfgagent" placeholder="hostname 或 agent_id，空=全部"> <button onclick="pushConfig()">推送下方 JSON</button> <span id="cfgmsg"></span></p>
-<textarea id="cfgjson" rows="12" style="width:100%;font-family:monospace">{"proxies":[]}</textarea>
-<h2>Logs</h2><pre id="logs"></pre>
-</div>
+<div id="login" class="layout" style="align-items:center;justify-content:center">
+<div class="card" style="width:320px"><h2>neutrino 登录</h2>
+<p><input id="user" value="admin" placeholder="user" style="width:100%"></p>
+<p><input id="pass" type="password" placeholder="pass" style="width:100%"></p>
+<p><button class="btn" onclick="login()" style="width:100%">登录</button></p>
+<p id="loginmsg" style="color:var(--danger)"></p></div></div>
+<div id="app" class="layout hidden">
+<nav class="side"><h1>neutrino</h1>
+<button id="nav-ov" class="on" onclick="tab('ov')">总览</button>
+<button id="nav-tn" onclick="tab('tn')">隧道</button>
+<button id="nav-log" onclick="tab('log')">日志</button></nav>
+<main class="main">
+<section id="sec-ov">
+<div class="topbar"><h2>Agents</h2><button class="btn ghost" onclick="refresh()">刷新</button></div>
+<div class="card"><table id="agents"></table></div>
+</section>
+<section id="sec-tn" class="hidden">
+<div class="topbar"><h2>隧道</h2>
+<select id="hostsel" onchange="loadDesired()"></select>
+<button class="btn" onclick="openForm()">+ 新增隧道</button></div>
+<div class="card"><table id="tunnels"></table></div>
+<details><summary>高级：JSON 直推（热更新，不断线）</summary>
+<div class="card"><div class="row">
+<input id="cfgagent" placeholder="hostname 或 agent_id，空=全部">
+<button class="btn ghost" onclick="pushConfig()">推送下方 JSON</button><span id="cfgmsg"></span></div>
+<textarea id="cfgjson" rows="8" style="width:100%;font-family:monospace;margin-top:8px">{"proxies":[]}</textarea></div>
+</details>
+</section>
+<section id="sec-log" class="hidden">
+<div class="topbar"><h2>日志</h2></div>
+<div class="card"><pre id="logs"></pre></div>
+</section>
+</main></div>
+<div id="formwrap" class="modal hidden"><div class="box">
+<h3 id="formtitle">新增隧道</h3>
+<label>名称</label><input id="f-name" placeholder="如 web">
+<label>类型</label><select id="f-type" onchange="typeFields()">
+<option value="http">http（域名路由）</option><option value="tcp">tcp（端口）</option>
+<option value="https">https（TLS 透传）</option><option value="udp">udp（端口）</option></select>
+<label id="l-dom">域名（逗号分隔）</label><input id="f-dom" placeholder="a.example.com">
+<label id="l-port" class="hidden">公网端口 remote_port</label><input id="f-port" class="hidden" type="number" placeholder="如 2222">
+<label>内网目标 IP</label><input id="f-ip" value="127.0.0.1">
+<label>内网目标端口</label><input id="f-lport" type="number" placeholder="如 80">
+<label><input type="checkbox" id="f-en" checked> 启用</label>
+<div class="row" style="margin-top:16px;justify-content:flex-end">
+<button class="btn ghost" onclick="closeForm()">取消</button>
+<button class="btn" onclick="saveForm()">保存</button></div>
+</div></div>
+<div id="toast"></div>
 <script>
-let auth='';
+let auth='', editing=null, desiredCache=[];
+function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
+  document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
+function tab(t){ for(const x of ['ov','tn','log']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+  document.getElementById('nav-'+x).classList.toggle('on',x===t); } }
 async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
   const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({user,pass})});
   if(r.ok){ const j=await r.json(); auth=j.token||'';
-    document.getElementById('login').style.display='none';document.getElementById('app').style.display='';
+    document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');
     refresh();setInterval(refresh,5000);
   } else document.getElementById('loginmsg').textContent='login failed';
 }
+async function need(u){ const r=await fetch(u,{headers:hdrs()}); if(r.status===401){location.reload();throw 0;} return r.json(); }
 async function refresh(){
-  const need=async (u)=>{ const r=await fetch(u,{headers:hdrs()}); if(r.status===401){location.reload();throw 0;} return r.json(); };
   try{
   const o=await need('/api/overview');
-  document.getElementById('agents').innerHTML='<tr><th>hostname</th><th>id</th><th>ver</th><th>RTT(ms)</th><th>在线(s)</th><th>rx/tx</th></tr>'+o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${a.rx_bytes}/${a.tx_bytes}</td></tr>`).join('');
+  const sel=document.getElementById('hostsel');
+  const cur=sel.value;
+  sel.innerHTML=o.agents.map(a=>`<option ${a.hostname===cur?'selected':''}>${a.hostname}</option>`).join('')||'<option value="">(无在线 agent)</option>';
+  document.getElementById('agents').innerHTML='<tr><th>hostname</th><th>id</th><th>ver</th><th>RTT(ms)</th><th>在线(s)</th><th>rx/tx</th></tr>'+
+    o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${a.rx_bytes}/${a.tx_bytes}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
+  await loadDesired(false);
   const t=await need('/api/tunnels');
-  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>status</th><th>操作</th></tr>'+t.tunnels.map(x=>{
+  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
     const where=`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
-    const btn=x.enabled?`<button onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
-    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${x.type}</td><td>${where}</td><td>${x.target}</td><td class="${x.enabled?'ok':'off'}">${x.status}</td><td>${btn}</td></tr>`;}).join('');
+    const live=o.agents.some(a=>a.agent_id===x.agent_id||a.hostname===x.agent);
+    const st=!x.enabled?'<span class="badge b-off">已禁用</span>':(live?'<span class="badge b-ok">生效中</span>':'<span class="badge b-warn">待同步</span>');
+    const btn=x.enabled?`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
+    const ed=`<button class="btn ghost" onclick='editRow(${JSON.stringify(x).replace(/'/g,"&#39;")})'>编辑</button>`;
+    const del=`<button class="btn ghost" onclick="delRow('${x.name}')">删除</button>`;
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${x.type}</td><td>${where}</td><td>${x.target}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
   const l=await need('/api/logs');
   document.getElementById('logs').textContent=l.logs.join('\n');
   }catch(e){}
 }
+async function loadDesired(showMsg){
+  const h=document.getElementById('hostsel').value;
+  if(!h) return;
+  const d=await need('/api/desired/'+encodeURIComponent(h));
+  desiredCache=d.proxies||[];
+  if(showMsg!==false) toast(`已加载 ${h} 的 ${desiredCache.length} 条期望配置`);
+}
+function typeFields(){
+  const t=document.getElementById('f-type').value, isHttp=(t==='http');
+  document.getElementById('l-dom').classList.toggle('hidden',!isHttp);
+  document.getElementById('f-dom').classList.toggle('hidden',!isHttp);
+  document.getElementById('l-port').classList.toggle('hidden',isHttp);
+  document.getElementById('f-port').classList.toggle('hidden',isHttp);
+}
+function openForm(){ editing=null; document.getElementById('formtitle').textContent='新增隧道';
+  for(const id of ['f-name','f-dom','f-ip','f-lport']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+  document.getElementById('f-en').checked=true; typeFields();
+  document.getElementById('formwrap').classList.remove('hidden'); }
+function closeForm(){ document.getElementById('formwrap').classList.add('hidden'); }
+function editRow(x){ editing=x.name;
+  document.getElementById('formtitle').textContent='编辑 '+x.name;
+  document.getElementById('f-name').value=x.name;
+  document.getElementById('f-type').value=x.type||'http'; typeFields();
+  document.getElementById('f-dom').value=(x.domains||[]).join(',');
+  document.getElementById('f-port').value=x.remote_port||'';
+  const tgt=(x.target||'').split(':'); document.getElementById('f-ip').value=tgt[0]||'127.0.0.1';
+  document.getElementById('f-lport').value=tgt[1]||'';
+  document.getElementById('f-en').checked=!!x.enabled;
+  document.getElementById('formwrap').classList.remove('hidden'); }
+function curProxy(){
+  const t=document.getElementById('f-type').value;
+  const p={name:document.getElementById('f-name').value.trim(),type:t,
+    local_ip:document.getElementById('f-ip').value.trim()||'127.0.0.1',
+    local_port:parseInt(document.getElementById('f-lport').value||'0'),
+    domains:t==='http'?document.getElementById('f-dom').value.split(',').map(s=>s.trim()).filter(Boolean):[],
+    remote_port:t==='http'?0:parseInt(document.getElementById('f-port').value||'0'),
+    enabled:document.getElementById('f-en').checked};
+  return p;
+}
+async function saveForm(){
+  const h=document.getElementById('hostsel').value;
+  if(!h){ toast('先选 agent',true); return; }
+  const p=curProxy();
+  if(!p.name){ toast('名称必填',true); return; }
+  if(p.type==='http'&&!p.domains.length){ toast('http 隧道域名必填',true); return; }
+  if(p.type!=='http'&&!p.remote_port){ toast('此类隧道公网端口必填',true); return; }
+  if(!p.local_port){ toast('内网目标端口必填',true); return; }
+  let list=desiredCache.slice();
+  const i=list.findIndex(q=>q.name===(editing||p.name));
+  if(editing&&editing!==p.name) { const j=list.findIndex(q=>q.name===editing); if(j>=0) list.splice(j,1); }
+  if(i>=0) list[i]=p; else list.push(p);
+  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),body:JSON.stringify({proxies:list})});
+  if(r.ok){ toast('已保存并下发'); closeForm(); refresh(); }
+  else { const j=await r.json().catch(()=>({})); toast('保存失败: '+(j.reason||r.status),true); }
+}
+async function delRow(name){
+  const h=document.getElementById('hostsel').value;
+  if(!confirm('删除隧道 '+name+'？')) return;
+  const list=desiredCache.filter(q=>q.name!==name);
+  const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),body:JSON.stringify({proxies:list})});
+  if(r.ok){ toast('已删除'); refresh(); } else toast('删除失败',true);
+}
 async function toggle(agent,name,enabled){
   const r=await fetch(`/api/tunnels/${agent}/${name}/enabled`,{method:'POST',headers:hdrs(true),body:JSON.stringify({enabled})});
-  if(!r.ok) alert('toggle failed'); else refresh();
+  if(!r.ok) toast('toggle failed',true); else refresh();
 }
 async function pushConfig(){
   const agent=document.getElementById('cfgagent').value;
-  let body; try{ body=JSON.parse(document.getElementById('cfgjson').value); }catch(e){ alert('JSON 非法'); return; }
+  let body; try{ body=JSON.parse(document.getElementById('cfgjson').value); }catch(e){ toast('JSON 非法',true); return; }
   body.hostname=body.hostname||agent||undefined; body.agent_id=body.agent_id||undefined;
   const r=await fetch('/api/config',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
   document.getElementById('cfgmsg').textContent=r.ok?'已推送':'推送失败 '+r.status;
