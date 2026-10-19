@@ -33,7 +33,7 @@ linux:
 		-v $(CARGO_VOL):/usr/local/cargo \
 		-e CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
 		$(IMAGE) \
-		bash -c "mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"$(CRATES_MIRROR)\"\n' > /usr/local/cargo/config.toml && cargo build --jobs 2 --release --target $(TARGET) && ls -lh $(LINUX_OUT) && file $(LINUX_OUT)"
+		bash -c "mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"$(CRATES_MIRROR)\"\n' > /usr/local/cargo/config.toml && cargo build --jobs 1 --release --target $(TARGET) && ls -lh $(LINUX_OUT) && file $(LINUX_OUT)"
 
 clean:
 	cargo clean
