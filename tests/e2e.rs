@@ -451,6 +451,61 @@ async fn e2e_agent_webui_upstream_edit_redials() {
 }
 
 #[tokio::test]
+async fn e2e_register_does_not_loop_config_push() {
+    // 回归：agent 上报收敛后，server 不再重复 push Config。
+    // 刷屏死循环的根因：每次 Register 都无条件 Config -> agent 回 Register。
+    // 现场还原：desired 有隧道（want.is_some 才会 push），agent 空上报等下发；
+    // 收敛后 overlay 日志不再增长。boot() 无 desired 时旧代码也不循环，测不出。
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                let body = "loop-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // agent 空上报 + server desired 有隧道：正好走 want.is_some 的 push 分支
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"web\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"l.e2e.test\"]\n"
+    );
+    let env = boot_with_desired("", Some(&desired)).await;
+    let jwt = login(&env.web_base).await;
+    let c = reqwest::Client::new();
+    // overlay 日志每条带时间戳前缀，同名事件也算不同行 -> 计数即 Register 次数
+    let count_overlays = || async {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/logs", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        j["logs"]
+            .as_array()
+            .map(|a| a.iter().filter(|l| l.as_str().unwrap_or("").contains("desired overlay")).count())
+            .unwrap_or(0)
+    };
+    // 等收敛：死循环版本会在 3s 内刷出几十条 overlay；修复后静默
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let n = count_overlays().await;
+    assert!(n <= 2, "overlay log count {n}: Register/Config loop!");
+    assert!(http_get_via(&env, "l.e2e.test").await.contains("loop-ok"));
+    let _ = env;
+}
+
+#[tokio::test]
 async fn e2e_restart_covered_by_desired() {
     // backend on good port
     let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

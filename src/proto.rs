@@ -51,7 +51,7 @@ pub enum ServerMsg {
     Error { reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]

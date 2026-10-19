@@ -528,14 +528,23 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     log_ev(&s, format!("agent '{hostname}' disconnected"));
 }
 
+/// agent 上报已与期望态一致时无需再 push Config（否则死循环）。
+/// 空==空视为收敛（双方都没隧道时不 push）。
+fn needs_config_push(reported: &[ProxyConfig], want: &[ProxyConfig]) -> bool {
+    reported != want
+}
+
 async fn on_register(s: &S, agent_id: &str, hostname: &str, reported: Vec<ProxyConfig>) {
     let want = s.desired.read().await.get(hostname).cloned();
-    let proxies = resolve_proxies(want.clone(), reported);
+    let proxies = resolve_proxies(want.clone(), reported.clone());
     if want.is_some() {
         log_ev(s, format!("agent '{hostname}' desired overlay applied ({} proxies)", proxies.len()));
         // sync the agent's local routing table: it dials by its own copy,
         // so push the overlaid list back (agent re-Registers on Config).
-        if let Some(ctl) = s.agents.read().await.get(agent_id).map(|h| h.ctl.clone()) {
+        // 已收敛则跳过：否则 Register -> Config -> Register 无限 ping-pong 刷屏。
+        if !needs_config_push(&reported, &proxies) {
+            tracing::debug!("agent '{hostname}' already converged, skip Config push");
+        } else if let Some(ctl) = s.agents.read().await.get(agent_id).map(|h| h.ctl.clone()) {
             let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
         }
     }
@@ -1525,6 +1534,30 @@ mod tests {
         let (s2, _, rest2) = parse_response_head(b"HTTP/1.1 200 OK\r\nX-A: b");
         assert_eq!(s2, StatusCode::OK);
         assert!(rest2.is_empty());
+    }
+
+    #[test]
+    fn config_push_stops_when_agent_converged() {
+        // 复现刷屏死循环：agent 上报的 proxies 已与期望态一致时，
+        // server 不应再下发 Config，否则 agent 回 Register -> Config 无限 ping-pong。
+        let p = ProxyConfig {
+            name: "web".into(),
+            ptype: "http".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 80,
+            domains: vec!["a.test".into()],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            enabled: true,
+        };
+        // 已收敛：不再 push
+        assert!(!needs_config_push(&[p.clone()], &[p.clone()]));
+        // 未收敛：需要 push（server 期望态覆盖 agent 上报）
+        let mut q = p.clone();
+        q.local_port = 8080;
+        assert!(needs_config_push(&[q], &[p]));
+        // agent 空上报但期望态有隧道：需要 push
+        assert!(!needs_config_push(&[], &[]));
     }
 
     #[tokio::test]
