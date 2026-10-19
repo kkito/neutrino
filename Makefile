@@ -21,9 +21,11 @@ test:
 
 build:
 	cargo build
+	@ls -lh target/debug/$(BIN)
 
 release:
 	cargo build --release
+	@ls -lh target/release/$(BIN)
 
 linux:
 	docker run --rm --platform linux/amd64 \
