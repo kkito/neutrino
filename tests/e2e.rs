@@ -691,3 +691,132 @@ async fn egress_dial_refused_close() {
     assert!(closed, "dial-refused stream did not close");
     let _ = env;
 }
+
+/// e2e desired 文件重载回归：旧代码无 reload 接口时，此测试在 POST /api/desired/reload 即 404。
+/// 断言抓三段：①手改文件加 tcp 映射→reload→端口通；②文件改错（非法 TOML）→reload 500 且旧映射仍通（内存不动）；
+/// ③修好但某条字段非法→reload 成功、好条生效、坏条跳过（skipped=1）。
+#[tokio::test]
+async fn desired_reload_from_file() {
+    // echo backend
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let rport = free_port();
+    // 自建 dir 传 desired 路径以便手改：复制 boot_with_desired 拉起逻辑，desired_path 用可写路径
+    let ws_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(&cfg_path, "hostname = \"e2e\"\ntoken = \"s3cret\"\n")
+        .await
+        .unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    tokio::fs::write(&desired_path, "").await.unwrap(); // 初始空文件
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mut srv = tokio::process::Command::new(&bin)
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let mut ag = tokio::process::Command::new(&bin)
+        .args([
+            "agent",
+            "--server",
+            &format!("ws://127.0.0.1:{ws_port}/ws"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let web_base = format!("http://127.0.0.1:{ws_port}");
+    let jwt = login(&web_base).await;
+    let c = reqwest::Client::new();
+    let do_reload = || async {
+        c.post(format!("{web_base}/api/desired/reload"))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+    };
+    async fn echo_ok(rport: u16) -> bool {
+        let mut s = match tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if s.write_all(b"reload-ping").await.is_err() {
+            return false;
+        }
+        let mut b = vec![0u8; 32];
+        match tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await {
+            Ok(Ok(n)) => &b[..n] == b"reload-ping",
+            _ => false,
+        }
+    }
+    // ① 手写一段 tcp 映射 → reload → 端口通（轮询 40×200ms 等 listen 生效）
+    tokio::fs::write(
+        &desired_path,
+        format!(
+            "[[agents.e2e]]\nname=\"svc\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nenabled=true\n"
+        ),
+    )
+    .await
+    .unwrap();
+    let r = do_reload().await;
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["reloaded"], 1);
+    let mut ok = false;
+    for _ in 0..40 {
+        if echo_ok(rport).await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "reloaded tcp mapping not reachable");
+    // ② 写入非法 TOML → reload 500 且旧映射仍通（内存不动）
+    tokio::fs::write(&desired_path, "[[[broken").await.unwrap();
+    let r = do_reload().await;
+    assert_eq!(r.status(), 500);
+    assert!(echo_ok(rport).await, "old mapping lost after bad reload");
+    // ③ 好条+坏条（tcp 但 remote_port=0）→ ok 且 skipped=1，好条仍通
+    tokio::fs::write(
+        &desired_path,
+        format!(
+            "[[agents.e2e]]\nname=\"svc\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nenabled=true\n\n[[agents.e2e]]\nname=\"bad\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port=0\nenabled=true\n"
+        ),
+    )
+    .await
+    .unwrap();
+    let r = do_reload().await;
+    assert_eq!(r.status(), 200);
+    let j: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["skipped"], 1);
+    assert!(echo_ok(rport).await, "good mapping lost after partial reload");
+    let _ = (&mut srv, &mut ag);
+}
