@@ -161,8 +161,8 @@ fn inject_xfp(head: &[u8], proto: &str) -> Vec<u8> {
     out
 }
 
-fn trim_crlf(mut b: &[u8]) -> &[u8] {
-    while let Some((&c, rest)) = b.split_first() {
+#[allow(dead_code)]
+fn trim_crlf(mut b: &[u8]) -> &[u8] {    while let Some((&c, rest)) = b.split_first() {
         if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
             b = rest;
         } else {
