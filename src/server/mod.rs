@@ -131,7 +131,9 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     } else {
         println!("  web login    : admin / (已设置的口令)");
     }
-    axum::serve(lis, app).await?;
+    // ConnectInfo 让 fallback 能取对端 ip:port（连接列表 peer 列用）
+    let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(lis, svc).await?;
     Ok(())
 }
 

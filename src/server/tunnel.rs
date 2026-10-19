@@ -162,6 +162,10 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                     if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
                                         h.info.rx_bytes += payload.len() as u64;
                                     }
+                                    // 连接行 rx 累计（agent->server 方向即公网下行计入 rx）
+                                    if let Some(c) = s.conns.write().await.get_mut(&(id as u64)) {
+                                        c.rx += payload.len() as u64;
+                                    }
                                 } else {
                                     // 早到（Open 未处理/占位未命中）：缓存，泵启动后 drain。
                                     let mut p = pe.write().await;
@@ -185,6 +189,10 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                 if ws_send.send(WsMsg::Binary(encode_data(id, &payload).into())).await.is_err() { break; }
                 if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
                     h.info.tx_bytes += payload.len() as u64;
+                }
+                // 连接行 tx 累计
+                if let Some(c) = s.conns.write().await.get_mut(&(id as u64)) {
+                    c.tx += payload.len() as u64;
                 }
             }
         }

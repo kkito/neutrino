@@ -104,6 +104,7 @@ fn route_fallback(host: &str, tunneled: bool) -> FallbackRoute {
 /// 未知域名 404（`no such tunnel`），裸 IP/localhost 访问落到 WebUI。
 pub(crate) async fn fallback_http_ingress(
     State((s, _)): State<(S, Arc<String>)>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Request,
 ) -> impl IntoResponse {
     use axum::body::to_bytes;
@@ -170,6 +171,27 @@ pub(crate) async fn fallback_http_ingress(
     if let Some(h) = s.agents.read().await.get(&aid) {
         h.incoming.write().await.insert(sid, dtx);
     }
+    // 连接快照行（/api/conns 用；流结束/超时处 remove）
+    {
+        let mut m = s.conns.write().await;
+        let hostname = s.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
+        super::state::insert_conn(
+            &mut m,
+            super::state::ConnInfo {
+                id: sid as u64,
+                proto: "http".into(),
+                peer: peer.to_string(),
+                public_port: s.public_port,
+                agent: hostname,
+                tunnel: proxy.name.clone(),
+                remote_port: 0,
+                target: format!("{}:{}", proxy.local_ip, proxy.local_port),
+                since: chrono::Local::now().timestamp(),
+                rx: 0,
+                tx: 0,
+            },
+        );
+    }
     let _ = ctl.send(ServerMsg::Open {
         stream: sid,
         kind: "http".into(),
@@ -187,6 +209,7 @@ pub(crate) async fn fallback_http_ingress(
             if let Some(h) = s.agents.read().await.get(&aid) {
                 h.incoming.write().await.remove(&sid);
             }
+            s.conns.write().await.remove(&(sid as u64));
             let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "timeout".into() });
             return (StatusCode::BAD_GATEWAY, "upstream timeout\n").into_response();
         }
@@ -250,11 +273,18 @@ fn async_stream_lite(
     let rest = unfold(Some((s, aid, sid, ctl, drx)), |st| async {
         let (s, aid, sid, ctl, mut drx) = st?;
         match drx.recv().await {
-            Some(chunk) => Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx)))),
+            Some(chunk) => {
+                // 连接行 tx 累计（agent->公网字节）
+                if let Some(c) = s.conns.write().await.get_mut(&(sid as u64)) {
+                    c.tx += chunk.len() as u64;
+                }
+                Some((Ok(axum::body::Bytes::from(chunk)), Some((s, aid, sid, ctl, drx))))
+            }
             None => {
                 if let Some(h) = s.agents.read().await.get(&aid) {
                     h.incoming.write().await.remove(&sid);
                 }
+                s.conns.write().await.remove(&(sid as u64));
                 let _ = ctl.send(ServerMsg::Close { stream: sid, reason: "eof".into() });
                 None
             }
@@ -363,7 +393,7 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                 tracing::info!("tcp ingress on 0.0.0.0:{port}");
                 log_ev(&s2, format!("tcp listening :{port}"));
                 loop {
-                    let Ok((inbound, _)) = lis.accept().await else {
+                    let Ok((inbound, peer)) = lis.accept().await else {
                         continue;
                     };
                     let s3 = s2.clone();
@@ -373,7 +403,42 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         else {
                             return;
                         };
+                        // 连接行目标信息（proxy 名 + 内网目标）
+                        let (pname, target) = {
+                            let ag = s3.agents.read().await;
+                            ag.get(&aid)
+                                .and_then(|h| {
+                                    h.info.proxies.iter().find(|p| {
+                                        p.enabled && p.remote_port == port && p.ptype != "udp"
+                                    })
+                                })
+                                .map(|p| {
+                                    (p.name.clone(), format!("{}:{}", p.local_ip, p.local_port))
+                                })
+                                .unwrap_or_default()
+                        };
+                        let hostname = s3.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
                         let sid = next_sid();
+                        // 连接快照行（双泵结束处 remove）
+                        {
+                            let mut m = s3.conns.write().await;
+                            super::state::insert_conn(
+                                &mut m,
+                                super::state::ConnInfo {
+                                    id: sid as u64,
+                                    proto: "tcp".into(),
+                                    peer: peer.to_string(),
+                                    public_port: port,
+                                    agent: hostname,
+                                    tunnel: pname,
+                                    remote_port: port,
+                                    target,
+                                    since: chrono::Local::now().timestamp(),
+                                    rx: 0,
+                                    tx: 0,
+                                },
+                            );
+                        }
                         let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
                         let (ctl, out) = {
                             let ag = s3.agents.read().await;
@@ -394,6 +459,7 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         });
                         let (mut ri, mut wi) = inbound.into_split();
                         let out2 = out.clone();
+                        let s_rx = s3.clone();
                         let to_agent = tokio::spawn(async move {
                             let mut b = vec![0u8; 32 * 1024];
                             loop {
@@ -401,14 +467,23 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                                 if n == 0 {
                                     break;
                                 }
+                                // 连接行 rx 累计（公网->agent 字节）
+                                if let Some(c) = s_rx.conns.write().await.get_mut(&(sid as u64)) {
+                                    c.rx += n as u64;
+                                }
                                 out2
                                     .send((sid, b[..n].to_vec()))
                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                             }
                             anyhow::Ok(())
                         });
+                        let s_tx = s3.clone();
                         let from_agent = async {
                             while let Some(chunk) = drx.recv().await {
+                                // 连接行 tx 累计（agent->公网字节）
+                                if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
+                                    c.tx += chunk.len() as u64;
+                                }
                                 wi.write_all(&chunk).await?;
                             }
                             anyhow::Ok::<()>(())
@@ -420,6 +495,7 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         if let Some(h) = s3.agents.read().await.get(&aid) {
                             h.incoming.write().await.remove(&sid);
                         }
+                        s3.conns.write().await.remove(&(sid as u64));
                         let _ = ctl.send(ServerMsg::Close {
                             stream: sid,
                             reason: "eof".into(),
@@ -457,8 +533,12 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant)> = HashMap::new();
         let mut buf = vec![0u8; 65535];
         loop {
-            // expire old sessions
+            // expire old sessions（conns 表 UDP 行同步删）
             sessions.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(120));
+            {
+                let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _)| *id).collect();
+                s2.conns.write().await.retain(|_, c| c.proto != "udp" || live.contains(&(c.id as u32)));
+            }
             let (n, peer) = match sock.recv_from(&mut buf).await {
                 Ok(x) => x,
                 Err(_) => continue,
@@ -497,6 +577,16 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     let aid3 = aid.clone();
                     tokio::spawn(async move {
                         while let Some(chunk) = drx.recv().await {
+                            // UDP 连接行 tx 累计（线性找 peer 行）
+                            {
+                                let mut m = s3.conns.write().await;
+                                for c in m.values_mut() {
+                                    if c.proto == "udp" && c.peer == peer.to_string() {
+                                        c.tx += chunk.len() as u64;
+                                        break;
+                                    }
+                                }
+                            }
                             let _ = sock2.send_to(&chunk, peer).await;
                             if let Some(h) = s3.agents.write().await.get_mut(&aid3)
                             {
@@ -506,11 +596,49 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     });
                     let _ = out;
                     sessions.insert(peer, (id, Instant::now()));
+                    // UDP 连接行（peer 一行；since 每次收包刷新见下）
+                    {
+                        let ag = s2.agents.read().await;
+                        let hostname = ag.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
+                        let (pname, target) = ag
+                            .get(&aid)
+                            .and_then(|h| h.info.proxies.iter().find(|p| p.enabled && p.remote_port == port && p.ptype == "udp"))
+                            .map(|p| (p.name.clone(), format!("{}:{}", p.local_ip, p.local_port)))
+                            .unwrap_or_default();
+                        let mut m = s2.conns.write().await;
+                        super::state::insert_conn(
+                            &mut m,
+                            super::state::ConnInfo {
+                                id: id as u64,
+                                proto: "udp".into(),
+                                peer: peer.to_string(),
+                                public_port: port,
+                                agent: hostname,
+                                tunnel: pname,
+                                remote_port: port,
+                                target,
+                                since: chrono::Local::now().timestamp(),
+                                rx: 0,
+                                tx: 0,
+                            },
+                        );
+                    }
                     id
                 }
             };
             // internet -> agent (each datagram = one data frame)
             let payload = buf[..n].to_vec();
+            // UDP 连接行 rx 累计 + since 刷新（线性找 peer 行；连接数小可接受）
+            {
+                let mut m = s2.conns.write().await;
+                for c in m.values_mut() {
+                    if c.proto == "udp" && c.peer == peer.to_string() {
+                        c.rx += payload.len() as u64;
+                        c.since = chrono::Local::now().timestamp();
+                        break;
+                    }
+                }
+            }
             // find owner agent of this stream
             let owner: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>> = {
                 let ag = s2.agents.read().await;

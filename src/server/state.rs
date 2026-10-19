@@ -48,18 +48,15 @@ pub(crate) struct Shared {
     pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>,
     /// 上分钟累计快照：key 同 traffic，用于算增量
     pub(crate) last_total: RwLock<HashMap<String, (u64, u64)>>,
-    /// 当前连接快照：key = conn id（Task3 连接插桩消费）
-    #[allow(dead_code)]
+    /// 当前连接快照：key = conn id
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
-    /// --listen 解析出的公网端口（Task3 HTTP fallback 连接行用）
-    #[allow(dead_code)]
+    /// --listen 解析出的公网端口（HTTP fallback 连接行用）
     pub(crate) public_port: u16,
 }
 
 /// 30天分钟点上限
 pub(crate) const TRAFFIC_CAP: usize = 43_200;
-/// 当前连接表上限（超了挤掉 id 最小的）；Task3 连接插桩消费
-#[allow(dead_code)]
+/// 当前连接表上限（超了挤掉 id 最小的）
 pub(crate) const CONNS_CAP: usize = 5_000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,10 +83,20 @@ pub(crate) fn minute_delta(prev: (u64, u64), cur: (u64, u64)) -> (u64, u64) {
     (cur.0.saturating_sub(prev.0), cur.1.saturating_sub(prev.1))
 }
 
-/// 后 n 个点求和（Task4 /api/traffic hour/day 加总用）
-#[allow(dead_code)]
+/// 后 n 个点求和（/api/traffic hour/day 加总用）
+#[allow(dead_code)] // Task4 切片消费
 pub(crate) fn rollup(points: &VecDeque<(u64, u64)>, n: usize) -> (u64, u64) {
     points.iter().rev().take(n).fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
+}
+
+/// conns 表插入（满 5000 挤掉 id 最小的防 OOM）
+pub(crate) fn insert_conn(m: &mut HashMap<u64, ConnInfo>, c: ConnInfo) {
+    if m.len() >= CONNS_CAP {
+        if let Some(min) = m.keys().min().cloned() {
+            m.remove(&min);
+        }
+    }
+    m.insert(c.id, c);
 }
 
 pub(crate) fn trim_traffic(v: &mut VecDeque<(u64, u64)>) {
@@ -323,6 +330,30 @@ mod tests {
         super::load_traffic(&s2, &p).await;
         assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+    #[test]
+    fn conns_cap_evicts_oldest() {
+        let mut m: HashMap<u64, super::ConnInfo> = HashMap::new();
+        for i in 0..(super::CONNS_CAP + 10) {
+            super::insert_conn(
+                &mut m,
+                super::ConnInfo {
+                    id: i as u64,
+                    proto: "tcp".into(),
+                    peer: "1.1.1.1:2".into(),
+                    public_port: 2222,
+                    agent: "h".into(),
+                    tunnel: "t".into(),
+                    remote_port: 2222,
+                    target: "127.0.0.1:80".into(),
+                    since: 0,
+                    rx: 0,
+                    tx: 0,
+                },
+            );
+        }
+        assert_eq!(m.len(), super::CONNS_CAP);
+        assert!(!m.contains_key(&0)); // 最老的被挤掉
     }
     #[test]
     fn resolve_prefers_desired() {
