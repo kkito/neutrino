@@ -1560,6 +1560,24 @@ mod tests {
         assert!(!needs_config_push(&[], &[]));
     }
 
+    #[test]
+    fn server_webui_clarifies_agent_view_ip() {
+        // server WebUI 填的是 agent 视角的目标地址，页面必须说清楚，
+        // 否则用户会误填 server 本机的 127.0.0.1。
+        let html = include_str!("../web/index.html");
+        assert!(html.contains("agent"), "missing agent-perspective hint");
+        assert!(html.contains("127.0.0.1 = agent"), "missing loopback hint");
+    }
+
+    #[test]
+    fn server_webui_checkbox_not_full_width() {
+        // .modal input{width:100%} 会把 checkbox 也撑满一行，
+        // 必须有 checkbox 例外规则保证对齐。
+        let html = include_str!("../web/index.html");
+        assert!(html.contains("type=checkbox") || html.contains("type=\"checkbox\""));
+        assert!(html.contains("input[type=checkbox]") || html.contains("input[type=\"checkbox\"]"));
+    }
+
     #[tokio::test]
     async fn save_load_state_roundtrip() {
         let dir = std::env::temp_dir().join(format!("nt-test-{}", uuid::Uuid::new_v4()));
