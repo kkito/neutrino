@@ -577,14 +577,12 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     let aid3 = aid.clone();
                     tokio::spawn(async move {
                         while let Some(chunk) = drx.recv().await {
-                            // UDP 连接行 tx 累计（线性找 peer 行）
+                            // UDP 连接行 tx 累计（peer 行线性查找；连接数小可接受）
+                            let peer_s = peer.to_string();
                             {
                                 let mut m = s3.conns.write().await;
-                                for c in m.values_mut() {
-                                    if c.proto == "udp" && c.peer == peer.to_string() {
-                                        c.tx += chunk.len() as u64;
-                                        break;
-                                    }
+                                if let Some(c) = m.values_mut().find(|c| c.proto == "udp" && c.peer == peer_s) {
+                                    c.tx += chunk.len() as u64;
                                 }
                             }
                             let _ = sock2.send_to(&chunk, peer).await;
@@ -628,15 +626,13 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
             };
             // internet -> agent (each datagram = one data frame)
             let payload = buf[..n].to_vec();
-            // UDP 连接行 rx 累计 + since 刷新（线性找 peer 行；连接数小可接受）
+            // UDP 连接行 rx 累计 + since 刷新（peer 行线性查找）
             {
+                let peer_s = peer.to_string();
                 let mut m = s2.conns.write().await;
-                for c in m.values_mut() {
-                    if c.proto == "udp" && c.peer == peer.to_string() {
-                        c.rx += payload.len() as u64;
-                        c.since = chrono::Local::now().timestamp();
-                        break;
-                    }
+                if let Some(c) = m.values_mut().find(|c| c.proto == "udp" && c.peer == peer_s) {
+                    c.rx += payload.len() as u64;
+                    c.since = chrono::Local::now().timestamp();
                 }
             }
             // find owner agent of this stream
