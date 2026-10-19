@@ -11,6 +11,8 @@ TARGET       := x86_64-unknown-linux-gnu
 IMAGE        := rust:1.89-slim-bookworm
 LINUX_OUT    := target/$(TARGET)/release/$(BIN)
 CARGO_VOL    := nt-cargo-home
+# crates.io 镜像（容器内更新索引用，默认中科大；改道：RSYNC_MIRROR=sparse+https://... make linux）
+CRATES_MIRROR ?= sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 
 .PHONY: test build release linux clean
 
@@ -27,8 +29,9 @@ linux:
 	docker run --rm --platform linux/amd64 \
 		-v "$(PWD):/src" -w /src \
 		-v $(CARGO_VOL):/usr/local/cargo \
+		-e CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
 		$(IMAGE) \
-		bash -c "cargo build --release --target $(TARGET) && ls -lh $(LINUX_OUT) && file $(LINUX_OUT)"
+		bash -c "mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"$(CRATES_MIRROR)\"\n' > /usr/local/cargo/config.toml && cargo build --release --target $(TARGET) && ls -lh $(LINUX_OUT) && file $(LINUX_OUT)"
 
 clean:
 	cargo clean
