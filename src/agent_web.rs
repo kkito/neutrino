@@ -141,14 +141,87 @@ struct SettingsReq {
 }
 
 async fn write_upstream_toml(path: &str, up: &Upstream) -> anyhow::Result<()> {
-    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    let mut v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+    write_upstream_toml_inner(path, up, None).await
+}
+
+/// pure merge step (unit-testable): keep existing [[proxies]] etc, refresh
+/// hostname/token/server only. Proxies are server-owned (desired), never
+/// written from the agent WebUI.
+fn merge_upstream_toml(raw: &str, up: &Upstream) -> toml::Value {
+    let mut v: toml::Value =
+        toml::from_str(raw).unwrap_or(toml::Value::Table(Default::default()));
+    // 非 table（数组/标量脏文件）时丢弃重建，避免 as_table_mut panic
+    if !v.is_table() {
+        v = toml::Value::Table(Default::default());
+    }
     let t = v.as_table_mut().unwrap();
     t.insert("hostname".into(), toml::Value::String(up.hostname.clone()));
     t.insert("token".into(), toml::Value::String(up.token.clone()));
     t.insert("server".into(), toml::Value::String(up.server_url.clone()));
+    v
+}
+
+/// validate upstream fields the same way api_settings does.
+fn validate_server_url(s: &str) -> bool {
+    s.starts_with("ws://") || s.starts_with("wss://")
+}
+
+async fn write_upstream_toml_inner(path: &str, up: &Upstream, raw: Option<String>) -> anyhow::Result<()> {
+    let raw = match raw {
+        Some(r) => r,
+        None => tokio::fs::read_to_string(path).await.unwrap_or_default(),
+    };
+    let v = merge_upstream_toml(&raw, up);
     tokio::fs::write(path, toml::to_string_pretty(&v)?).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_url_accepts_ws_variants_only() {
+        assert!(validate_server_url("ws://127.0.0.1:7440/ws"));
+        assert!(validate_server_url("wss://tunnel.nat.kkito.cn:7443/ws"));
+        assert!(!validate_server_url("http://127.0.0.1:7440/"));
+        assert!(!validate_server_url("127.0.0.1:7440"));
+        assert!(!validate_server_url(""));
+        // 大小写/首尾空格由调用方 trim+原样判断，这里保持严格前缀
+        assert!(!validate_server_url("WS://x/ws"));
+    }
+
+    #[test]
+    fn merge_upstream_preserves_proxies_and_refreshes_upstream() {
+        let raw = "hostname = \"old\"\ntoken = \"t0\"\nserver = \"ws://old/ws\"\n\
+                   [[proxies]]\nname = \"web\"\ntype = \"http\"\n";
+        let up = Upstream {
+            server_url: "ws://new:7440/ws".into(),
+            hostname: "newhost".into(),
+            token: "newtok".into(),
+        };
+        let v = merge_upstream_toml(raw, &up);
+        assert_eq!(v["hostname"].as_str().unwrap(), "newhost");
+        assert_eq!(v["token"].as_str().unwrap(), "newtok");
+        assert_eq!(v["server"].as_str().unwrap(), "ws://new:7440/ws");
+        // 保留的 proxies 不被清空（server 期望态覆盖的是内存，不是文件）
+        assert_eq!(v["proxies"][0]["name"].as_str().unwrap(), "web");
+    }
+
+    #[test]
+    fn merge_upstream_tolerates_dirty_file() {
+        let up = Upstream {
+            server_url: "ws://n/ws".into(),
+            hostname: "h".into(),
+            token: "t".into(),
+        };
+        // 空文件 / 损坏 TOML / 非 table 顶层都不 panic，且上行字段正确
+        for raw in ["", "[[[", "42", "\"str\""] {
+            let v = merge_upstream_toml(raw, &up);
+            assert_eq!(v["hostname"].as_str().unwrap(), "h");
+            assert_eq!(v["server"].as_str().unwrap(), "ws://n/ws");
+        }
+    }
 }
 
 async fn api_settings(
@@ -174,7 +247,7 @@ async fn api_settings(
         if let Some(s) = r.server_url {
             let s = s.trim().to_string();
             if !s.is_empty() && s != up.server_url {
-                if !s.starts_with("ws://") && !s.starts_with("wss://") {
+                if !validate_server_url(&s) {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({"ok": false, "reason": "server 须以 ws(s):// 开头"})),

@@ -614,9 +614,33 @@ fn next_sid() -> u32 {
     ((STREAM_CTR.fetch_add(1, Ordering::Relaxed) as u32).wrapping_mul(2)).wrapping_add(2)
 }
 
-/// axum `/*key` 通配路由：已注册的 `/ws`、`/api/*`、精确 `/` 优先匹配；
+/// 单端口 fallback 路由判定：tunneled=true 表示该 Host 命中某 agent 隧道。
+/// - 命中隧道 -> 透传给 agent（无论路径）
+/// - 未命中 + 裸 IP/localhost/空 Host -> WebUI（方便直接打开 IP:端口看管理页）
+/// - 未命中 + 其他（点分域名） -> 404 `no such tunnel`
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackRoute {
+    Tunnel,
+    WebUi,
+    NotFound,
+}
+
+fn route_fallback(host: &str, tunneled: bool) -> FallbackRoute {
+    if tunneled {
+        return FallbackRoute::Tunnel;
+    }
+    if host.is_empty() || host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+        return FallbackRoute::WebUi;
+    }
+    if host.contains('.') {
+        return FallbackRoute::NotFound;
+    }
+    FallbackRoute::WebUi
+}
+
+/// axum fallback：已注册的 `/ws`、`/api/*` 优先匹配；
 /// 其余路径按 Host 路由到隧道 agent。整包转发给 agent，响应流式回写；
-/// 未知域名 404（`no such tunnel`），无点 Host（裸 IP 访问）落到 WebUI。
+/// 未知域名 404（`no such tunnel`），裸 IP/localhost 访问落到 WebUI。
 async fn fallback_http_ingress(
     State((s, _)): State<(S, Arc<String>)>,
     req: Request,
@@ -632,19 +656,15 @@ async fn fallback_http_ingress(
         .next()
         .unwrap_or("")
         .to_lowercase();
-    // `/` 归属判定：隧道域名 -> 透传给 agent；未知域名 -> 404；
-    // 裸 IP/localhost/空 Host -> WebUI（注意 127.0.0.1 本身带点，不能按有无点判断）。
-    // 注意 curl/e2e 常用 `GET / + Host: 隧道域名`，故不能给 `/` 注册精确路由，
-    // 统一走 fallback 按 Host 分流。
+    // 分流判定见 route_fallback：注意不能给 `/` 注册精确路由，否则
+    // curl/e2e 常用的 `GET / + Host: 隧道域名` 会被 WebUI 抢走。
     let tunneled = pick_http(&s, &host).await;
-    let Some((aid, xfp)) = tunneled else {
-        if host.is_empty() || host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
-            return index_page().await.into_response();
+    let (aid, xfp) = match route_fallback(&host, tunneled.is_some()) {
+        FallbackRoute::Tunnel => tunneled.unwrap(),
+        FallbackRoute::WebUi => return index_page().await.into_response(),
+        FallbackRoute::NotFound => {
+            return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response()
         }
-        if host.contains('.') {
-            return (StatusCode::NOT_FOUND, "no such tunnel\n").into_response();
-        }
-        return index_page().await.into_response();
     };
     // 重建原始请求头字节流（含 XFP 注入），body 拼回去
     let version = match parts.version {
@@ -1458,6 +1478,53 @@ mod tests {
         let p: Persisted = serde_json::from_str(r#"{"totals":{"h":[1,2]}}"#).unwrap();
         assert_eq!(p.totals["h"], (1, 2));
         assert!(p.password_hash.is_empty());
+    }
+
+    #[test]
+    fn fallback_routes_tunnel_when_matched() {
+        // 命中隧道：无论路径/Host 形式都透传（WebUI `/` 不抢）
+        assert_eq!(route_fallback("web.e2e.test", true), FallbackRoute::Tunnel);
+        assert_eq!(route_fallback("127.0.0.1", true), FallbackRoute::Tunnel);
+    }
+
+    #[test]
+    fn fallback_routes_webui_for_local() {
+        // 裸 IP（v4/v6，带点也不能误判成隧道域名）/localhost/空 Host -> WebUI
+        assert_eq!(route_fallback("127.0.0.1", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("::1", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("10.0.0.5", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("localhost", false), FallbackRoute::WebUi);
+        assert_eq!(route_fallback("", false), FallbackRoute::WebUi);
+        // 无点单 label 也落 WebUI（方便局域网 hostname 直访）
+        assert_eq!(route_fallback("intranet", false), FallbackRoute::WebUi);
+    }
+
+    #[test]
+    fn fallback_routes_404_for_unknown_domain() {
+        assert_eq!(route_fallback("nope.test", false), FallbackRoute::NotFound);
+        assert_eq!(route_fallback("git.nat.kkito.cn", false), FallbackRoute::NotFound);
+    }
+
+    #[test]
+    fn response_head_parses_status_headers_body() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\nabc";
+        let (status, headers, rest) = parse_response_head(raw);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(rest, b"abc");
+        // hop-by-hop 头被剥掉，业务头保留（小写归一）
+        assert!(headers.iter().any(|(k, v)| k == "content-length" && v == "3"));
+        assert!(!headers.iter().any(|(k, _)| k == "connection" || k == "transfer-encoding"));
+    }
+
+    #[test]
+    fn response_head_tolerates_malformed() {
+        // 无状态行数字 -> 兜底 200；无 CRLFCRLF -> 整包当头、body 为空
+        let (s, _, rest) = parse_response_head(b"garbage");
+        assert_eq!(s, StatusCode::OK);
+        assert!(rest.is_empty());
+        let (s2, _, rest2) = parse_response_head(b"HTTP/1.1 200 OK\r\nX-A: b");
+        assert_eq!(s2, StatusCode::OK);
+        assert!(rest2.is_empty());
     }
 
     #[tokio::test]

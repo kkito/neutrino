@@ -86,6 +86,25 @@ async fn boot(proxies_toml: &str) -> Env {
     boot_with_desired(proxies_toml, None).await
 }
 
+/// 生 HTTP GET（裸 TCP 组装），可指定任意 Host/路径：覆盖浏览器打 IP、
+/// 隧道域名、未知域名三种分流，以及非 `/` 路径的透传。
+async fn http_raw(env: &Env, host: &str, path: &str) -> String {
+    let host_hdr = if host.is_empty() {
+        String::new()
+    } else {
+        format!("Host: {host}\r\n")
+    };
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
+        .await
+        .unwrap();
+    c.write_all(format!("GET {path} HTTP/1.1\r\n{host_hdr}Connection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = vec![];
+    c.read_to_end(&mut out).await.unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn http_get_via(env: &Env, host: &str) -> String {
     let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
         .await
@@ -149,26 +168,26 @@ async fn e2e_http_and_auth_and_xfp() {
     ))
     .await;
     // http via Host routing + XFP injection
-    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
-        .await
-        .unwrap();
-    c.write_all(b"GET / HTTP/1.1\r\nHost: web.e2e.test\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut out = vec![];
-    c.read_to_end(&mut out).await.unwrap();
-    assert!(String::from_utf8_lossy(&out).contains("xfp=https"), "{out:?}");
+    let out = http_raw(&env, "web.e2e.test", "/").await;
+    assert!(out.contains("xfp=https"), "{out:?}");
 
-    // unknown host -> 404
-    let mut c2 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
-        .await
-        .unwrap();
-    c2.write_all(b"GET / HTTP/1.1\r\nHost: nope.test\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut o2 = vec![];
-    c2.read_to_end(&mut o2).await.unwrap();
-    assert!(String::from_utf8_lossy(&o2).contains("404"));
+    // unknown host -> 404; exact status line + body marker
+    let o2 = http_raw(&env, "nope.test", "/").await;
+    assert!(o2.starts_with("HTTP/1.1 404"), "{o2:?}");
+    assert!(o2.contains("no such tunnel"));
+
+    // bare IP -> WebUI (neutrino login page), not 404
+    let w = http_raw(&env, "127.0.0.1", "/").await;
+    assert!(w.starts_with("HTTP/1.1 200"), "{w:?}");
+    assert!(w.contains("neutrino"));
+    // localhost + missing Host likewise land on WebUI
+    assert!(http_raw(&env, "localhost", "/").await.starts_with("HTTP/1.1 200"));
+    assert!(http_raw(&env, "", "/").await.starts_with("HTTP/1.1 200"));
+
+    // non-root path under tunnel host still proxies (not swallowed by WebUI)
+    let np = http_raw(&env, "web.e2e.test", "/some/path?q=1").await;
+    assert!(np.starts_with("HTTP/1.1 200"), "{np:?}");
+    assert!(np.contains("xfp=https"));
 
     // auth gating
     let cli = reqwest::Client::new();
@@ -345,6 +364,89 @@ async fn e2e_desired_crud_flows_to_agent() {
         .await
         .unwrap();
     assert_eq!(j["proxies"][0]["name"], "web");
+    let _ = env;
+}
+
+#[tokio::test]
+async fn e2e_agent_webui_upstream_edit_redials() {
+    // agent WebUI：改上行 server_url（此处改个不可达端口再改回），
+    // 保存即落盘 + 立即重连；status 反映新 target。
+    use std::net::SocketAddr;
+    let env = boot("").await;
+    let data = std::env::temp_dir();
+    // 复用 boot 的 agent 进程 WebUI？boot 未开 --web，改为直测 api_settings 语义：
+    // 用独立 agent（带 --web）验证 settings -> toml 落盘 -> status 更新。
+    let dir = data.join(format!("nt-e2e-web-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(&cfg_path, "hostname = \"w\"\ntoken = \"s3cret\"\n").await.unwrap();
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let web_addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut ag = tokio::process::Command::new(&bin)
+        .args([
+            "agent",
+            "--server",
+            &format!("ws://127.0.0.1:{}/ws", env.http_port),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--web",
+            &web_addr.to_string(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&web_addr.to_string()).await;
+    let base = format!("http://{web_addr}");
+    let c = reqwest::Client::new();
+    // login with default pass
+    let r = c.post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"user": "admin", "pass": "neutrino123"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let jwt: String = r.json::<serde_json::Value>().await.unwrap()["token"].as_str().unwrap().into();
+    // settings: bad scheme rejected
+    let r = c.post(format!("{base}/api/settings"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"server_url": "http://bad/"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    // settings: valid upstream persists to toml
+    let target = format!("ws://127.0.0.1:{}/ws", env.http_port);
+    let r = c.post(format!("{base}/api/settings"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"server_url": target, "hostname": "w2"}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let saved = tokio::fs::read_to_string(&cfg_path).await.unwrap();
+    assert!(saved.contains(&target), "{saved:?}");
+    assert!(saved.contains("w2"));
+    // status shows the pending target immediately (no polling race)
+    let st: serde_json::Value = c.get(format!("{base}/api/status"))
+        .bearer_auth(&jwt)
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(st["server_url"], target);
+    assert_eq!(st["hostname"], "w2");
+    // reconnect endpoint forces a redial: session撕掉重建后 online 回 true
+    // 且 last_error 留下 "redial requested" 痕迹（稳定可判定，不依赖计数竞态）
+    let r = c.post(format!("{base}/api/reconnect"))
+        .bearer_auth(&jwt)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let mut st2 = st.clone();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        st2 = c.get(format!("{base}/api/status"))
+            .bearer_auth(&jwt)
+            .send().await.unwrap().json().await.unwrap();
+        if st2["last_error"] == "redial requested" || st2["reconnects"].as_u64().unwrap_or(0) > st["reconnects"].as_u64().unwrap_or(0) {
+            break;
+        }
+    }
+    assert!(
+        st2["last_error"] == "redial requested" || st2["reconnects"].as_u64().unwrap_or(0) > st["reconnects"].as_u64().unwrap_or(0),
+        "{st2:?}"
+    );
+    let _ = ag.kill().await;
     let _ = env;
 }
 

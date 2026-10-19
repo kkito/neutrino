@@ -133,10 +133,12 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     let mut backoff = vec![1u64, 2, 5, 10, 30, 60];
     let mut reconnects = 0u64;
     // abort handle for the live session; WebUI redial aborts it so the loop
-    // immediately redials with the new upstream (no waiting, no restart)
+    // immediately redials with the new upstream (no waiting, no restart).
+    // watch channel carries a monotonically increasing generation; the loop
+    // re-checks it after every session so no bump is ever lost (no take race:
+    // watcher only aborts, generation compare happens in-loop).
     let cur: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    // background watcher: any redial bump aborts the live session
     {
         let cur2 = cur.clone();
         tokio::spawn(async move {
@@ -150,14 +152,34 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
                 let v = *rx.borrow_and_update();
                 if v != seen {
                     seen = v;
-                    if let Some(h) = cur2.lock().await.take() {
+                    if let Some(h) = cur2.lock().await.as_ref() {
                         h.abort();
                     }
                 }
             }
         });
     }
+    let mut redial_seen = *redial_tx.borrow();
     loop {
+        // bump arrived while not in a session (backoff / debounce gap):
+        // count the redial without spawning a stale session first, so no
+        // user click is ever lost (the old debounce consumed them).
+        {
+            let gen_now = *redial_tx.borrow();
+            if gen_now != redial_seen {
+                redial_seen = gen_now;
+                reconnects += 1;
+                backoff = vec![1u64, 2, 5, 10, 30, 60];
+                {
+                    let mut st = status.write().await;
+                    st.online = false;
+                    st.reconnects = reconnects;
+                    st.last_error = Some("redial requested".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                continue;
+            }
+        }
         // snapshot hot-updatable dial config
         let up = upstream.read().await.clone();
         {
@@ -176,7 +198,13 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         };
         *cur.lock().await = None;
         reconnects += 1;
-        let redial = err == "redial requested";
+        // a redial bump that arrived while the session was already exiting
+        // (watcher had nothing/old handle to abort) still counts: compare
+        // generations in-loop so the signal is never lost.
+        let gen_now = *redial_tx.borrow();
+        let bumped = gen_now != redial_seen;
+        redial_seen = gen_now;
+        let redial = err == "redial requested" || bumped;
         {
             let mut st = status.write().await;
             st.online = false;
@@ -186,8 +214,11 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         if redial {
             // user-triggered: immediate redial, reset backoff
             backoff = vec![1u64, 2, 5, 10, 30, 60];
-            // small debounce so rapid double-clicks don't spin
+            // small debounce so rapid double-clicks don't spin; bumps arriving
+            // during the debounce coalesce (consume them so the next session
+            // starts once with the latest upstream instead of redialing twice).
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            redial_seen = *redial_tx.borrow();
         } else {
             let s = backoff.first().cloned().unwrap_or(60);
             if backoff.len() > 1 {
@@ -510,5 +541,30 @@ mod tests {
         let cfg = load_or_default("/nonexistent-dir-xyz/agent.toml", "ws://x:7440/ws").await.unwrap();
         assert_eq!(cfg.server, "ws://x:7440/ws");
         assert!(cfg.proxies.is_empty());
+        // hostname 回退：HOSTNAME 为空时用默认名而非 panic
+        assert!(!cfg.hostname.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_or_default_reads_existing_file() {
+        let dir = std::env::temp_dir().join(format!("nt-agent-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let p = dir.join("agent.toml");
+        tokio::fs::write(&p, "hostname = \"h1\"\ntoken = \"t1\"\nserver = \"ws://s1/ws\"\n").await.unwrap();
+        let cfg = load_or_default(p.to_str().unwrap(), "ws://cli/ws").await.unwrap();
+        assert_eq!(cfg.hostname, "h1");
+        assert_eq!(cfg.token, "t1");
+        assert_eq!(cfg.server, "ws://s1/ws");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn load_or_default_rejects_broken_toml() {
+        let dir = std::env::temp_dir().join(format!("nt-agent-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let p = dir.join("agent.toml");
+        tokio::fs::write(&p, "[[[").await.unwrap();
+        assert!(load_or_default(p.to_str().unwrap(), "ws://cli/ws").await.is_err());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
