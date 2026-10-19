@@ -94,16 +94,27 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     if web.is_empty() {
         println!("agent local webui disabled (enable with --web 127.0.0.1:8080)");
     } else {
-        // persist web password hash under agent data file
+        // persist web password hash under agent data file.
+        // NOTE: --web-pass only takes effect on FIRST run (when the file
+        // doesn't exist yet). Afterwards the persisted hash wins; delete
+        // the file to reset to the CLI value.
         let data_path = format!("{config_path}.webpass");
-        let hash = match tokio::fs::read_to_string(&data_path).await {
-            Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
+        let (hash, fresh) = match tokio::fs::read_to_string(&data_path).await {
+            Ok(h) if !h.trim().is_empty() => {
+                if web_pass != "neutrino123" {
+                    tracing::warn!("--web-pass ignored: {data_path} already exists (delete it to reset password)");
+                }
+                (h.trim().to_string(), false)
+            }
             _ => {
                 let h = bcrypt::hash(web_pass, bcrypt::DEFAULT_COST)?;
                 let _ = tokio::fs::write(&data_path, &h).await;
-                h
+                (h, true)
             }
         };
+        if !fresh {
+            println!("agent webui password: persisted ({data_path}); delete it to reset to --web-pass");
+        }
         let w = web.to_string();
         let u = web_user.to_string();
         println!("agent local webui: http://{w}/ (user {u})");
