@@ -40,6 +40,16 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 .hidden{display:none!important}
 .topbar{display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 .topbar h2{margin:0;flex:1}
+.statcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+.stat .k{color:var(--mut);font-size:12px}
+.stat .v{font-size:20px;font-weight:700;margin-top:4px}
+.seg{display:flex;gap:4px}
+.seg button{background:none;border:1px solid var(--line);color:var(--mut);border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px}
+.seg button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(--line);border-radius:12px}
+.legend{display:flex;gap:16px;color:var(--mut);font-size:13px;margin:8px 2px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:99px;margin-right:6px}
 </style>
 </head><body>
 <div id="login" class="layout" style="align-items:center;justify-content:center">
@@ -52,6 +62,8 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 <nav class="side"><h1>neutrino</h1>
 <button id="nav-ov" class="on" onclick="tab('ov')">总览</button>
 <button id="nav-tn" onclick="tab('tn')">隧道</button>
+<button id="nav-tr" onclick="tab('tr')">流量</button>
+<button id="nav-cn" onclick="tab('cn')">连接</button>
 <button id="nav-log" onclick="tab('log')">日志</button></nav>
 <main class="main">
 <section id="sec-ov">
@@ -70,6 +82,25 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 <button class="btn ghost" onclick="pushConfig()">推送下方 JSON</button><span id="cfgmsg"></span></div>
 <textarea id="cfgjson" rows="8" style="width:100%;font-family:monospace;margin-top:8px">{"proxies":[]}</textarea></div>
 </details>
+</section>
+<section id="sec-tr" class="hidden">
+<div class="topbar"><h2>流量</h2>
+<select id="trtunnel" onchange="loadTraffic()"></select>
+<div class="seg" id="trseg">
+<button data-g="min" class="on" onclick="setGran('min')">分</button><button data-g="hour" onclick="setGran('hour')">时</button><button data-g="day" onclick="setGran('day')">天</button>
+</div></div>
+<div class="statcards">
+<div class="stat"><div class="k">当前周期 rx</div><div class="v" id="tr-rx">-</div></div>
+<div class="stat"><div class="k">当前周期 tx</div><div class="v" id="tr-tx">-</div></div>
+<div class="stat"><div class="k">周期峰值（rx+tx）</div><div class="v" id="tr-peak">-</div></div>
+<div class="stat"><div class="k">窗口总量（rx/tx）</div><div class="v" id="tr-sum" style="font-size:15px">-</div></div>
+</div>
+<div class="legend"><span><span class="dot" style="background:#4f9cf0"></span>rx 上行</span><span><span class="dot" style="background:#3fb97f"></span>tx 下行</span><span id="tr-hint"></span></div>
+<canvas class="chart" id="chart" width="960" height="260"></canvas>
+</section>
+<section id="sec-cn" class="hidden">
+<div class="topbar"><h2>连接 <span id="cn-count" class="badge b-ok">0</span></h2><button class="btn ghost" onclick="loadConns()">刷新</button></div>
+<div class="card"><table id="conns"></table></div>
 </section>
 <section id="sec-log" class="hidden">
 <div class="topbar"><h2>日志</h2></div>
@@ -94,12 +125,13 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--mut)}
 </div></div>
 <div id="toast"></div>
 <script>
-let auth='', editing=null, desiredCache=[];
+let auth='', editing=null, desiredCache=[], trGran='min';
 function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
   document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
-function tab(t){ for(const x of ['ov','tn','log']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
-  document.getElementById('nav-'+x).classList.toggle('on',x===t); } }
+function tab(t){ for(const x of ['ov','tn','tr','cn','log']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+  document.getElementById('nav-'+x).classList.toggle('on',x===t); }
+  if(t==='tr') loadTraffic(); if(t==='cn') loadConns(); }
 async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
   const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({user,pass})});
@@ -129,6 +161,65 @@ async function refresh(){
     return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${x.type}</td><td>${where}</td><td>${x.target}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
   const l=await need('/api/logs');
   document.getElementById('logs').textContent=l.logs.join('\n');
+  if(!document.getElementById('sec-tr').classList.contains('hidden')) loadTraffic();
+  if(!document.getElementById('sec-cn').classList.contains('hidden')) loadConns();
+  }catch(e){}
+}
+function human(n){ if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'K'; if(n<1073741824) return (n/1048576).toFixed(1)+'M'; return (n/1073741824).toFixed(2)+'G'; }
+function setGran(g){ trGran=g; for(const b of document.querySelectorAll('#trseg button')) b.classList.toggle('on',b.dataset.g===g); loadTraffic(); }
+async function loadTraffic(){
+  try{
+  const t=await need('/api/tunnels');
+  const sel=document.getElementById('trtunnel'), cur=sel.value||'all';
+  const keys=[...new Set(t.tunnels.filter(x=>x.enabled).map(x=>`${x.agent}/${x.name}`))];
+  sel.innerHTML='<option value="all">全部汇总</option>'+keys.map(k=>`<option ${k===cur?'selected':''}>${k}</option>`).join('');
+  const tun=sel.value||'all';
+  const n=trGran==='min'?180:(trGran==='hour'?168:31);
+  const j=await need(`/api/traffic?tunnel=${encodeURIComponent(tun)}&gran=${trGran}&n=${n}`);
+  const pts=j.points||[];
+  const sum=pts.reduce((a,p)=>[a[0]+p[1],a[1]+p[2]],[0,0]);
+  const last=pts.length?pts[pts.length-1]:[0,0,0];
+  const peak=pts.reduce((a,p)=>Math.max(a,p[1]+p[2]),0);
+  document.getElementById('tr-rx').textContent=human(last[1]);
+  document.getElementById('tr-tx').textContent=human(last[2]);
+  document.getElementById('tr-peak').textContent=human(peak);
+  document.getElementById('tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
+  document.getElementById('tr-hint').textContent=pts.length?`共 ${pts.length} 点`:'暂无数据（等待下一分钟 tick）';
+  drawChart(pts);
+  }catch(e){}
+}
+function drawChart(pts){
+  const c=document.getElementById('chart'), ctx=c.getContext('2d');
+  const W=c.width, H=c.height, pad=34;
+  ctx.clearRect(0,0,W,H);
+  const cs=getComputedStyle(document.body);
+  const grid=cs.getPropertyValue('--line').trim()||'#28323d', mut=cs.getPropertyValue('--mut').trim()||'#8fa0b3';
+  ctx.strokeStyle=grid; ctx.fillStyle=mut; ctx.font='11px system-ui'; ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){ const y=pad+(H-2*pad)*i/4; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(W-8,y); ctx.stroke(); }
+  if(!pts.length){ ctx.fillText('暂无数据',W/2-30,H/2); return; }
+  const max=Math.max(1,...pts.map(p=>p[1]+p[2]));
+  const X=i=>pad+(W-pad-8)*(pts.length===1?0:i/(pts.length-1));
+  const Y=v=>(H-pad)-(H-2*pad)*v/max;
+  const step=Math.ceil(pts.length/6);
+  pts.forEach((p,i)=>{ if(i%step!==0&&i!==pts.length-1) return;
+    const d=new Date(p[0]*1000);
+    const lb=trGran==='day'?`${d.getMonth()+1}-${d.getDate()}`:`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+    ctx.fillText(lb,X(i)-14,H-10); });
+  for(let i=0;i<=4;i++){ const v=max*(4-i)/4; ctx.fillText(human(Math.round(v)),2,pad+(H-2*pad)*i/4+4); }
+  const line=(idx,color)=>{ ctx.strokeStyle=color; ctx.lineWidth=1.6; ctx.beginPath();
+    pts.forEach((p,i)=>{ const x=X(i),y=Y(p[idx]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke(); };
+  line(1,'#4f9cf0'); line(2,'#3fb97f');
+}
+function dur(s){ s=Math.max(0,s|0); if(s<60) return s+'s'; if(s<3600) return (s/60|0)+'m'+(s%60?s%60+'s':''); return (s/3600|0)+'h'+((s%3600/60|0)?(s%3600/60|0)+'m':''); }
+async function loadConns(){
+  try{
+  const j=await need('/api/conns');
+  const rows=(j.conns||[]).slice().sort((a,b)=>b.since-a.since);
+  document.getElementById('cn-count').textContent=rows.length;
+  const now=Date.now()/1000|0;
+  document.getElementById('conns').innerHTML='<tr><th>外部</th><th>公网端口</th><th>协议</th><th>隧道/agent</th><th>内网目标</th><th>时长</th><th>rx/tx</th></tr>'+rows.map(c=>{
+    const pb=c.proto==='udp'?'<span class="badge b-warn">udp</span>':c.proto;
+    return `<tr><td>${c.peer}</td><td>${c.public_port}</td><td>${pb}</td><td>${c.tunnel||'-'} / ${c.agent}</td><td>${c.target}</td><td>${dur(now-c.since)}</td><td>${human(c.rx)}/${human(c.tx)}</td></tr>`;}).join('')||'<tr><td colspan=7>当前无连接</td></tr>';
   }catch(e){}
 }
 async function loadDesired(showMsg){

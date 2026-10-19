@@ -494,6 +494,15 @@ mod tests {
         assert_eq!(r2[0], (180 * 60, 180 * 30));
     }
     #[test]
+    fn webui_has_traffic_conns_tabs() {
+        let html = include_str!("../../web/index.html");
+        assert!(html.contains("sec-tr"), "missing traffic section");
+        assert!(html.contains("sec-cn"), "missing conns section");
+        assert!(html.contains("/api/traffic"), "missing traffic fetch");
+        assert!(html.contains("/api/conns"), "missing conns fetch");
+        assert!(html.contains("<canvas"), "traffic chart must be canvas");
+    }
+    #[test]
     fn basic_auth_gate() {
         use crate::common::proto::check_basic_auth;
         fn h(auth: Option<&str>) -> http::HeaderMap {
