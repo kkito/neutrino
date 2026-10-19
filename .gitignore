@@ -1,2 +1,7 @@
 /target
 data/
+# 本地运行时文件：agent 上行配置 + WebUI 口令 hash，不进仓库
+agent.toml
+agent.toml.webpass
+*.webpass
+neutrino-agent.log
