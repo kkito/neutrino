@@ -57,9 +57,17 @@ pub(crate) fn log_ev_err(s: &S, e: String) {
     push_ev(s, e);
 }
 
+/// WebUI 日志前缀：用 server 本地 wall clock（不用 Utc，否则 HKT 机器上早 8h）。
+pub(crate) fn format_ev<Tz: chrono::TimeZone>(t: chrono::DateTime<Tz>, e: &str) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!("{} {e}", t.format("%m-%d %H:%M:%S"))
+}
+
 fn push_ev(s: &S, e: String) {
     if let Ok(mut v) = s.events.try_write() {
-        v.push(format!("{} {e}", chrono::Utc::now().format("%m-%d %H:%M:%S")));
+        v.push(format_ev(chrono::Local::now(), &e));
         if v.len() > 500 {
             let n = v.len() - 500;
             v.drain(..n);
@@ -145,6 +153,7 @@ pub(crate) async fn save_state(s: &S) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     #[test]
     fn state_serde_compat() {
         let p: Persisted = serde_json::from_str(r#"{"totals":{"h":[1,2]}}"#).unwrap();
@@ -168,6 +177,30 @@ mod tests {
         assert_eq!(back.password_hash, "hash");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+    #[test]
+    fn ev_stamp_keeps_wall_clock_offset() {
+        // 根因→修法：push_ev 曾用 chrono::Utc::now()，WebUI 日志时间比系统本地慢 8h
+        //（如 natproxy HKT 18:00 打成 10:00）。format_ev 取本地 wall clock，
+        // 此例用 +08:00 固定时区锁定行为：旧代码传 Utc 时间会打出 10:00:45 而变红。
+        let hk = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let t = hk.with_ymd_and_hms(2026, 10, 19, 18, 0, 45).unwrap();
+        assert_eq!(format_ev(t, "x"), "10-19 18:00:45 x");
+    }
+
+    #[tokio::test]
+    async fn push_ev_prefix_matches_local_now() {
+        // 接线回归：push_ev 必须用本地时间打前缀（容忍分钟边界 60s）。
+        let s: S = Arc::new(Shared::default());
+        push_ev(&s, "hello".into());
+        let v = s.events.read().await.clone();
+        assert_eq!(v.len(), 1);
+        let now = chrono::Local::now();
+        let m0 = now.format("%m-%d %H:%M").to_string();
+        let m1 = (now - chrono::Duration::seconds(60)).format("%m-%d %H:%M").to_string();
+        assert!(v[0].starts_with(&m0) || v[0].starts_with(&m1), "got: {}", v[0]);
+        assert!(v[0].ends_with("hello"));
+    }
+
     #[test]
     fn resolve_prefers_desired() {
         let want = vec![ProxyConfig {

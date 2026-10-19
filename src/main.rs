@@ -134,9 +134,12 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
+    // stdout 时间戳用本地 wall clock（默认 SystemTime 打 UTC，如 HKT 机器 18:00 打成 10:00Z）。
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%dT%H:%M:%S%.3f%:z".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stdout)
+        .with_timer(timer)
         .init();
     let cli = Cli::parse();
     match cli.cmd {
