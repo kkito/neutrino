@@ -1,0 +1,12 @@
+[Unit]
+Description=neutrino tunnel agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/home/kkito/.local/bin/neutrino agent --server wss://tunnel.nat.kkito.cn:7443/ws --config /home/kkito/.config/tunnel/agent.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

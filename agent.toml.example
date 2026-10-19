@@ -1,0 +1,17 @@
+hostname = "minipc7s"
+token = "welcome2ll"
+
+[[proxies]]
+name = "gogs-web-nat"
+type = "http"
+local_ip = "172.28.0.50"
+local_port = 3000
+domains = ["git.nat.kkito.cn"]
+set_x_forwarded_proto = "https"
+
+[[proxies]]
+name = "transmission-web"
+type = "http"
+local_ip = "172.28.0.10"
+local_port = 9091
+domains = ["tm.nat.kkito.cn"]

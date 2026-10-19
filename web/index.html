@@ -1,0 +1,55 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>neutrino</title>
+<style>body{font-family:system-ui,sans-serif;max-width:960px;margin:24px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px 10px;text-align:left}h2{margin-top:32px}.ok{color:green}.off{color:#999}pre{background:#f6f6f6;padding:12px;overflow:auto;max-height:300px}button{margin:2px}</style>
+</head><body>
+<h1>neutrino tunnel</h1>
+<div id="login"><h2>登录</h2>
+<input id="user" value="admin" placeholder="user"> <input id="pass" type="password" placeholder="pass">
+<button onclick="login()">登录</button> <span id="loginmsg"></span></div>
+<div id="app" style="display:none">
+<h2>Agents</h2><table id="agents"></table>
+<h2>Tunnels</h2><table id="tunnels"></table>
+<h2>下发配置（热更新，不断线）</h2>
+<p>agent: <input id="cfgagent" placeholder="hostname 或 agent_id，空=全部"> <button onclick="pushConfig()">推送下方 JSON</button> <span id="cfgmsg"></span></p>
+<textarea id="cfgjson" rows="12" style="width:100%;font-family:monospace">{"proxies":[]}</textarea>
+<h2>Logs</h2><pre id="logs"></pre>
+</div>
+<script>
+let auth='';
+function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
+async function login(){
+  const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
+  const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({user,pass})});
+  if(r.ok){ const j=await r.json(); auth=j.token||'';
+    document.getElementById('login').style.display='none';document.getElementById('app').style.display='';
+    refresh();setInterval(refresh,5000);
+  } else document.getElementById('loginmsg').textContent='login failed';
+}
+async function refresh(){
+  const need=async (u)=>{ const r=await fetch(u,{headers:hdrs()}); if(r.status===401){location.reload();throw 0;} return r.json(); };
+  try{
+  const o=await need('/api/overview');
+  document.getElementById('agents').innerHTML='<tr><th>hostname</th><th>id</th><th>ver</th><th>RTT(ms)</th><th>在线(s)</th><th>rx/tx</th></tr>'+o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${a.rx_bytes}/${a.tx_bytes}</td></tr>`).join('');
+  const t=await need('/api/tunnels');
+  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>status</th><th>操作</th></tr>'+t.tunnels.map(x=>{
+    const where=`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
+    const btn=x.enabled?`<button onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${x.type}</td><td>${where}</td><td>${x.target}</td><td class="${x.enabled?'ok':'off'}">${x.status}</td><td>${btn}</td></tr>`;}).join('');
+  const l=await need('/api/logs');
+  document.getElementById('logs').textContent=l.logs.join('\n');
+  }catch(e){}
+}
+async function toggle(agent,name,enabled){
+  const r=await fetch(`/api/tunnels/${agent}/${name}/enabled`,{method:'POST',headers:hdrs(true),body:JSON.stringify({enabled})});
+  if(!r.ok) alert('toggle failed'); else refresh();
+}
+async function pushConfig(){
+  const agent=document.getElementById('cfgagent').value;
+  let body; try{ body=JSON.parse(document.getElementById('cfgjson').value); }catch(e){ alert('JSON 非法'); return; }
+  body.hostname=body.hostname||agent||undefined; body.agent_id=body.agent_id||undefined;
+  const r=await fetch('/api/config',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
+  document.getElementById('cfgmsg').textContent=r.ok?'已推送':'推送失败 '+r.status;
+  if(r.ok) refresh();
+}
+</script></body></html>
