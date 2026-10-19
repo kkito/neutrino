@@ -62,7 +62,10 @@ kill $(cat neutrino.pid)                               # 停服
 ```bash
 cargo build --release
 scp target/release/neutrino root@natproxy:/root/nastools/tunnel/
-NEUTRINO_TOKEN=welcome2neutrino ./neutrino server --listen 127.0.0.1:7440 --data ./data
+# systemd 保活（二选一；推荐）：
+sudo cp deploy/tunnel-server.service /etc/systemd/system/ && sudo systemctl enable --now tunnel-server
+# 或裸跑（无 systemd 时，一次性后台，崩溃不自启）：
+NEUTRINO_TOKEN=welcome2neutrino ./neutrino server --detach --pid-file ./neutrino.pid --listen 127.0.0.1:7440 --data ./data
 ```
 
 nginx 用 `deploy/tunnel-nginx.conf`：单 upstream `127.0.0.1:7440`（`/`+WebUI、`Upgrade` 透传给 `/ws`、业务域名按 Host 路由到隧道，一条 `location /` 全收；配合 `map $http_upgrade $connection_upgrade`）。

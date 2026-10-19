@@ -1,0 +1,13 @@
+[Unit]
+Description=neutrino tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/root/nastools/tunnel/neutrino server --listen 127.0.0.1:7440 --data /root/nastools/tunnel/data
+Environment=NEUTRINO_TOKEN=welcome2neutrino
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
