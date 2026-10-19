@@ -27,7 +27,7 @@ pub enum ClientMsg {
     },
     Open {
         stream: u32,
-        kind: String, // "http" | "tcp" (agent-initiated; reserved)
+        kind: String, // "http" | "tcp" | "egress" (agent-initiated)
         host: String,
         port: u16,
     },

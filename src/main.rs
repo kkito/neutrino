@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_web;
 pub mod desired;
+pub mod egress;
 pub mod proto;
 pub mod server;
 

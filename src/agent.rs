@@ -1,7 +1,6 @@
 //! Agent side: out-bound WSS, local dial, stream pumps.
 use crate::proto::*;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -10,7 +9,41 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EgressHttp {
+    #[serde(default = "egress_ip_default")]
+    pub listen_ip: String,
+    #[serde(default = "egress_port_default")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn egress_ip_default() -> String {
+    "0.0.0.0".into()
+}
+
+fn egress_port_default() -> u16 {
+    18080
+}
+
+impl Default for EgressHttp {
+    fn default() -> Self {
+        Self {
+            listen_ip: egress_ip_default(),
+            listen_port: egress_port_default(),
+            enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct EgressCfg {
+    #[serde(default)]
+    http: EgressHttp,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct AgentFileConfig {
     hostname: String,
     #[serde(default)]
@@ -19,6 +52,9 @@ struct AgentFileConfig {
     server: String,
     #[serde(default)]
     proxies: Vec<ProxyConfig>,
+    /// agent 本地出网代理（只本地生效，不走 server desired）。
+    #[serde(default)]
+    egress: EgressCfg,
 }
 
 /// Hot-updatable upstream dial config (WebUI can change without restart).
@@ -55,6 +91,7 @@ async fn load_or_default(config_path: &str, url: &str) -> anyhow::Result<AgentFi
                 token: String::new(),
                 server: url.to_string(),
                 proxies: vec![],
+                egress: EgressCfg::default(),
             })
         }
         Err(e) => Err(anyhow::anyhow!("read {config_path}: {e} (see agent.toml.example)")),
@@ -127,6 +164,18 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         hostname: cfg.hostname.clone(),
         ..Default::default()
     }));
+    // 出站通道持有者：session 建连后注入，egress 监听经它发 Open/数据。
+    let egress_out: crate::egress::OutHolder = Arc::new(RwLock::new(None));
+    // egress 本地监听（与 WSS 主链解耦：bind 失败/未启用只影响本 task）。
+    {
+        let http = cfg.egress.http.clone();
+        let bind = format!("{}:{}", http.listen_ip, http.listen_port);
+        let st = status.clone();
+        let oh = egress_out.clone();
+        tokio::spawn(async move {
+            crate::egress::serve_egress(bind, http, oh, st).await;
+        });
+    }
     // bumped by WebUI to force an immediate redial (settings save / button)
     let (redial_tx, redial_rx) = tokio::sync::watch::channel(0u64);
     if web.is_empty() {
@@ -226,7 +275,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
             st.hostname = up.hostname.clone();
         }
         // run session in a task so the watcher can abort it on redial
-        let sess = tokio::spawn(session(up, cfg.clone(), status.clone()));
+        let sess = tokio::spawn(session(up, cfg.clone(), status.clone(), egress_out.clone()));
         *cur.lock().await = Some(sess.abort_handle());
         let err = match sess.await {
             Ok(Ok(())) => String::from("closed"),
@@ -282,7 +331,12 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     }
 }
 
-async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::agent_web::AgentStatus>>) -> anyhow::Result<()> {
+async fn session(
+    up: Upstream,
+    cfg: AgentFileConfig,
+    status: Arc<RwLock<crate::agent_web::AgentStatus>>,
+    egress_out: crate::egress::OutHolder,
+) -> anyhow::Result<()> {
     let (ws, _) = connect_async(up.server_url.as_str()).await?;
     tracing::info!("ws connected");
     let (mut sink, mut stream) = ws.split();
@@ -295,6 +349,7 @@ async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::a
             }
         }
     });
+    *egress_out.write().await = Some(out_tx.clone());
     let ctx = Arc::new(Ctx {
         proxies: RwLock::new(cfg.proxies.clone()),
         streams: RwLock::new(HashMap::new()),
@@ -394,6 +449,7 @@ async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::a
                 }
                 Ok(ServerMsg::Close { stream, .. }) => {
                     ctx.streams.write().await.remove(&stream);
+                    crate::egress::egress_streams().write().await.remove(&stream);
                 }
                 Ok(ServerMsg::Config { proxies }) => {
                     *ctx.proxies.write().await = proxies.clone();
@@ -420,6 +476,8 @@ async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::a
                 if let Some((id, payload)) = decode_data(&b) {
                     if let Some(tx) = ctx.streams.read().await.get(&id).cloned() {
                         let _ = tx.send(payload.to_vec());
+                    } else if let Some(tx) = crate::egress::egress_streams().read().await.get(&id).cloned() {
+                        let _ = tx.send(payload.to_vec());
                     } else {
                         // Open not processed yet — buffer for open_stream to drain.
                         ctx.pending.write().await.entry(id).or_default().push(payload.to_vec());
@@ -430,6 +488,7 @@ async fn session(up: Upstream, cfg: AgentFileConfig, status: Arc<RwLock<crate::a
             _ => {}
         }
     }
+    *egress_out.write().await = None;
     writer.abort();
     anyhow::Ok(())
 }
@@ -813,8 +872,15 @@ async fn open_udp_stream(ctx: Arc<Ctx>, sid: u32, port: u16) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-        use std::time::Duration;
+    #[test]
+    fn egress_config_defaults_off_and_fullbind() {
+        let c: AgentFileConfig = toml::from_str("hostname = \"h\"\n").unwrap();
+        assert!(!c.egress.http.enabled);
+        assert_eq!(c.egress.http.listen_port, 18080);
+        assert_eq!(c.egress.http.listen_ip, "0.0.0.0");
+    }
 
     /// RED: backoff 睡眠必须可被 redial 打断。
     /// 现场：session 刚失败，主循环进 30s+ 睡眠，此时 WebUI 点保存 bump。

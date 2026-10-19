@@ -23,6 +23,12 @@ pub struct AgentStatus {
     pub reconnects: u64,
     pub last_error: Option<String>,
     pub proxies: Vec<ProxyConfig>,
+    #[serde(default)]
+    pub egress_listen: String,
+    #[serde(default)]
+    pub egress_on: bool,
+    #[serde(default)]
+    pub egress_err: Option<String>,
 }
 
 #[derive(Clone)]
