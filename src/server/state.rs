@@ -45,7 +45,11 @@ pub(crate) struct Shared {
     pub(crate) desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,
     pub(crate) desired_path: String,
     /// 分钟流量点：key = "hostname/proxy名" -> VecDeque<(rx增量,tx增量)>，cap 43200（30天）
-    pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>,
+    pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>, 
+    /// 5s 实时快照：key 同 traffic -> (rx_5s, tx_5s)，纯内存不落盘（秒级监控用）
+    pub(crate) live: RwLock<HashMap<String, (u64, u64)>>,
+    /// 5s tick 上轮累计：key 同 traffic，用于算 5s 增量（纯内存，重启丢了下轮重建基线）
+    pub(crate) live_last: RwLock<HashMap<String, (u64, u64)>>,
     /// 上分钟累计快照：key 同 traffic，用于算增量
     pub(crate) last_total: RwLock<HashMap<String, (u64, u64)>>,
     /// 已见 tunnel：随 traffic.json 落盘，重启后读回，已知 key 首轮只建基线不 push

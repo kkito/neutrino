@@ -8,7 +8,7 @@ pub mod state;
 pub mod tunnel;
 
 pub(crate) use state::{Shared, S};
-use api::{api_config, api_conns, api_desired_get, api_desired_reload, api_desired_set, api_login, api_logs, api_overview, api_toggle, api_traffic, api_tunnels};
+use api::{api_config, api_conns, api_desired_get, api_desired_reload, api_desired_set, api_login, api_live, api_logs, api_overview, api_toggle, api_traffic, api_tunnels};
 use ingress::fallback_http_ingress;
 use tunnel::ws_handler;
 use axum::{routing::{get, post}, Router};
@@ -58,6 +58,28 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     }
     let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());
+    // 5s live tick：conns 表行累计 -> per-tunnel 5s 增量快照（纯内存，供 /api/live 秒级监控）。
+    // 根因→修法：分钟 tick 看毛刺太慢（60s 才一点）；5s 快照独立窗口、不落盘、不进 history。
+    {
+        let s = shared.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                iv.tick().await;
+                let cur = { let g = s.conns.read().await; state::aggregate_conns(&*g) };
+                let mut live = s.live.write().await;
+                let mut last = s.live_last.write().await;
+                // 全量重算：本轮有行的算增量（无基线则 0），上轮有、本轮无的行清零
+                let mut fresh: HashMap<String, (u64, u64)> = HashMap::new();
+                for (k, c) in &cur {
+                    let prev = last.get(k).cloned().unwrap_or(*c);
+                    fresh.insert(k.clone(), state::minute_delta(prev, *c));
+                }
+                *live = fresh;
+                *last = cur;
+            }
+        });
+    }
     // 60s traffic tick：conns 表行累计 -> per-tunnel 增量 push + 落盘 traffic.json。
     // 根因→修法：旧 tick 拿 agent 级累计给该 agent 下每个 proxy 各 push 一份，
     // 多隧道流量翻 N 倍；新 tick 只读 conns 表归集，空闲隧道不 push。
@@ -127,6 +149,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         .route("/api/tunnels", get(api_tunnels))
         .route("/api/logs", get(api_logs))
         .route("/api/traffic", get(api_traffic))
+        .route("/api/live", get(api_live))
         .route("/api/conns", get(api_conns))
         .route("/api/config", post(api_config))
         .route("/api/tunnels/:agent/:name/enabled", post(api_toggle))

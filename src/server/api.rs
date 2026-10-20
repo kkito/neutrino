@@ -196,6 +196,31 @@ pub(crate) async fn api_traffic(
     Json(serde_json::json!({"points": points})).into_response()
 }
 
+/// GET /api/live?tunnel=<key|all>：5s 实时速率快照（纯内存，不落盘）。
+pub(crate) async fn api_live(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+    Query(q): Query<TrafficQ>,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let live = s.live.read().await;
+    let mut rows = vec![];
+    for (k, (r, t)) in live.iter() {
+        if !q.tunnel.is_empty() && q.tunnel != "all" && *k != q.tunnel {
+            continue;
+        }
+        rows.push(serde_json::json!({
+            "tunnel": k, "rx_5s": r, "tx_5s": t,
+            "rx_s": r / 5, "tx_s": t / 5,
+        }));
+    }
+    rows.sort_by(|a, b| a["tunnel"].as_str().cmp(&b["tunnel"].as_str()));
+    Json(serde_json::json!({"live": rows, "interval": 5})).into_response()
+}
+
 /// GET /api/conns：当前连接快照。
 pub(crate) async fn api_conns(
     State((s, _)): State<(S, Arc<String>)>,
@@ -526,6 +551,8 @@ mod tests {
         assert!(html.contains("sec-tr"), "missing traffic section");
         assert!(html.contains("sec-cn"), "missing conns section");
         assert!(html.contains("/api/traffic"), "missing traffic fetch");
+        assert!(html.contains("/api/live"), "missing live fetch");
+        assert!(html.contains("loadLive"), "missing live refresh");
         assert!(html.contains("/api/conns"), "missing conns fetch");
         assert!(html.contains("<canvas"), "traffic chart must be canvas");
         // 流量卡片标题随粒度联动（桶时长/查询范围写明白，不再用“周期/窗口”模糊词）

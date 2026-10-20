@@ -95,6 +95,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <div class="stat"><div class="k" id="tr-peak-k">单桶峰值（rx+tx）</div><div class="v" id="tr-peak">-</div></div>
 <div class="stat"><div class="k" id="tr-sum-k">近3小时总量（rx/tx）</div><div class="v" id="tr-sum" style="font-size:15px">-</div></div>
 </div>
+<div class="card" style="margin-bottom:10px"><div style="font-size:12px;color:var(--mut)">实时速率（5s 快照 · 每5s刷新）</div><div id="live" style="font-size:13px;margin-top:4px">-</div></div>
 <div class="legend"><span><span class="dot" style="background:#4f9cf0"></span>rx 上行</span><span><span class="dot" style="background:#3fb97f"></span>tx 下行</span><span id="tr-hint"></span></div>
 <canvas class="chart" id="chart" width="960" height="260"></canvas>
 </section>
@@ -174,6 +175,17 @@ async function refresh(){
 }
 function human(n){ if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'K'; if(n<1073741824) return (n/1048576).toFixed(1)+'M'; return (n/1073741824).toFixed(2)+'G'; }
 function setGran(g){ trGran=g; for(const b of document.querySelectorAll('#trseg button')) b.classList.toggle('on',b.dataset.g===g); loadTraffic(); }
+async function loadLive(){
+  try{
+  const t=await need('/api/tunnels');
+  const sel=document.getElementById('trtunnel');
+  const tun=sel&&sel.value?sel.value:'all';
+  const j=await need(`/api/live?tunnel=${encodeURIComponent(tun)}`);
+  const rows=j.live||[];
+  document.getElementById('live').innerHTML=rows.length?rows.map(r=>`${r.tunnel} <b>${human(r.rx_s)}/s</b> / <b>${human(r.tx_s)}/s</b>`).join('&nbsp;&nbsp;·&nbsp;&nbsp;'):'暂无流量（等待下一 5s tick）';
+  }catch(e){}
+}
+setInterval(()=>{ if(!document.getElementById('sec-tr').classList.contains('hidden')) loadLive(); },5000);
 async function loadTraffic(){
   try{
   const t=await need('/api/tunnels');
@@ -201,6 +213,7 @@ async function loadTraffic(){
   document.getElementById('tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
   document.getElementById('tr-hint').textContent=pts.length?`${span}共 ${pts.length} 点 · 每点${bucket}`:'暂无数据（等待下一分钟 tick）';
   drawChart(pts);
+  loadLive();
   }catch(e){}
 }
 function drawChart(pts){

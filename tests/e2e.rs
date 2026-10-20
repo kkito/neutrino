@@ -1508,6 +1508,68 @@ async fn e2e_tcp_ratelimit_throttles_downlink() {
     let _ = (env_f, dt_l);
 }
 
+/// 回归：5s 实时快照——tcp 跑量后 /api/live 10s 内可见该 tunnel 且 rx_5s>0。
+/// 旧代码无 live tick、无 /api/live 路由，此 GET 直接 404 而红。
+#[tokio::test]
+async fn e2e_live_snapshot_within_10s() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"lv\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 持续跑量：后台循环 32KB roundtrip 10s，保证每个 5s 窗口都有增量
+    tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let chunk = vec![0xABu8; 32 * 1024];
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) {
+            if c.write_all(&chunk).await.is_err() {
+                break;
+            }
+            let mut got = vec![0u8; 32 * 1024];
+            if c.read_exact(&mut got).await.is_err() {
+                break;
+            }
+        }
+    });
+    // 轮询 /api/live（上限 10s，每 1s 一次）
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let mut seen = false;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let j: serde_json::Value = cli
+            .get(format!("{}/api/live?tunnel=e2e/lv", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = j["live"].as_array().cloned().unwrap_or_default();
+        if rows.iter().any(|r| r["rx_5s"].as_u64().unwrap_or(0) > 0) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "10s 内 /api/live 未见 e2e/lv 跑量");
+    let _ = env;
+}
+
 /// 回归：UDP 限速不断包——慢发 100 包（每包 1KB，间隔 5ms），限速组全收到。
 /// 猛发 flood 在本机回环上连不限速组都丢包（WSS 中转跟不上，现场 384/2048），
 /// flood 丢包断言是伪命题；此用例只锁“限速不丢正常流量”，钳制效果由线上网卡验证。
