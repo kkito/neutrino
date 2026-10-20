@@ -334,6 +334,33 @@ async fn e2e_http_conns_cleaned_on_client_abort() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(shown, "conns should show the slow http request");
+    // 代理头透传：带 X-Real-IP 的请求，peer 列应是外部 IP 而非 127.0.0.1
+    let mut cli2 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
+        .await
+        .unwrap();
+    cli2.write_all(b"GET / HTTP/1.1\r\nHost: slow.e2e.test\r\nX-Real-IP: 9.9.9.9\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut real_shown = false;
+    for _ in 0..40 {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/conns", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if arr.iter().any(|x| x["tunnel"] == "slow" && x["peer"].as_str().unwrap_or("").starts_with("9.9.9.9")) {
+            real_shown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(real_shown, "conns peer should show X-Real-IP, not 127.0.0.1");
+    drop(cli2);
     // 客户端裸断（后端还没回包）→ 行必须消失
     drop(cli);
     let mut gone = false;

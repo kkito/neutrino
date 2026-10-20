@@ -170,6 +170,32 @@ impl Drop for HttpConnGuard {
 /// axum fallback：已注册的 `/ws`、`/api/*` 优先匹配；
 /// 其余路径按 Host 路由到隧道 agent。整包转发给 agent，响应流式回写；
 /// 未知域名 404（`no such tunnel`），裸 IP/localhost 访问落到 WebUI。
+/// 真实外部 IP：nginx 在前时 ConnectInfo 恒为 127.0.0.1，优先读代理头。
+/// 顺序：X-Real-IP（单 IP，nginx 配的）> X-Forwarded-For 首个 > 直连对端。
+/// 伪造风险：公网直连 7440 时客户端可自带 X-Real-IP 冒充，仅展示用、不做鉴权依据。
+fn real_peer(headers: &::axum::http::HeaderMap, peer: &std::net::SocketAddr) -> String {
+    let hdr = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(ip) = hdr("x-real-ip") {
+        return if ip.contains(':') { ip } else { format!("{ip}:{}", peer.port()) };
+    }
+    if let Some(xff) = hdr("x-forwarded-for") {
+        if let Some(first) = xff.split(',').next().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return if first.contains(':') {
+                first.to_string()
+            } else {
+                format!("{}:{}", first, peer.port())
+            };
+        }
+    }
+    peer.to_string()
+}
+
 pub(crate) async fn fallback_http_ingress(
     State((s, _)): State<(S, Arc<String>)>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -177,6 +203,7 @@ pub(crate) async fn fallback_http_ingress(
 ) -> impl IntoResponse {
     use axum::body::to_bytes;
     let (parts, body) = req.into_parts();
+    let peer_s = real_peer(&parts.headers, &peer);
     let host = parts
         .headers
         .get(header::HOST)
@@ -248,7 +275,7 @@ pub(crate) async fn fallback_http_ingress(
             super::state::ConnInfo {
                 id: sid as u64,
                 proto: "http".into(),
-                peer: peer.to_string(),
+                peer: peer_s,
                 public_port: s.public_port,
                 agent: hostname,
                 tunnel: proxy.name.clone(),
@@ -765,6 +792,24 @@ mod tests {
         // hop-by-hop 头被剥掉，业务头保留（小写归一）
         assert!(headers.iter().any(|(k, v)| k == "content-length" && v == "3"));
         assert!(!headers.iter().any(|(k, _)| k == "connection" || k == "transfer-encoding"));
+    }
+
+    #[test]
+    fn real_peer_prefers_proxy_headers() {
+        // 根因→修法：nginx 在前时 ConnectInfo 恒为 127.0.0.1，peer 列全是内网地址。
+        // 旧代码直接 peer.to_string()，此单测锁死代理头优先顺序。
+        use axum::http::HeaderMap;
+        let peer: std::net::SocketAddr = "127.0.0.1:60032".parse().unwrap();
+        // X-Real-IP 优先（无端口则补对端端口）
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "1.2.3.4".parse().unwrap());
+        assert_eq!(real_peer(&h, &peer), "1.2.3.4:60032");
+        // XFF 取首个，跳过 X-Real-IP 缺席时
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "5.6.7.8, 10.0.0.1".parse().unwrap());
+        assert_eq!(real_peer(&h2, &peer), "5.6.7.8:60032");
+        // 都没有 → 直连对端
+        assert_eq!(real_peer(&HeaderMap::new(), &peer), "127.0.0.1:60032");
     }
 
     #[test]
