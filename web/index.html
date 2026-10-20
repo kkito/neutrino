@@ -150,7 +150,7 @@ async function refresh(){
   const cur=sel.value;
   sel.innerHTML=o.agents.map(a=>`<option ${a.hostname===cur?'selected':''}>${a.hostname}</option>`).join('')||'<option value="">(无在线 agent)</option>';
   document.getElementById('agents').innerHTML='<tr><th>hostname</th><th>id</th><th>ver</th><th>RTT(ms)</th><th>在线(s)</th><th>rx/tx</th></tr>'+
-    o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${a.rx_bytes}/${a.tx_bytes}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
+    o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${human(a.rx_bytes)}/${human(a.tx_bytes)}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
   await loadDesired(false);
   const t=await need('/api/tunnels');
   document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{

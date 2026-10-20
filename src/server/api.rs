@@ -514,6 +514,8 @@ mod tests {
         assert!(html.contains("tr-rx-k"), "missing traffic label ids");
         assert!(html.contains("最近"), "traffic labels must show bucket span");
         assert!(html.contains("均速"), "traffic labels must show avg rate");
+        // 总览 rx/tx 用 human() 格式化（与流量 tab 一致，不再裸字节）
+        assert!(html.contains("human(a.rx_bytes)"), "overview rx/tx must be humanized");
         // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
         assert!(html.contains("id=\"ver\""), "missing sidebar version span");
         assert!(html.contains("o.version"), "missing version render");
