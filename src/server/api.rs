@@ -71,15 +71,22 @@ pub(crate) async fn api_tunnels(
         return unauthorized();
     }
     let ag = s.agents.read().await;
+    let lims = s.rate_limiters.read().await;
     let mut out = vec![];
     for hh in ag.values() {
         for p in &hh.info.proxies {
+            // 限速实况：key 同泵侧 traffic_key；无 key = 该映射无流量经过 limiter。
+            let rl = lims.get(&crate::server::state::traffic_key(&hh.info.hostname, &p.name)).map(|l| {
+                let (limit, bytes, sleep_ms) = l.stats();
+                serde_json::json!({"limit_bps": limit, "throttled_bytes": bytes, "sleep_ms": sleep_ms})
+            });
             out.push(serde_json::json!({
                 "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
                 "name": p.name, "enabled": p.enabled,
                 "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
                 "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
                 "rate_limit": p.rate_limit,
+                "ratelimit_stats": rl,
                 "target": format!("{}:{}", p.local_ip, p.local_port),
                 "status": if p.enabled { "online" } else { "disabled" },
             }));

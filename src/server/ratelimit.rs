@@ -53,11 +53,13 @@ impl Default for RateWindow {
 pub struct RateLimiter {
     limit: AtomicU64,
     win: tokio::sync::Mutex<RateWindow>,
+    throttled_bytes: AtomicU64,
+    sleep_millis: AtomicU64,
 }
 
 impl RateLimiter {
     pub fn new(limit_bps: u64) -> Self {
-        Self { limit: AtomicU64::new(limit_bps), win: tokio::sync::Mutex::new(RateWindow::new()) }
+        Self { limit: AtomicU64::new(limit_bps), win: tokio::sync::Mutex::new(RateWindow::new()), throttled_bytes: AtomicU64::new(0), sleep_millis: AtomicU64::new(0) }
     }
     /// 纯算 sleep 量（不 sleep，调用方 sleep；零开销路径：limit==0 直接 ZERO 不锁）。
     pub async fn take(&self, n: usize) -> Duration {
@@ -65,7 +67,14 @@ impl RateLimiter {
         if lim == 0 || n == 0 {
             return Duration::ZERO;
         }
-        self.win.lock().await.take(n, lim)
+        let d = self.win.lock().await.take(n, lim);
+        self.throttled_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.sleep_millis.fetch_add(d.as_millis() as u64, Ordering::Relaxed);
+        d
+    }
+    /// (limit, 经手字节累计, 累计 sleep 毫秒)——供 /api/tunnels + 周期日志验证限速生效。
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.limit.load(Ordering::Relaxed), self.throttled_bytes.load(Ordering::Relaxed), self.sleep_millis.load(Ordering::Relaxed))
     }
     pub fn set_limit(&self, v: u64) {
         self.limit.store(v, Ordering::Relaxed);
@@ -103,6 +112,29 @@ pub fn limit_of(opt: Option<&str>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn limiter_stats_counters() {
+        // 可观测回归：take 累计经手字节 + sleep 量；零 limit/零字节不计数。
+        // RED 现场：旧 RateLimiter 无 stats 方法，编译即红。
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = super::RateLimiter::new(10 * 1024 * 1024);
+            let d = l.take(32 * 1024).await;
+            let (limit, bytes, sleep_ms) = l.stats();
+            assert_eq!(limit, 10 * 1024 * 1024);
+            assert_eq!(bytes, 32 * 1024);
+            assert_eq!(sleep_ms, d.as_millis() as u64);
+            // 零字节不计数
+            let _ = l.take(0).await;
+            assert_eq!(l.stats().1, 32 * 1024);
+        });
+        let zero = super::RateLimiter::new(0);
+        let rt2 = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt2.block_on(async {
+            assert_eq!(zero.take(100).await, std::time::Duration::ZERO);
+            assert_eq!(zero.stats(), (0, 0, 0));
+        });
+    }
     #[test]
     fn sleep_math_clamps_at_zero() {
         // 32KB 块 @0.5MB/s 理论 62.5ms；已用 10ms -> 睡 52.5ms；已超时 -> 0

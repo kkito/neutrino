@@ -80,6 +80,27 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
             }
         });
     }
+    // 限速实况周期日志（5min）：每映射经手字节 + 累计 sleep，验证限速是否真在压。
+    // 根因→修法：VPS 网卡总量监控分不清哪条路的流量，limiter 自带计数器才是实锤。
+    {
+        let s = shared.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                iv.tick().await;
+                let lims = s.rate_limiters.read().await;
+                if lims.is_empty() {
+                    continue;
+                }
+                let mut rows: Vec<String> = lims.iter().map(|(k, l)| {
+                    let (limit, bytes, sleep_ms) = l.stats();
+                    format!("{k} limit={limit}B/s thru={bytes}B sleep={sleep_ms}ms")
+                }).collect();
+                rows.sort();
+                tracing::info!("ratelimit stats: {}", rows.join(" | "));
+            }
+        });
+    }
     // periodic persist
     {
         let s = shared.clone();
