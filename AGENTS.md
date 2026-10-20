@@ -32,7 +32,7 @@ cargo test --test e2e <name>       # 跑单个 e2e
 
 ## 部署（natproxy server 二进制）
 - linux 二进制只走 GitHub Actions：打 tag `v*` 触发 `.github/workflows/release.yml`
-  （musl static，产物 `neutrino-x86_64-unknown-linux-musl.tar.gz`，见 GitHub Release），
+  （musl static，产物 `neutrino-<version>-x86_64-unknown-linux-musl.tar.gz`，见 GitHub Release），
   下载解压到 `/root/nastools/tunnel/neutrino` 再 `systemctl restart tunnel-server`。
 - 别 `scp` 本机 `target/release/neutrino`（macOS arm64，server 上 203/EXEC 起不来；
   2026-10-20 已踩过一次把线上二进制覆盖掉）；本地也别折腾 musl cross（缺 musl-gcc，ring 编不过）。

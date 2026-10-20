@@ -31,17 +31,20 @@ jobs:
 
       - name: Package
         run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then VER="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
           cd target/$TARGET/release
-          tar czf neutrino-$TARGET.tar.gz neutrino
-          sha256sum neutrino-$TARGET.tar.gz > neutrino-$TARGET.tar.gz.sha256
+          tar czf neutrino-$VER-$TARGET.tar.gz neutrino
+          sha256sum neutrino-$VER-$TARGET.tar.gz > neutrino-$VER-$TARGET.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: neutrino-$TARGET
-          path: target/${{ env.TARGET }}/release/neutrino-${{ env.TARGET }}.tar.gz*
+          name: neutrino-${{ env.VERSION }}-$TARGET
+          path: target/${{ env.TARGET }}/release/neutrino-${{ env.VERSION }}-${{ env.TARGET }}.tar.gz*
 
       # 只在打 tag (v*) 时发布到 GitHub Release
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ env.TARGET }}/release/neutrino-${{ env.TARGET }}.tar.gz*
+          files: target/${{ env.TARGET }}/release/neutrino-${{ env.VERSION }}-${{ env.TARGET }}.tar.gz*

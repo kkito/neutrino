@@ -7,7 +7,7 @@ pub(crate) use server::auth::{mint_jwt as server_mint_jwt, verify_jwt as server_
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "neutrino", about = "stealth WSS tunnel: server | agent")]
+#[command(name = "neutrino", version, about = "stealth WSS tunnel: server | agent")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
