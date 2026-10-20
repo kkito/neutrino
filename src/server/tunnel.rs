@@ -292,20 +292,18 @@ fn spawn_link_relay(
         };
         // 出口 sid：server 偶数号（与 ingress next_sid 同源，避开 agent 奇数 sid）
         let sid_exit = super::ingress::next_sid_pub();
-        // 3. 双端占位 incoming（防 Open 后背靠背 Binary 早到丢包，同 egress 注释）
+        // 3. 双端占位 incoming（防 Open 后背靠背 Binary 早到丢包，同 egress 注释）。
+        // 根因→修法：旧代码用 try_read/try_write best-effort 占位，relay task 调度慢于
+        // ws_loop 的 Binary 分支时，首包查不到 incoming 进 pending 缓存，而泵从不 drain
+        // pending → 首包永久丢失，client 读 5s 超时才重试（link_tcp_roundtrip 跑 80s+）。
+        // 改为 await 强注册 + 下面第 3.5 步 drain entry pending，保证首包必达。
         let (dtx_exit, mut drx_exit) = mpsc::unbounded_channel::<Vec<u8>>();
         let (dtx_entry, mut drx_entry) = mpsc::unbounded_channel::<Vec<u8>>();
-        if let Ok(ag) = s.agents.try_read() {
-            if let Some(h) = ag.get(&exit_aid) {
-                if let Ok(mut inc) = h.incoming.try_write() {
-                    inc.insert(sid_exit, dtx_exit);
-                }
-            }
-            if let Some(h) = ag.get(&entry_aid) {
-                if let Ok(mut inc) = h.incoming.try_write() {
-                    inc.insert(sid_entry, dtx_entry);
-                }
-            }
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            h.incoming.write().await.insert(sid_exit, dtx_exit.clone());
+        }
+        if let Some(h) = s.agents.read().await.get(&entry_aid) {
+            h.incoming.write().await.insert(sid_entry, dtx_entry.clone());
         }
         // 4. 向出口发 Open{link}（真实目标，出口直接 dial）
         if exit_ctl
@@ -323,6 +321,26 @@ fn spawn_link_relay(
             });
             return;
         }
+        // 3.5 入口早到包 drain（同 spawn_egress_dial）：Open 与首个 Binary 背靠背时，
+        // 占位注册前的包已进 entry pending。占位的新 dtx 替换了缓存目标，必须先把缓存
+        // 包转给泵，否则首字节永久丢失（client 侧表现为读超时重试）。出口侧同理。
+        async fn drain_early(
+            s: &S,
+            aid: &str,
+            sid: u32,
+            tx: &mpsc::UnboundedSender<Vec<u8>>,
+        ) {
+            let pe = s.agents.read().await.get(aid).map(|h| h.pending.clone());
+            if let Some(pe) = pe {
+                if let Some(chunks) = pe.write().await.remove(&sid) {
+                    for chunk in chunks {
+                        let _ = tx.send(chunk);
+                    }
+                }
+            }
+        }
+        drain_early(&s, &entry_aid, sid_entry, &dtx_entry).await;
+        drain_early(&s, &exit_aid, sid_exit, &dtx_exit).await;
         // 5. conns 记账（peer=入口 agent，target=最终目标）
         let cid = (sid_entry as u64) | ((sid_exit as u64) << 32);
         s.conns.write().await.insert(
@@ -361,10 +379,15 @@ fn spawn_link_relay(
                 }
             }
         });
-        // 7. 任一方向结束即 abort 对端（否则单边 EOF 时 join! 永等→conns 僵尸行）
+        // 7. 任一方向结束即 abort 对端（否则单边 EOF 时 join! 永等→conns 僵尸行）。
+        // 根因→修法：旧代码 abort 后不 drop sender，relay task 自身持有的 dtx_exit/
+        // dtx_entry 副本让对端 drx 永不结束→select! 永等→conns 行泄漏。先显式 drop
+        // 全部 sender 副本，再 abort+await，确保双泵退出。
+        drop(dtx_exit);
+        drop(dtx_entry);
         tokio::select! {
-            _ = &mut a2e => { a2e.abort(); e2a.abort(); }
-            _ = &mut e2a => { a2e.abort(); e2a.abort(); }
+            _ = &mut a2e => { e2a.abort(); let _ = (&mut e2a).await; }
+            _ = &mut e2a => { a2e.abort(); let _ = (&mut a2e).await; }
         }
         // 任一方向结束即双关+清行
         s.conns.write().await.remove(&cid);
