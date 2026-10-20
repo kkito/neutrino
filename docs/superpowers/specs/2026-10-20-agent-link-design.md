@@ -61,7 +61,21 @@
 - conns/traffic 零改动（自动按 `tunnel=link名` 统计）。
 - agent 侧 WebUI 只读显示 link 监听，不可改（源头在 server desired）。
 
-## 6. 测试与边界
+## 6. 流量统计与连接（复用，无额外工作量）
+
+- **conns**：link 中转泵建流时 `insert_conn`（`tunnel=link名`，`peer`=连到
+  agent2 监听的对端），每泵一块累加该行 `rx/tx`，双关时删除。
+  实现时注意走 `HttpConnGuard` 同款 Drop-guard 语义，任一侧断都清行，
+  不引入新僵尸行（`conns` 上限 5000 复用）。
+- **traffic**：60s tick 按 `traffic_key(hostname, name)`（即 `agent2/link名`）
+  记增量，link 字节天然经过两端 agent 的 `rx/tx_bytes` 累加路径
+  （`tunnel.rs` 的 Binary/out_rx 分支不分 kind），所以 link 自动进
+  `/api/traffic`，流量 tab 下拉直接多出 `agent2/link名` 选项，落盘
+  `traffic.json` 复用。
+- 注意：当前 tick 取的是 agent 级累计（同 agent 多条目均摊口径已有近似），
+  link 沿用同一口径，不单独立精确到流的计数——与现有隧道一致，不加复杂度。
+
+## 7. 测试与边界
 
 - 单测：link 字段 serde 默认（老 desired 不炸）；自环校验；
   Open(link) 目标以 server 存为准（伪造被忽略）。
