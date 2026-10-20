@@ -510,6 +510,10 @@ mod tests {
         assert!(html.contains("/api/traffic"), "missing traffic fetch");
         assert!(html.contains("/api/conns"), "missing conns fetch");
         assert!(html.contains("<canvas"), "traffic chart must be canvas");
+        // 流量卡片标题随粒度联动（桶时长/查询范围写明白，不再用“周期/窗口”模糊词）
+        assert!(html.contains("tr-rx-k"), "missing traffic label ids");
+        assert!(html.contains("最近"), "traffic labels must show bucket span");
+        assert!(html.contains("均速"), "traffic labels must show avg rate");
         // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
         assert!(html.contains("id=\"ver\""), "missing sidebar version span");
         assert!(html.contains("o.version"), "missing version render");

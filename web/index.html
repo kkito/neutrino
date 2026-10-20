@@ -90,10 +90,10 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <button data-g="min" class="on" onclick="setGran('min')">分</button><button data-g="hour" onclick="setGran('hour')">时</button><button data-g="day" onclick="setGran('day')">天</button>
 </div></div>
 <div class="statcards">
-<div class="stat"><div class="k">当前周期 rx</div><div class="v" id="tr-rx">-</div></div>
-<div class="stat"><div class="k">当前周期 tx</div><div class="v" id="tr-tx">-</div></div>
-<div class="stat"><div class="k">周期峰值（rx+tx）</div><div class="v" id="tr-peak">-</div></div>
-<div class="stat"><div class="k">窗口总量（rx/tx）</div><div class="v" id="tr-sum" style="font-size:15px">-</div></div>
+<div class="stat"><div class="k" id="tr-rx-k">最近1分钟 rx</div><div class="v" id="tr-rx">-</div></div>
+<div class="stat"><div class="k" id="tr-tx-k">最近1分钟 tx</div><div class="v" id="tr-tx">-</div></div>
+<div class="stat"><div class="k" id="tr-peak-k">单桶峰值（rx+tx）</div><div class="v" id="tr-peak">-</div></div>
+<div class="stat"><div class="k" id="tr-sum-k">近3小时总量（rx/tx）</div><div class="v" id="tr-sum" style="font-size:15px">-</div></div>
 </div>
 <div class="legend"><span><span class="dot" style="background:#4f9cf0"></span>rx 上行</span><span><span class="dot" style="background:#3fb97f"></span>tx 下行</span><span id="tr-hint"></span></div>
 <canvas class="chart" id="chart" width="960" height="260"></canvas>
@@ -182,11 +182,19 @@ async function loadTraffic(){
   const sum=pts.reduce((a,p)=>[a[0]+p[1],a[1]+p[2]],[0,0]);
   const last=pts.length?pts[pts.length-1]:[0,0,0];
   const peak=pts.reduce((a,p)=>Math.max(a,p[1]+p[2]),0);
+  // 卡片标题随粒度联动，消除“周期/窗口”歧义：桶时长与查询范围写明白。
+  const bucket=trGran==='min'?'1分钟':(trGran==='hour'?'1小时':'1天');
+  const span=trGran==='min'?'近3小时':(trGran==='hour'?'近7天':'近31天');
+  const rate=s=>human(Math.round(s/(trGran==='min'?60:(trGran==='hour'?3600:86400))))+'/s';
+  document.getElementById('tr-rx-k').textContent=`最近${bucket} rx（均速 ${rate(last[1])}）`;
+  document.getElementById('tr-tx-k').textContent=`最近${bucket} tx（均速 ${rate(last[2])}）`;
+  document.getElementById('tr-peak-k').textContent=`单${bucket}峰值（rx+tx）`;
+  document.getElementById('tr-sum-k').textContent=`${span}总量（rx/tx）`;
   document.getElementById('tr-rx').textContent=human(last[1]);
   document.getElementById('tr-tx').textContent=human(last[2]);
   document.getElementById('tr-peak').textContent=human(peak);
   document.getElementById('tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
-  document.getElementById('tr-hint').textContent=pts.length?`共 ${pts.length} 点`:'暂无数据（等待下一分钟 tick）';
+  document.getElementById('tr-hint').textContent=pts.length?`${span}共 ${pts.length} 点 · 每点${bucket}`:'暂无数据（等待下一分钟 tick）';
   drawChart(pts);
   }catch(e){}
 }
