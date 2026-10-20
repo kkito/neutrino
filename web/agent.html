@@ -42,7 +42,7 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <p><button class="btn" onclick="login()" style="width:100%">登录</button></p>
 <p id="loginmsg" style="color:var(--danger)"></p></div></div>
 <div id="app" class="layout hidden">
-<nav class="side"><h1>agent</h1>
+<nav class="side"><h1>agent <span id="ver" style="font-size:12px;color:var(--mut);font-weight:400"></span></h1>
 <button id="nav-ov" class="on" onclick="tab('ov')">状态</button>
 <button id="nav-tn" onclick="tab('tn')">隧道</button>
 <button id="nav-eg" onclick="tab('eg')">出网代理</button>
@@ -102,6 +102,7 @@ async function refresh(){
   const r=await fetch('/api/status',{headers:hdrs()});
   if(r.status===401){location.reload();return;}
   const s=await r.json();
+  if(s.version) document.getElementById('ver').textContent='('+s.version+')';
   const on=s.online;
   document.getElementById('stat').innerHTML=
     `<dt>上行</dt><dd>${s.server_url||'-'}</dd>`+

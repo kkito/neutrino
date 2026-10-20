@@ -59,7 +59,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <p><button class="btn" onclick="login()" style="width:100%">登录</button></p>
 <p id="loginmsg" style="color:var(--danger)"></p></div></div>
 <div id="app" class="layout hidden">
-<nav class="side"><h1>neutrino</h1>
+<nav class="side"><h1>neutrino <span id="ver" style="font-size:12px;color:var(--mut);font-weight:400"></span></h1>
 <button id="nav-ov" class="on" onclick="tab('ov')">总览</button>
 <button id="nav-tn" onclick="tab('tn')">隧道</button>
 <button id="nav-tr" onclick="tab('tr')">流量</button>
@@ -145,6 +145,7 @@ async function need(u){ const r=await fetch(u,{headers:hdrs(),credentials:'same-
 async function refresh(){
   try{
   const o=await need('/api/overview');
+  if(o.version) document.getElementById('ver').textContent='('+o.version+')';
   const sel=document.getElementById('hostsel');
   const cur=sel.value;
   sel.innerHTML=o.agents.map(a=>`<option ${a.hostname===cur?'selected':''}>${a.hostname}</option>`).join('')||'<option value="">(无在线 agent)</option>';

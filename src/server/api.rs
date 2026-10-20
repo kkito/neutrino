@@ -59,7 +59,7 @@ pub(crate) async fn api_overview(
             i
         })
         .collect();
-    Json(serde_json::json!({"agents": list})).into_response()
+    Json(serde_json::json!({"agents": list, "version": crate::common::proto::VERSION})).into_response()
 }
 
 pub(crate) async fn api_tunnels(
@@ -510,6 +510,12 @@ mod tests {
         assert!(html.contains("/api/traffic"), "missing traffic fetch");
         assert!(html.contains("/api/conns"), "missing conns fetch");
         assert!(html.contains("<canvas"), "traffic chart must be canvas");
+        // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
+        assert!(html.contains("id=\"ver\""), "missing sidebar version span");
+        assert!(html.contains("o.version"), "missing version render");
+        let ahtml = include_str!("../../web/agent.html");
+        assert!(ahtml.contains("id=\"ver\""), "missing agent sidebar version span");
+        assert!(ahtml.contains("s.version"), "missing agent version render");
     }
     #[test]
     fn basic_auth_gate() {

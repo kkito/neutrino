@@ -167,6 +167,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     );
     // shared status for local WebUI
     let status = Arc::new(RwLock::new(self::web::AgentStatus {
+        version: crate::common::proto::VERSION.into(),
         server_url: initial_url.clone(),
         hostname: cfg.hostname.clone(),
         ..Default::default()

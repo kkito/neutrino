@@ -16,6 +16,8 @@ use tokio::{net::TcpListener, sync::RwLock};
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AgentStatus {
+    #[serde(default)]
+    pub version: String,
     pub server_url: String,
     pub hostname: String,
     pub online: bool,
