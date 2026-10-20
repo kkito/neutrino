@@ -561,10 +561,12 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         let (mut ri, mut wi) = inbound.into_split();
                         let out2 = out.clone();
                         let s_rx = s3.clone();
+                        // 双向总量：上下行共用同一 limiter（同映射所有连接+双向累加）。
                         let limiter = match rate_bps {
                             Some(bps) => Some(crate::server::ratelimit::limiter_for(&s3, &rate_key, bps).await),
                             None => None,
                         };
+                        let limiter_up = limiter.clone();
                         let to_agent = tokio::spawn(async move {
                             let mut b = vec![0u8; 32 * 1024];
                             loop {
@@ -594,6 +596,13 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         let s_tx = s3.clone();
                         let from_agent = async {
                             while let Some(chunk) = drx.recv().await {
+                                // 上行同压：与下行共用同一 limiter（双向总量口径）。
+                                if let Some(l) = &limiter_up {
+                                    let d = l.take(chunk.len()).await;
+                                    if !d.is_zero() {
+                                        tokio::time::sleep(d).await;
+                                    }
+                                }
                                 // 连接行 tx 累计（agent->公网字节）
                                 if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
                                     c.tx += chunk.len() as u64;
@@ -685,12 +694,30 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                         host: String::new(),
                         port,
                     });
-                    // agent->internet pump for this peer
+                    // agent->internet pump for this peer（回包方向同压：与收包共用映射级 limiter，双向总量）。
                     let sock2 = sock.clone();
                     let s3 = s2.clone();
                     let aid3 = aid.clone();
+                    let up_limiter = {
+                        let ag = s2.agents.read().await;
+                        let hit = ag.values().find_map(|h| {
+                            h.info.proxies.iter()
+                                .find(|p| p.enabled && p.remote_port == port && p.ptype == "udp")
+                                .map(|p| (crate::server::state::traffic_key(&h.info.hostname, &p.name), crate::server::ratelimit::limit_of(p.rate_limit.as_deref())))
+                        });
+                        match hit {
+                            Some((key, Some(b))) if !key.is_empty() => Some(crate::server::ratelimit::limiter_for(&s2, &key, b).await),
+                            _ => None,
+                        }
+                    };
                     tokio::spawn(async move {
                         while let Some(chunk) = drx.recv().await {
+                            if let Some(l) = &up_limiter {
+                                let d = l.take(chunk.len()).await;
+                                if !d.is_zero() {
+                                    tokio::time::sleep(d).await;
+                                }
+                            }
                             // UDP 连接行 tx 累计（peer 行线性查找；连接数小可接受）
                             let peer_s = peer.to_string();
                             {

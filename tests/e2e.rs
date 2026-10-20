@@ -1507,3 +1507,66 @@ async fn e2e_tcp_ratelimit_throttles_downlink() {
     assert!(dt_l >= dt_f * 3, "限速不显著：限速{dt_l:?} vs 不限速{dt_f:?}");
     let _ = (env_f, dt_l);
 }
+
+/// 回归：映射级双向总量限速——client 上传方向（公网->agent）同压。
+/// 因果链写法：后端每收齐 32KB 回 1 字节 ack，client 发一块等一 ack。
+/// server 内核缓冲再大也藏不住——ack 没回来下一块发不出去，耗时 = 上行泵真实转发速率。
+/// （反面教材：单向 write_all 计时全是假阴性，256KB 进内核缓冲就返回，现场 73µs。）
+#[tokio::test]
+async fn e2e_tcp_ratelimit_throttles_uplink() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else { break };
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 32 * 1024];
+                loop {
+                    // 收齐一块 -> 回 1 字节 ack（ack 经回程，1 字节可忽略）
+                    let mut off = 0;
+                    while off < b.len() {
+                        match s.read(&mut b[off..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => off += n,
+                        }
+                    }
+                    if s.write_all(&[0x06]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    const N: usize = 256 * 1024;
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"up\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"0.5m\"\n"
+    ))
+    .await;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let mut off = 0;
+    while off < N {
+        let len = (N - off).min(32 * 1024);
+        c.write_all(&vec![0xCDu8; len]).await.unwrap();
+        let mut ack = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(30), c.read_exact(&mut ack))
+            .await
+            .unwrap_or_else(|_| panic!("[uplink] ack stall: block {off}/{N}"))
+            .unwrap();
+        assert_eq!(ack[0], 0x06);
+        off += len;
+    }
+    let dt = t0.elapsed();
+    eprintln!("[uplink-limited] up={dt:?}");
+    // 理论下限 256KB/0.5MB/s=0.5s，留余量防计时抖动
+    assert!(dt >= Duration::from_millis(400), "上行限速未生效：{dt:?}");
+    let _ = env;
+}
