@@ -112,11 +112,13 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <label>名称</label><input id="f-name" placeholder="如 web">
 <label>类型</label><select id="f-type" onchange="typeFields()">
 <option value="http">http（域名路由）</option><option value="tcp">tcp（端口）</option>
-<option value="https">https（TLS 透传）</option><option value="udp">udp（端口）</option></select>
+<option value="https">https（TLS 透传）</option><option value="udp">udp（端口）</option><option value="link">link（跨 agent）</option></select>
 <label id="l-dom">域名（逗号分隔）</label><input id="f-dom" placeholder="a.example.com">
 <label id="l-port" class="hidden">公网端口 remote_port</label><input id="f-port" class="hidden" type="number" placeholder="如 2222">
-<label>目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）</label><input id="f-ip" value="127.0.0.1">
-<label>目标端口（agent 本机视角）</label><input id="f-lport" type="number" placeholder="如 80">
+<label id="l-link-agent" class="hidden">对端 agent（出口 agent 的主机名）</label><select id="f-link-agent" class="hidden"></select>
+<label id="l-link-tgt" class="hidden">对端目标（出口 agent 本机视角的 ip:port）</label><div id="f-link-tgt" class="hidden"><input id="f-link-ip" placeholder="如 192.168.1.10"><input id="f-link-port" type="number" placeholder="如 3306"></div>
+<label id="l-ip">目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）</label><input id="f-ip" value="127.0.0.1">
+<label id="l-lport">目标端口（agent 本机视角）</label><input id="f-lport" type="number" placeholder="如 80">
 <label>入口 Basic 认证（可选，http 隧道：浏览器先弹框登录才放行；格式 user:pass，transmission 这类无登录页的最合适。留空=不校验）</label><input id="f-basic" placeholder="如 admin:一串随机口令" autocomplete="off">
 <label><input type="checkbox" id="f-en" checked> 启用</label>
 <div class="row" style="margin-top:16px;justify-content:flex-end">
@@ -154,13 +156,15 @@ async function refresh(){
   await loadDesired(false);
   const t=await need('/api/tunnels');
   document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
-    const where=`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
+    const isLink=x.type==='link';
+    const where=isLink?'-':`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
+    const tgt=isLink?`${x.link_agent||'?'}→${x.link_host||'?'}:${x.link_port||'?'}`:x.target;
     const live=o.agents.some(a=>a.agent_id===x.agent_id||a.hostname===x.agent);
     const st=!x.enabled?'<span class="badge b-off">已禁用</span>':(live?'<span class="badge b-ok">生效中</span>':'<span class="badge b-warn">待同步</span>');
     const btn=x.enabled?`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
     const ed=`<button class="btn ghost" onclick='editRow(${JSON.stringify(x).replace(/'/g,"&#39;")})'>编辑</button>`;
     const del=`<button class="btn ghost" onclick="delRow('${x.name}')">删除</button>`;
-    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${x.type}</td><td>${where}</td><td>${x.target}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
   const l=await need('/api/logs');
   document.getElementById('logs').textContent=l.logs.join('\n');
   if(!document.getElementById('sec-tr').classList.contains('hidden')) loadTraffic();
@@ -247,14 +251,29 @@ async function reloadDesired(){
   else toast('重载失败: '+(j.reason||r.status),true);
 }
 function typeFields(){
-  const t=document.getElementById('f-type').value, isHttp=(t==='http');
+  const t=document.getElementById('f-type').value, isHttp=(t==='http'), isLink=(t==='link');
   document.getElementById('l-dom').classList.toggle('hidden',!isHttp);
   document.getElementById('f-dom').classList.toggle('hidden',!isHttp);
-  document.getElementById('l-port').classList.toggle('hidden',isHttp);
-  document.getElementById('f-port').classList.toggle('hidden',isHttp);
+  document.getElementById('l-port').classList.toggle('hidden',isHttp||isLink);
+  document.getElementById('f-port').classList.toggle('hidden',isHttp||isLink);
+  for(const id of ['l-link-agent','f-link-agent','l-link-tgt','f-link-tgt'])
+    document.getElementById(id).classList.toggle('hidden',!isLink);
+  document.getElementById('l-ip').textContent=isLink?'本监听地址（入口 agent 上起监听：0.0.0.0=入口内网可达，127.0.0.1=仅本机）':'目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）';
+  document.getElementById('l-lport').textContent=isLink?'本监听端口':'目标端口（agent 本机视角）';
+  if(isLink){
+    // 对端下拉=在线 agents（除自己）；根因→修法：自环在保存时也拦（见 saveForm）。
+    const self=document.getElementById('hostsel').value;
+    need('/api/overview').then(o=>{
+      const sel=document.getElementById('f-link-agent');
+      const cur=sel.value;
+      sel.innerHTML=(o.agents||[]).filter(a=>a.hostname!==self)
+        .map(a=>`<option ${a.hostname===cur?'selected':''}>${a.hostname}</option>`).join('')||'<option value="">(无其他在线 agent)</option>';
+    }).catch(()=>{});
+  }
 }
 function openForm(){ editing=null; document.getElementById('formtitle').textContent='新增隧道';
-  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic','f-link-ip','f-link-port']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+  document.getElementById('f-link-agent').innerHTML='';
   document.getElementById('f-en').checked=true; typeFields();
   document.getElementById('formwrap').classList.remove('hidden'); }
 function closeForm(){ document.getElementById('formwrap').classList.add('hidden'); }
@@ -265,8 +284,11 @@ function editRow(x){ editing=x.name;
   document.getElementById('f-dom').value=(x.domains||[]).join(',');
   document.getElementById('f-port').value=x.remote_port||'';
   document.getElementById('f-basic').value=x.basic_auth||'';
+  document.getElementById('f-link-ip').value=x.link_host||'';
+  document.getElementById('f-link-port').value=x.link_port||'';
   const tgt=(x.target||'').split(':'); document.getElementById('f-ip').value=tgt[0]||'127.0.0.1';
   document.getElementById('f-lport').value=tgt[1]||'';
+  if((x.type||'')==='link'){ const sel=document.getElementById('f-link-agent'); sel.innerHTML=`<option>${x.link_agent||''}</option>`; sel.value=x.link_agent||''; }
   document.getElementById('f-en').checked=!!x.enabled;
   document.getElementById('formwrap').classList.remove('hidden'); }
 function curProxy(){
@@ -279,6 +301,9 @@ function curProxy(){
     remote_port:t==='http'?0:parseInt(document.getElementById('f-port').value||'0'),
     enabled:document.getElementById('f-en').checked};
   if(t==='http'&&basic) p.basic_auth=basic;
+  if(t==='link'){ p.link_agent=document.getElementById('f-link-agent').value.trim();
+    p.link_host=document.getElementById('f-link-ip').value.trim();
+    p.link_port=parseInt(document.getElementById('f-link-port').value||'0'); }
   return p;
 }
 async function saveForm(){
@@ -287,8 +312,15 @@ async function saveForm(){
   const p=curProxy();
   if(!p.name){ toast('名称必填',true); return; }
   if(p.type==='http'&&!p.domains.length){ toast('http 隧道域名必填',true); return; }
-  if(p.type!=='http'&&!p.remote_port){ toast('此类隧道公网端口必填',true); return; }
-  if(!p.local_port){ toast('内网目标端口必填',true); return; }
+  if(p.type==='link'){
+    if(!p.link_agent){ toast('对端 agent 必填',true); return; }
+    if(p.link_agent===h){ toast('link 对端不能是自己',true); return; }
+    if(!p.link_host||!p.link_port){ toast('对端目标 ip:port 必填',true); return; }
+    if(!p.local_port){ toast('本监听端口必填',true); return; }
+  } else {
+    if(!p.remote_port&&p.type!=='http'){ toast('此类隧道公网端口必填',true); return; }
+    if(!p.local_port){ toast('内网目标端口必填',true); return; }
+  }
   let list=desiredCache.slice();
   const i=list.findIndex(q=>q.name===(editing||p.name));
   if(editing&&editing!==p.name) { const j=list.findIndex(q=>q.name===editing); if(j>=0) list.splice(j,1); }

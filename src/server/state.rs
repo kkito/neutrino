@@ -388,6 +388,9 @@ mod tests {
             set_x_forwarded_proto: None,
             basic_auth: None,
             enabled: true,
+            link_agent: String::new(),
+            link_host: String::new(),
+            link_port: 0,
         }];
         assert_eq!(resolve_proxies(Some(want.clone()), vec![]).len(), 1);
         assert_eq!(resolve_proxies(Some(want.clone()), vec![])[0].name, "d");

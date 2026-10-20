@@ -1,5 +1,6 @@
 //! Agent side: out-bound WSS, local dial, stream pumps.
 pub mod egress;
+pub mod link;
 pub mod session;
 pub mod stream;
 pub mod web;

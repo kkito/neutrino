@@ -1089,3 +1089,272 @@ async fn desired_reload_from_file() {
     assert!(echo_ok(rport).await, "good mapping lost after partial reload");
     let _ = (&mut srv, &mut ag);
 }
+
+/// 双 agent 启动器（link e2e 用）：同一 server + 两个 hostname 不同的 agent。
+/// agent1 纯出口（无 link），agent2 带 link 条目（入口监听）。
+struct Env2 {
+    http_port: u16,
+    web_base: String,
+    _srv: tokio::process::Child,
+    _ag1: tokio::process::Child,
+    _ag2: tokio::process::Child,
+}
+
+async fn boot_two_agents(desired_toml: &str) -> Env2 {
+    let ws_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg1 = dir.join("a1.toml");
+    let cfg2 = dir.join("a2.toml");
+    tokio::fs::write(&cfg1, "hostname = \"agent1\"\ntoken = \"s3cret\"\n").await.unwrap();
+    tokio::fs::write(&cfg2, "hostname = \"agent2\"\ntoken = \"s3cret\"\n").await.unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    tokio::fs::write(&desired_path, desired_toml).await.unwrap();
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mut srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let _ = &mut srv;
+    let mk_agent = |cfg: &std::path::PathBuf| {
+        tokio::process::Command::new(&bin)
+            .stdout(e2e_stdio())
+            .stderr(e2e_stdio())
+            .args([
+                "agent",
+                "--server",
+                &format!("ws://127.0.0.1:{ws_port}/ws"),
+                "--config",
+                cfg.to_str().unwrap(),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let ag1 = mk_agent(&cfg1);
+    let ag2 = mk_agent(&cfg2);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    Env2 {
+        http_port: ws_port,
+        web_base: format!("http://127.0.0.1:{ws_port}"),
+        _srv: srv,
+        _ag1: ag1,
+        _ag2: ag2,
+    }
+}
+
+async fn link_echo_ok(port: u16, payload: &[u8]) -> bool {
+    let mut s = match tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if s.write_all(payload).await.is_err() {
+        return false;
+    }
+    let mut b = vec![0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await {
+        Ok(Ok(n)) => &b[..n] == payload,
+        _ => false,
+    }
+}
+
+/// link e2e 回归：旧代码无 Open{link} 分支/入口监听时，此测试挂（连上无回声）。
+/// 断言抓：client → agent2 监听 → server → agent1 → echo 回声；
+/// 且 /api/conns 有 tunnel==dblink 的行，client 关后行消失（Drop-guard）。
+#[tokio::test]
+async fn link_tcp_roundtrip() {
+    // 后端 echo（agent1 可达）
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = echo.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.into_split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"dblink\"\ntype=\"link\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"agent1\"\nlink_host=\"127.0.0.1\"\nlink_port={echo_port}\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    // 轮询等入口监听就绪（40×200ms 上限，不赌固定 sleep）
+    let mut ok = false;
+    for _ in 0..40 {
+        if link_echo_ok(link_port, b"hello-link").await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "link roundtrip never came up");
+    // conns 有行
+    let c = reqwest::Client::new();
+    let jwt = login(&env.web_base).await;
+    // 保持一条连接打开时查 conns（回声测完即关，看不到行；这里重开一条不关）
+    let mut holder = tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}"))
+        .await
+        .unwrap();
+    holder.write_all(b"ping").await.unwrap();
+    let mut shown = false;
+    for _ in 0..40 {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/conns", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if arr.iter().any(|x| x["tunnel"] == "dblink" && x["proto"] == "link") {
+            shown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(shown, "conns should show the link stream");
+    drop(holder);
+    // 关后行消失（Drop-guard，无僵尸行）
+    let mut gone = false;
+    for _ in 0..40 {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/conns", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if !arr.iter().any(|x| x["tunnel"] == "dblink") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(gone, "link conns row leaked after close");
+    let _ = env.http_port;
+}
+
+/// link 对端不在线：client 被干净 Close（读 EOF），入口 agent 主链不断。
+#[tokio::test]
+async fn link_agent_offline_closes() {
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"ghost\"\ntype=\"link\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"no-such-agent\"\nlink_host=\"127.0.0.1\"\nlink_port=9999\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    // 等监听就绪
+    let mut up = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}")).await.is_ok() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "link listen never came up");
+    // 发点数据触发 server 查表失败 → Close；读到 EOF 即干净关闭
+    let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}"))
+        .await
+        .unwrap();
+    let _ = s.write_all(b"hi").await;
+    let mut b = vec![0u8; 16];
+    let mut eof = false;
+    for _ in 0..40 {
+        match tokio::time::timeout(Duration::from_millis(200), s.read(&mut b)).await {
+            Ok(Ok(0)) => {
+                eof = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            _ => {}
+        }
+    }
+    assert!(eof, "client should see EOF when exit agent offline");
+    // 主链不断：overview 仍有 agent2
+    let c = reqwest::Client::new();
+    let jwt = login(&env.web_base).await;
+    let o: serde_json::Value = c
+        .get(format!("{}/api/overview", env.web_base))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "agent2"));
+}
+
+/// link 热更新：删 desired 条目后监听端口释放（连接被拒）。
+#[tokio::test]
+async fn link_hot_update() {
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = echo.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.into_split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"tmp\"\ntype=\"link\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"agent1\"\nlink_host=\"127.0.0.1\"\nlink_port={echo_port}\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    let mut ok = false;
+    for _ in 0..40 {
+        if link_echo_ok(link_port, b"hot").await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "link never came up before update");
+    // 置空 agent2 的 desired（经 WebUI API）
+    let c = reqwest::Client::new();
+    let jwt = login(&env.web_base).await;
+    let r = c
+        .post(format!("{}/api/desired/agent2", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"proxies": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 监听释放：轮询到连接被拒（40×200ms）
+    let mut released = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}")).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(released, "link listen not released after hot update");
+}

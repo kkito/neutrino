@@ -78,6 +78,7 @@ pub(crate) async fn api_tunnels(
                 "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
                 "name": p.name, "enabled": p.enabled,
                 "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
+                "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
                 "target": format!("{}:{}", p.local_ip, p.local_port),
                 "status": if p.enabled { "online" } else { "disabled" },
             }));
@@ -516,6 +517,10 @@ mod tests {
         assert!(html.contains("均速"), "traffic labels must show avg rate");
         // 总览 rx/tx 用 human() 格式化（与流量 tab 一致，不再裸字节）
         assert!(html.contains("human(a.rx_bytes)"), "overview rx/tx must be humanized");
+        // link 表单：对端下拉 + 目标字段 + 自环拦截（同表 A 方案）
+        assert!(html.contains("f-link-agent"), "missing link peer select");
+        assert!(html.contains("link_agent"), "missing link fields");
+        assert!(html.contains("不能是自己"), "missing link self-loop guard");
         // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
         assert!(html.contains("id=\"ver\""), "missing sidebar version span");
         assert!(html.contains("o.version"), "missing version render");
@@ -562,6 +567,9 @@ mod tests {
             set_x_forwarded_proto: None,
             basic_auth: None,
             enabled: true,
+            link_agent: String::new(),
+            link_host: String::new(),
+            link_port: 0,
         };
         assert!(validate_proxy(&ok_http).is_ok());
         let mut bad = ok_http.clone();

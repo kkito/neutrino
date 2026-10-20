@@ -9,6 +9,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub(crate) struct Ctx {
     pub(crate) proxies: RwLock<Vec<ProxyConfig>>,
+    pub(crate) link_tasks: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
     pub(crate) streams: RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
     /// Binary arrived before Open task inserted the channel (server sends
     /// Open+head back-to-back; spawn ordering isn't guaranteed).
@@ -37,10 +38,20 @@ pub(crate) async fn session(
     *egress_out.write().await = Some(out_tx.clone());
     let ctx = Arc::new(Ctx {
         proxies: RwLock::new(cfg.proxies.clone()),
+        link_tasks: tokio::sync::Mutex::new(HashMap::new()),
         streams: RwLock::new(HashMap::new()),
         pending: RwLock::new(HashMap::new()),
         out: out_tx.clone(),
     });
+    // link 入口监听与 session 同命：Config 热更新时 sync，session 结束 abort 全部。
+    super::link::sync_link_listeners(
+        &ctx,
+        &cfg.proxies,
+        &up.hostname,
+        &egress_out,
+        &status,
+    )
+    .await;
     let send = |m: &ClientMsg| {
         out_tx
             .send(Message::Text(serde_json::to_string(m).unwrap().into()))
@@ -138,6 +149,14 @@ pub(crate) async fn session(
                 }
                 Ok(ServerMsg::Config { proxies }) => {
                     *ctx.proxies.write().await = proxies.clone();
+                    super::link::sync_link_listeners(
+                        &ctx,
+                        &proxies,
+                        &up.hostname,
+                        &egress_out,
+                        &status,
+                    )
+                    .await;
                     {
                         let mut st = status.write().await;
                         st.proxies = proxies.clone();
@@ -193,6 +212,50 @@ async fn open_stream(
 ) -> anyhow::Result<()> {
     if kind == "udp" {
         return open_udp_stream(ctx, sid, port).await;
+    }
+    if kind == "link" {
+        // link 出口：server 下发的 host/port 即真实目标（以 server 存为准），
+        // 直接 dial，不查本地 proxies。泵与 tcp 同（EOF 即收尾）。
+        let local = TcpStream::connect((host.as_str(), port)).await?;
+        let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
+        for chunk in early {
+            let _ = dtx.send(chunk);
+        }
+        ctx.streams.write().await.insert(sid, dtx);
+        let (mut lr, mut lw) = local.into_split();
+        let ctx3 = ctx.clone();
+        let ctx2 = ctx.clone();
+        let mut ws_to_local = tokio::spawn(async move {
+            while let Some(chunk) = drx.recv().await {
+                if lw.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut local_to_ws = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut b = vec![0u8; 32 * 1024];
+            loop {
+                match lr.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if ctx3.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        // 任一方向结束即拆：否则对端关后泵永等→不回 Close→server conns 僵尸行。
+        tokio::select! {
+            _ = &mut ws_to_local => { local_to_ws.abort(); }
+            _ = &mut local_to_ws => { ws_to_local.abort(); }
+        }
+        ctx.streams.write().await.remove(&sid);
+        let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
+        let _ = ctx2.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+        return Ok(());
     }
     // route to local target
     let proxies = ctx.proxies.read().await.clone();

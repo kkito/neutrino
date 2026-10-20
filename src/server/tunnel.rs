@@ -149,6 +149,10 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                             Ok(ClientMsg::Open { stream, kind, host, port }) if kind == "egress" => {
                                 spawn_egress_dial(&s, &agent_id, stream, host, port, ctl_tx.clone());
                             }
+                            Ok(ClientMsg::Open { stream, kind, host, .. }) if kind == "link" => {
+                                // host=link名（port 忽略）；目标以 server 存的 desired 为准。
+                                spawn_link_relay(&s, &agent_id, &hostname, stream, host, ctl_tx.clone());
+                            }
                             Ok(_) => {}
                             Err(e) => tracing::warn!("bad client frame: {e}"),
                         }
@@ -219,6 +223,169 @@ pub(crate) fn needs_config_push(reported: &[ProxyConfig], want: &[ProxyConfig]) 
 /// egress 目标校验（纯函数，单测覆盖）：空 host / 0 端口拒绝。
 fn valid_egress_target(host: &str, port: u16) -> bool {
     !host.trim().is_empty() && port != 0
+}
+
+/// link 查表（纯函数）：按 link 名找启用的 link 条目，返回 (对端hostname, host, port)。
+/// 目标以 server 存的 desired 为准——入口 agent 传什么都不信，防伪造扫对端内网。
+pub(crate) fn resolve_link(
+    proxies: &[ProxyConfig],
+    link_name: &str,
+) -> Option<(String, String, u16)> {
+    proxies
+        .iter()
+        .find(|p| p.enabled && p.ptype == "link" && p.name == link_name)
+        .map(|p| (p.link_agent.clone(), p.link_host.clone(), p.link_port))
+}
+
+/// server 侧 link 中转：入口 agent Open{link, host=link名} → 查表 → 出口 agent
+/// Open{link, host/port=真实目标} → 双 channel 对接泵。任一方向结束即双关+清
+/// conns 行（Drop-guard 语义，防 HttpConnGuard 修过的同类僵尸行）。
+/// 根因→修法：link 双端都是 WSS 流（无本地 socket），泵两端都经 incoming/outbox。
+fn spawn_link_relay(
+    s: &S,
+    entry_agent_id: &str,
+    entry_hostname: &str,
+    sid_entry: u32,
+    link_name: String,
+    ctl_entry: mpsc::UnboundedSender<ServerMsg>,
+) {
+    let s = s.clone();
+    let (entry_aid, entry_host) = (entry_agent_id.to_string(), entry_hostname.to_string());
+    tokio::spawn(async move {
+        // 1. 查表（server 存为准）
+        let (exit_host, tgt_host, tgt_port) = {
+            let ag = s.agents.read().await;
+            let proxies = ag.get(&entry_aid).map(|h| h.info.proxies.clone()).unwrap_or_default();
+            match resolve_link(&proxies, &link_name) {
+                Some(t) if !t.0.is_empty() && !t.1.is_empty() && t.2 != 0 => t,
+                _ => {
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: no such link".into(),
+                    });
+                    return;
+                }
+            }
+        };
+        // 2. 找出口 agent（按 hostname）+ 出向通道
+        let (exit_aid, exit_ctl, exit_out) = {
+            let ag = s.agents.read().await;
+            let found = ag.iter().find(|(_, h)| h.info.hostname == exit_host);
+            match found {
+                Some((id, h)) => (id.clone(), h.ctl.clone(), s.outbox.read().await.get(id).cloned()),
+                None => {
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: exit agent offline".into(),
+                    });
+                    log_ev(&s, format!("link '{link_name}' exit '{exit_host}' offline"));
+                    return;
+                }
+            }
+        };
+        let Some(exit_out) = exit_out else {
+            let _ = ctl_entry.send(ServerMsg::Close {
+                stream: sid_entry,
+                reason: "link denied: exit gone".into(),
+            });
+            return;
+        };
+        // 出口 sid：server 偶数号（与 ingress next_sid 同源，避开 agent 奇数 sid）
+        let sid_exit = super::ingress::next_sid_pub();
+        // 3. 双端占位 incoming（防 Open 后背靠背 Binary 早到丢包，同 egress 注释）
+        let (dtx_exit, mut drx_exit) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (dtx_entry, mut drx_entry) = mpsc::unbounded_channel::<Vec<u8>>();
+        if let Ok(ag) = s.agents.try_read() {
+            if let Some(h) = ag.get(&exit_aid) {
+                if let Ok(mut inc) = h.incoming.try_write() {
+                    inc.insert(sid_exit, dtx_exit);
+                }
+            }
+            if let Some(h) = ag.get(&entry_aid) {
+                if let Ok(mut inc) = h.incoming.try_write() {
+                    inc.insert(sid_entry, dtx_entry);
+                }
+            }
+        }
+        // 4. 向出口发 Open{link}（真实目标，出口直接 dial）
+        if exit_ctl
+            .send(ServerMsg::Open {
+                stream: sid_exit,
+                kind: "link".into(),
+                host: tgt_host.clone(),
+                port: tgt_port,
+            })
+            .is_err()
+        {
+            let _ = ctl_entry.send(ServerMsg::Close {
+                stream: sid_entry,
+                reason: "link denied: exit send failed".into(),
+            });
+            return;
+        }
+        // 5. conns 记账（peer=入口 agent，target=最终目标）
+        let cid = (sid_entry as u64) | ((sid_exit as u64) << 32);
+        s.conns.write().await.insert(
+            cid,
+            super::state::ConnInfo {
+                id: cid,
+                proto: "link".into(),
+                peer: entry_host.clone(),
+                public_port: 0,
+                agent: entry_host.clone(),
+                tunnel: link_name.clone(),
+                remote_port: 0,
+                target: format!("{exit_host}->{tgt_host}:{tgt_port}"),
+                since: chrono::Utc::now().timestamp(),
+                rx: 0,
+                tx: 0,
+            },
+        );
+        // 6. 双向泵
+        let entry_out = s.outbox.read().await.get(&entry_aid).cloned();
+        let Some(entry_out) = entry_out else {
+            s.conns.write().await.remove(&cid);
+            return;
+        };
+        let mut a2e = tokio::spawn(async move {
+            while let Some(chunk) = drx_entry.recv().await {
+                if exit_out.send((sid_exit, chunk)).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut e2a = tokio::spawn(async move {
+            while let Some(chunk) = drx_exit.recv().await {
+                if entry_out.send((sid_entry, chunk)).is_err() {
+                    break;
+                }
+            }
+        });
+        // 7. 任一方向结束即 abort 对端（否则单边 EOF 时 join! 永等→conns 僵尸行）
+        tokio::select! {
+            _ = &mut a2e => { a2e.abort(); e2a.abort(); }
+            _ = &mut e2a => { a2e.abort(); e2a.abort(); }
+        }
+        // 任一方向结束即双关+清行
+        s.conns.write().await.remove(&cid);
+        if let Some(h) = s.agents.read().await.get(&entry_aid) {
+            h.incoming.write().await.remove(&sid_entry);
+        }
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            h.incoming.write().await.remove(&sid_exit);
+        }
+        let _ = ctl_entry.send(ServerMsg::Close {
+            stream: sid_entry,
+            reason: "eof".into(),
+        });
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            let _ = h.ctl.send(ServerMsg::Close {
+                stream: sid_exit,
+                reason: "eof".into(),
+            });
+        }
+        log_ev(&s, format!("link '{link_name}' closed"));
+    });
 }
 
 /// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
@@ -388,6 +555,47 @@ pub(crate) async fn on_register(s: &S, agent_id: &str, hostname: &str, reported:
 mod tests {
     use super::*;
     #[test]
+    fn resolve_link_uses_server_table() {
+        // server 存为准：入口传什么 host 都不信，只认 desired 表。
+        let p = ProxyConfig {
+            name: "dblink".into(),
+            ptype: "link".into(),
+            local_ip: "0.0.0.0".into(),
+            local_port: 13306,
+            link_agent: "agent1".into(),
+            link_host: "10.0.0.1".into(),
+            link_port: 3306,
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+            enabled: true,
+        };
+        assert_eq!(
+            super::resolve_link(&[p], "dblink"),
+            Some(("agent1".into(), "10.0.0.1".into(), 3306))
+        );
+        assert_eq!(super::resolve_link(&[], "dblink"), None);
+        // 禁用的 link 不命中
+        let mut dis = ProxyConfig {
+            name: "off".into(),
+            ptype: "link".into(),
+            local_ip: "0.0.0.0".into(),
+            local_port: 13307,
+            link_agent: "agent1".into(),
+            link_host: "10.0.0.1".into(),
+            link_port: 3306,
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+            enabled: false,
+        };
+        let _ = &mut dis;
+        assert_eq!(super::resolve_link(&[dis], "off"), None);
+    }
+
+    #[test]
     fn egress_target_rejects_empty_host() {
         assert!(!valid_egress_target("", 80));
         assert!(!valid_egress_target("   ", 80));
@@ -409,6 +617,9 @@ mod tests {
             set_x_forwarded_proto: None,
             basic_auth: None,
             enabled: true,
+            link_agent: String::new(),
+            link_host: String::new(),
+            link_port: 0,
         };
         // 已收敛：不再 push
         assert!(!needs_config_push(&[p.clone()], &[p.clone()]));

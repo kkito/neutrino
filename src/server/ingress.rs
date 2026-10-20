@@ -75,6 +75,11 @@ fn next_sid() -> u32 {
     ((STREAM_CTR.fetch_add(1, Ordering::Relaxed) as u32).wrapping_mul(2)).wrapping_add(2)
 }
 
+/// link 中转复用 server 偶数 sid（tunnel.rs 用）。与 next_sid 同源。
+pub(crate) fn next_sid_pub() -> u32 {
+    next_sid()
+}
+
 /// 单端口 fallback 路由判定：tunneled=true 表示该 Host 命中某 agent 隧道。
 /// - 命中隧道 -> 透传给 agent（无论路径）
 /// - 未命中 + 裸 IP/localhost/空 Host -> WebUI（方便直接打开 IP:端口看管理页）

@@ -27,7 +27,7 @@ pub enum ClientMsg {
     },
     Open {
         stream: u32,
-        kind: String, // "http" | "tcp" | "egress" (agent-initiated)
+        kind: String, // "http" | "tcp" | "egress" | "link" (agent-initiated)
         host: String,
         port: u16,
     },
@@ -56,7 +56,7 @@ pub enum ServerMsg {
 pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
-    pub ptype: String, // "http" | "tcp" | "udp"
+    pub ptype: String, // "http" | "tcp" | "udp" | "link"（跨 agent TCP 互联）
     pub local_ip: String,
     pub local_port: u16,
     #[serde(default)]
@@ -71,6 +71,30 @@ pub struct ProxyConfig {
     pub basic_auth: Option<String>,
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// link 对端 agent 主机名（入口 agent 配置里填出口 agent 的 hostname）。
+    #[serde(default)]
+    pub link_agent: String,
+    /// link 对端可达目标 ip（出口 agent 去 dial）。
+    #[serde(default)]
+    pub link_host: String,
+    /// link 对端可达目标 port。
+    #[serde(default)]
+    pub link_port: u16,
+}
+
+/// link 条目校验（纯函数）：对端/目标/监听缺一不可，且禁止自环。
+/// 根因→修法：link 配错（空对端/自环）要在配置层拦掉，别等建流时再炸。
+pub fn valid_link(p: &ProxyConfig, self_hostname: &str) -> bool {
+    if p.ptype != "link" || !p.enabled {
+        return false;
+    }
+    if p.link_agent.trim().is_empty() || p.link_agent == self_hostname {
+        return false;
+    }
+    if p.link_host.trim().is_empty() || p.link_port == 0 || p.local_port == 0 {
+        return false;
+    }
+    true
 }
 
 /// 校验 http 入口 Authorization: Basic 头。`expected` 为 `user:pass` 明文。
@@ -128,6 +152,28 @@ mod tests {
         assert!(s.contains("\"t\":\"hello\""));
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, ClientMsg::Hello { .. }));
+    }
+
+    #[test]
+    fn link_fields_default_and_validate() {
+        // 老 desired 无 link 字段：反序列化不炸，全空默认。
+        let p: ProxyConfig = serde_json::from_str(
+            r#"{"name":"l","type":"link","local_ip":"0.0.0.0","local_port":13306}"#,
+        )
+        .unwrap();
+        assert_eq!(p.link_agent, "");
+        assert!(!super::valid_link(&p, "agent2")); // 缺对端 -> 拒绝
+        let mut q = p.clone();
+        q.link_agent = "agent2".into(); // 自环 -> 拒绝
+        q.link_host = "10.0.0.1".into();
+        q.link_port = 3306;
+        assert!(!super::valid_link(&q, "agent2"));
+        q.link_agent = "agent1".into();
+        assert!(super::valid_link(&q, "agent2"));
+        // 非 link 类型直接拒绝
+        let mut r = q.clone();
+        r.ptype = "tcp".into();
+        assert!(!super::valid_link(&r, "agent2"));
     }
 
     #[test]

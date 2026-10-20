@@ -31,6 +31,8 @@ pub struct AgentStatus {
     pub egress_on: bool,
     #[serde(default)]
     pub egress_err: Option<String>,
+    #[serde(default)]
+    pub link_err: Option<String>,
 }
 
 #[derive(Clone)]
