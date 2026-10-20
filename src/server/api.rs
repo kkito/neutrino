@@ -546,6 +546,16 @@ mod tests {
         assert!(html.contains("/api/overview"), "boot probe missing");
     }
     #[test]
+    #[test]
+    fn webui_edit_uses_row_agent_not_hostsel() {
+        // 根因：隧道表是全 agent 列表，但 saveForm/delRow 用顶部 hostsel 当 target；
+        // 当 hostsel=macmini 时编辑 snail-kkito/trans-bt-tcp，会把该行写进 macmini
+        // 的 desired，凭空造出一条 macmini/trans-bt-tcp。断言抓：保存/删除必须用
+        // 行内 agent（editingAgent/行参），欲缓存不一致时重取该 agent 的 desired。
+        let html = include_str!("../../web/index.html");
+        assert!(html.contains("editingAgent"), "edit must track row agent");
+        assert!(html.contains("delRow('${x.agent}'"), "delete must carry row agent");
+    }
     fn webui_has_traffic_conns_tabs() {
         let html = include_str!("../../web/index.html");
         assert!(html.contains("sec-tr"), "missing traffic section");
