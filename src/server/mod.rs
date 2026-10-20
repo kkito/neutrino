@@ -72,7 +72,8 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                     let conns = s.conns.read().await;
                     let mut tr = s.traffic.write().await;
                     let mut lt = s.last_total.write().await;
-                    state::tick_from_conns(&mut tr, &mut lt, &conns);
+                    let mut seen = s.seen_tunnels.write().await;
+                    state::tick_from_conns(&mut tr, &mut lt, &mut seen, &conns);
                 }
                 let p = state::traffic_path(&data);
                 state::save_traffic(&s, &p).await;

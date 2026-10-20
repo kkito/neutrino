@@ -48,6 +48,9 @@ pub(crate) struct Shared {
     pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>,
     /// 上分钟累计快照：key 同 traffic，用于算增量
     pub(crate) last_total: RwLock<HashMap<String, (u64, u64)>>,
+    /// 已见 tunnel：随 traffic.json 落盘，重启后读回，已知 key 首轮只建基线不 push
+    ///（不断崖、不吞量）。key 同 traffic。
+    pub(crate) seen_tunnels: RwLock<std::collections::HashSet<String>>,
     /// 当前连接快照：key = conn id
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
     /// --listen 解析出的公网端口（HTTP fallback 连接行用）
@@ -227,28 +230,73 @@ pub(crate) fn traffic_path(data_dir: &str) -> String {
     format!("{data_dir}/traffic.json")
 }
 
+/// traffic.json 落盘格式：{points: {key: [[rx,tx],...]}, seen: [key,...]}。
+/// 旧格式（裸 {key: [...]}）兼容读回：seen 为空，已经有点的 key 重启后首轮
+/// 只建基线不 push（不断崖）；全新 key 同样首轮建基线。
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct TrafficFile {
+    #[serde(default)]
+    points: HashMap<String, Vec<(u64, u64)>>,
+    #[serde(default)]
+    seen: Vec<String>,
+}
+
 /// 启动读回 traffic.json：无文件直接从空开始；坏 json 记一条日志、内存不动。
 pub(crate) async fn load_traffic(s: &S, path: &str) {
     let Ok(txt) = tokio::fs::read_to_string(path).await else {
         return;
     };
-    let Ok(m): Result<HashMap<String, Vec<(u64, u64)>>, _> = serde_json::from_str(&txt) else {
-        log_ev_err(s, "traffic load failed: bad json".into());
-        return;
+    // 新格式含 "points" 顶层键；旧格式是裸 {tunnel: [[..]]}。
+    // 根因→修法：TrafficFile 全字段 #[serde(default)]，旧文件也能“成功”解析成
+    // 空 points——先判键再解析，否则线上旧 traffic.json 重启即丢全部历史点。
+    let file: TrafficFile = match serde_json::from_str::<serde_json::Value>(&txt) {
+        Ok(v) if v.get("points").is_some() => match serde_json::from_value(v) {
+            Ok(f) => f,
+            Err(_) => {
+                log_ev_err(s, "traffic load failed: bad json".into());
+                return;
+            }
+        },
+        Ok(v) => match serde_json::from_value::<HashMap<String, Vec<(u64, u64)>>>(v) {
+            Ok(m) => TrafficFile { points: m, seen: vec![] },
+            Err(_) => {
+                log_ev_err(s, "traffic load failed: bad json".into());
+                return;
+            }
+        },
+        Err(_) => {
+            log_ev_err(s, "traffic load failed: bad json".into());
+            return;
+        }
     };
-    let mut t = s.traffic.write().await;
-    for (k, v) in m {
-        let mut q: VecDeque<(u64, u64)> = v.into_iter().collect();
-        trim_traffic(&mut q);
-        t.insert(k, q);
+    {
+        let mut t = s.traffic.write().await;
+        for (k, v) in file.points {
+            let mut q: VecDeque<(u64, u64)> = v.into_iter().collect();
+            trim_traffic(&mut q);
+            t.insert(k, q);
+        }
+    }
+    {
+        let mut seen = s.seen_tunnels.write().await;
+        // 有点的 key 天然已见（旧格式兼容）；seen 列表是显式补充
+        for k in s.traffic.read().await.keys() {
+            seen.insert(k.clone());
+        }
+        for k in file.seen {
+            seen.insert(k);
+        }
     }
 }
 
 pub(crate) async fn save_traffic(s: &S, path: &str) {
     let t = s.traffic.read().await;
-    let m: HashMap<&String, Vec<(u64, u64)>> =
-        t.iter().map(|(k, q)| (k, q.iter().cloned().collect())).collect();
-    if let Ok(txt) = serde_json::to_string(&m) {
+    let seen = s.seen_tunnels.read().await;
+    let file = TrafficFile {
+        points: t.iter().map(|(k, q)| (k.clone(), q.iter().cloned().collect())).collect(),
+        seen: seen.iter().cloned().collect(),
+    };
+    if let Ok(txt) = serde_json::to_string(&file) {
         let _ = tokio::fs::write(path, txt).await;
     }
 }
@@ -274,20 +322,34 @@ pub(crate) fn aggregate_conns(conns: &HashMap<u64, ConnInfo>) -> HashMap<String,
 
 /// tick 入口：conns 表行累计 -> per-tunnel 增量 push（聚合+增量一步到位）。
 /// 调用方（60s tick）每轮调一次即可；e2e/单测锁死该入口，防旧 fanout 回归。
+/// 重启连续性：重启后 conns 表清空、累计从 0 重建——旧逻辑以首轮值建基线后
+/// push (0,0)，重启那分钟的流量直接吞掉。`seen` 标记区分“从未见过”与
+/// “重启后首次见”：后者不 push，只建基线（不断崖、不吞量、不造假点）。
 pub(crate) fn tick_from_conns(
     traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
     last: &mut HashMap<String, (u64, u64)>,
+    seen: &mut std::collections::HashSet<String>,
     conns: &HashMap<u64, ConnInfo>,
 ) {
-    tick_traffic(traffic, last, &aggregate_conns(conns));
+    tick_traffic(traffic, last, seen, &aggregate_conns(conns));
 }
 
 pub(crate) fn tick_traffic(
     traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
     last: &mut HashMap<String, (u64, u64)>,
+    seen: &mut std::collections::HashSet<String>,
     currents: &HashMap<String, (u64, u64)>,
 ) {
     for (k, cur) in currents {
+        // 基线缺失即只建基线不 push，两种情况：
+        // 1. 全新 key（seen 无）；2. 重启后（seen 落盘读回但 last_total 是纯内存、已丢）。
+        // 根因→修法：旧代码 unwrap_or(*cur) 在情况 2 下 push (0,0) 假点，图表重启处断崖。
+        if !seen.contains(k.as_str()) || !last.contains_key(k.as_str()) {
+            seen.insert(k.clone());
+            last.insert(k.clone(), *cur);
+            traffic.entry(k.clone()).or_default();
+            continue;
+        }
         let prev = last.get(k).cloned().unwrap_or(*cur);
         tick_one(traffic.entry(k.clone()).or_default(), prev, *cur);
         last.insert(k.clone(), *cur);
@@ -326,6 +388,8 @@ pub(crate) async fn save_state(s: &S) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    fn seen_for_test() -> std::collections::HashSet<String> { Default::default() }
+    fn seen_with(keys: &[&str]) -> std::collections::HashSet<String> { keys.iter().map(|k| k.to_string()).collect() }
     #[test]
     fn state_serde_compat() {
         let p: Persisted = serde_json::from_str(r#"{"totals":{"h":[1,2]}}"#).unwrap();
@@ -390,12 +454,14 @@ mod tests {
         m.insert(2, row(2, "trans-bt-tcp", 500, 500));
         let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
-        // 首轮建基线：last 为空时以当前值为基线，增量 0
-        super::tick_from_conns(&mut traffic, &mut last, &m);
-        assert_eq!(*traffic["snail-kkito/trans-bt-tcp"].back().unwrap(), (0, 0));
+        let mut seen = seen_for_test();
+        // 首轮建基线：只记 last，不 push 假点（根因→修法：旧代码 push (0,0)，
+        // 重启后图表多个 0 点断崖；新语义首轮序列为空）
+        super::tick_from_conns(&mut traffic, &mut last, &mut seen, &m);
+        assert!(traffic["snail-kkito/trans-bt-tcp"].is_empty());
         m.get_mut(&1).unwrap().rx += 100;
         m.get_mut(&1).unwrap().tx += 200;
-        super::tick_from_conns(&mut traffic, &mut last, &m);
+        super::tick_from_conns(&mut traffic, &mut last, &mut seen, &m);
         assert_eq!(*traffic["snail-kkito/trans-bt-tcp"].back().unwrap(), (100, 200));
         // 其他 6 条隧道一行都没有
         assert_eq!(traffic.len(), 1);
@@ -438,8 +504,29 @@ mod tests {
         last.insert("h/idle".into(), (100, 100));
         // idle 无增量且本轮 conns 无此 tunnel：跳过，不 push
         let currents: HashMap<String, (u64, u64)> = HashMap::new();
-        super::tick_traffic(&mut traffic, &mut last, &currents);
+        let mut seen = seen_with(&["h/idle"]);
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
         assert_eq!(traffic["h/idle"].len(), 1);
+    }
+    #[test]
+    fn tick_first_seen_builds_baseline_without_fake_point() {
+        // 回归：重启后 conns 累计从 0 重建，已见 key 首轮只建基线不 push。
+        // 旧代码首轮 push (0,0) 假点，图表重启处多个 0 断崖；新语义序列保持为空，
+        // 次轮才 push 真增量。
+        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut last: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut seen = seen_with(&["h/w"]);
+        let currents: HashMap<String, (u64, u64)> = [("h/w".into(), (5000, 9000))].into();
+        // 模拟重启：last 丢了但 seen 还在（随 traffic.json 读回）
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
+        assert!(traffic["h/w"].is_empty(), "首轮不应 push 假点");
+        // 全新 key：同样只建基线
+        let mut traffic2: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut last2: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut seen2 = seen_for_test();
+        super::tick_traffic(&mut traffic2, &mut last2, &mut seen2, &currents);
+        assert!(traffic2["h/w"].is_empty());
+        assert!(seen2.contains("h/w"));
     }
     #[test]
     fn tick_records_per_tunnel_delta_without_fanout() {
@@ -450,9 +537,10 @@ mod tests {
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
         last.insert("h/A".into(), (100, 200));
         last.insert("h/B".into(), (100, 200));
+        let mut seen = seen_with(&["h/A", "h/B"]);
         let currents: HashMap<String, (u64, u64)> =
             [("h/A".into(), (150, 260)), ("h/B".into(), (100, 200))].into();
-        super::tick_traffic(&mut traffic, &mut last, &currents);
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
         // A 只记自己的 50/60；B 无流量记 0（旧代码会给 B 也记 50/60）
         assert_eq!(*traffic["h/A"].back().unwrap(), (50, 60));
         assert_eq!(*traffic["h/B"].back().unwrap(), (0, 0));
@@ -504,10 +592,19 @@ mod tests {
         let s2: S = Arc::new(Shared::default());
         super::load_traffic(&s2, &p).await;
         assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
+        // seen 随落盘：读回后已知 key 在内存
+        assert!(s2.seen_tunnels.read().await.contains("h/web"));
+        // 旧格式兼容：裸 {key: [[..]]} 必须读回点（根因→修法：TrafficFile 全 default
+        // 会把旧文件“成功”解析成空 points，线上 traffic.json 重启即丢全部历史）
+        tokio::fs::write(&p, br#"{"h/old":[[5,6],[7,8]]}"#).await.unwrap();
+        let s3: S = Arc::new(Shared::default());
+        super::load_traffic(&s3, &p).await;
+        assert_eq!(s3.traffic.read().await["h/old"].len(), 2);
+        assert!(s3.seen_tunnels.read().await.contains("h/old"));
         // 坏文件：不动内存、不 panic
         tokio::fs::write(&p, b"[[[broken").await.unwrap();
-        super::load_traffic(&s2, &p).await;
-        assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
+        super::load_traffic(&s3, &p).await;
+        assert_eq!(s3.traffic.read().await["h/old"].len(), 2);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
     #[test]
