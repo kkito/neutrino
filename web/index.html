@@ -120,6 +120,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <label id="l-ip">目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）</label><input id="f-ip" value="127.0.0.1">
 <label id="l-lport">目标端口（agent 本机视角）</label><input id="f-lport" type="number" placeholder="如 80">
 <label>入口 Basic 认证（可选，http 隧道：浏览器先弹框登录才放行；格式 user:pass，transmission 这类无登录页的最合适。留空=不校验）</label><input id="f-basic" placeholder="如 admin:一串随机口令" autocomplete="off">
+<label id="l-rate">下行限速（可选，仅 tcp/udp/link 总量：如 0.5m=0.5MB/s、500k；留空=不限速；口径与 transmission 显示一致）</label><input id="f-rate" placeholder="如 0.5m">
 <label><input type="checkbox" id="f-en" checked> 启用</label>
 <div class="row" style="margin-top:16px;justify-content:flex-end">
 <button class="btn ghost" onclick="closeForm()">取消</button>
@@ -155,7 +156,7 @@ async function refresh(){
     o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${human(a.rx_bytes)}/${human(a.tx_bytes)}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
   await loadDesired(false);
   const t=await need('/api/tunnels');
-  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
+  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>限速</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
     const isLink=x.type==='link';
     const where=isLink?'-':`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
     const tgt=isLink?`${x.link_agent||'?'}→${x.link_host||'?'}:${x.link_port||'?'}`:x.target;
@@ -164,7 +165,7 @@ async function refresh(){
     const btn=x.enabled?`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
     const ed=`<button class="btn ghost" onclick='editRow(${JSON.stringify(x).replace(/'/g,"&#39;")})'>编辑</button>`;
     const del=`<button class="btn ghost" onclick="delRow('${x.name}')">删除</button>`;
-    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${x.rate_limit||'-'}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=8>暂无</td></tr>';
   const l=await need('/api/logs');
   document.getElementById('logs').textContent=l.logs.join('\n');
   if(!document.getElementById('sec-tr').classList.contains('hidden')) loadTraffic();
@@ -258,6 +259,8 @@ function typeFields(){
   document.getElementById('f-port').classList.toggle('hidden',isHttp||isLink);
   for(const id of ['l-link-agent','f-link-agent','l-link-tgt','f-link-tgt'])
     document.getElementById(id).classList.toggle('hidden',!isLink);
+  document.getElementById('l-rate').classList.toggle('hidden',isHttp);
+  document.getElementById('f-rate').classList.toggle('hidden',isHttp);
   document.getElementById('l-ip').textContent=isLink?'本监听地址（入口 agent 上起监听：0.0.0.0=入口内网可达，127.0.0.1=仅本机）':'目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）';
   document.getElementById('l-lport').textContent=isLink?'本监听端口':'目标端口（agent 本机视角）';
   if(isLink){
@@ -272,7 +275,7 @@ function typeFields(){
   }
 }
 function openForm(){ editing=null; document.getElementById('formtitle').textContent='新增隧道';
-  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic','f-link-ip','f-link-port']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic','f-rate','f-link-ip','f-link-port']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
   document.getElementById('f-link-agent').innerHTML='';
   document.getElementById('f-en').checked=true; typeFields();
   document.getElementById('formwrap').classList.remove('hidden'); }
@@ -286,6 +289,7 @@ function editRow(x){ editing=x.name;
   document.getElementById('f-basic').value=x.basic_auth||'';
   document.getElementById('f-link-ip').value=x.link_host||'';
   document.getElementById('f-link-port').value=x.link_port||'';
+  document.getElementById('f-rate').value=x.rate_limit||'';
   const tgt=(x.target||'').split(':'); document.getElementById('f-ip').value=tgt[0]||'127.0.0.1';
   document.getElementById('f-lport').value=tgt[1]||'';
   if((x.type||'')==='link'){ const sel=document.getElementById('f-link-agent'); sel.innerHTML=`<option>${x.link_agent||''}</option>`; sel.value=x.link_agent||''; }
@@ -304,6 +308,7 @@ function curProxy(){
   if(t==='link'){ p.link_agent=document.getElementById('f-link-agent').value.trim();
     p.link_host=document.getElementById('f-link-ip').value.trim();
     p.link_port=parseInt(document.getElementById('f-link-port').value||'0'); }
+  if(t!=='http'){ const rl=document.getElementById('f-rate').value.trim(); if(rl) p.rate_limit=rl; }
   return p;
 }
 async function saveForm(){

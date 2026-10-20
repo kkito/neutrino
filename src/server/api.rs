@@ -79,6 +79,7 @@ pub(crate) async fn api_tunnels(
                 "name": p.name, "enabled": p.enabled,
                 "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
                 "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
+                "rate_limit": p.rate_limit,
                 "target": format!("{}:{}", p.local_ip, p.local_port),
                 "status": if p.enabled { "online" } else { "disabled" },
             }));
@@ -294,6 +295,15 @@ fn validate_proxy(p: &ProxyConfig) -> Result<(), String> {
         "tcp" | "https" | "udp" => {
             if p.remote_port == 0 {
                 return Err(format!("{} proxy requires remote_port", p.ptype));
+            }
+            Ok(())
+        }
+        // link 复用 local_port 做入口监听端口（remote_port 不用，恒 0）；
+        // 对端/目标合法性由 agent 侧 valid_link + server resolve_link 兜底，此处只拦空名/零监听。
+        // rate_limit 故意不校验：非法在运行时 limit_of warn-忽略，不断言拒绝。
+        "link" => {
+            if p.local_port == 0 {
+                return Err("link proxy requires local_port".into());
             }
             Ok(())
         }
@@ -521,6 +531,9 @@ mod tests {
         assert!(html.contains("f-link-agent"), "missing link peer select");
         assert!(html.contains("link_agent"), "missing link fields");
         assert!(html.contains("不能是自己"), "missing link self-loop guard");
+        // 限速表单：输入框 + 回填 + 透传（tcp/udp/link 总量下行，http 隐藏）
+        assert!(html.contains("f-rate"), "missing rate_limit input");
+        assert!(html.contains("rate_limit"), "missing rate_limit fields");
         // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
         assert!(html.contains("id=\"ver\""), "missing sidebar version span");
         assert!(html.contains("o.version"), "missing version render");
@@ -585,6 +598,14 @@ mod tests {
         let mut unk = tcp.clone();
         unk.ptype = "socks".into();
         assert!(validate_proxy(&unk).is_err());
+        // link 类型必须放行（旧 match 无 link 分支，WebUI 存 link 会 400）；
+        // rate_limit 非法不断言拒绝（运行时 warn-忽略，见 limit_of）。
+        let mut link_p = ok_http.clone();
+        link_p.ptype = "link".into();
+        assert!(validate_proxy(&link_p).is_ok());
+        let mut rl = ok_http.clone();
+        rl.rate_limit = Some("abc".into());
+        assert!(validate_proxy(&rl).is_ok());
     }
 
     #[test]
