@@ -76,7 +76,35 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                     fresh.insert(k.clone(), state::minute_delta(prev, *c));
                 }
                 *live = fresh;
-                *last = cur;
+                *last = cur.clone();
+                // agent 总量批量刷：包循环零 agents 写锁后，info.rx/tx 只在此 5s 刷一次
+                // （单次 write，读锁最多等一个临界区，不饥饿）。key=`host/proxy`，按首段 host 汇总。
+                {
+                    drop(live);
+                    drop(last);
+                    let mut per_host: HashMap<String, (u64, u64)> = HashMap::new();
+                    for (k, c) in &cur {
+                        if let Some(host) = k.split('/').next() {
+                            let e = per_host.entry(host.to_string()).or_insert((0, 0));
+                            e.0 += c.0;
+                            e.1 += c.1;
+                        }
+                    }
+                    // 增量 = 本轮累计 - 上轮基线（基线存 live_last_host；无基线则 0，不跳变）
+                    // 注：conns 行是累计值，agent 重连后行 id 变化会回绕，minute_delta 饱和为 0。
+                    let mut ag = s.agents.write().await;
+                    for h in ag.values_mut() {
+                        if let Some((crx, ctx)) = per_host.get(&h.info.hostname) {
+                            let prev = s.live_last_host.read().await.get(&h.info.hostname).cloned().unwrap_or((*crx, *ctx));
+                            let d = state::minute_delta(prev, (*crx, *ctx));
+                            h.info.rx_bytes += d.0;
+                            h.info.tx_bytes += d.1;
+                        }
+                    }
+                    drop(ag);
+                    let mut base = s.live_last_host.write().await;
+                    *base = per_host;
+                }
             }
         });
     }

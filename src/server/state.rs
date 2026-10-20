@@ -52,6 +52,10 @@ pub(crate) struct Shared {
     pub(crate) live: RwLock<HashMap<String, (u64, u64)>>,
     /// 5s tick 上轮累计：key 同 traffic，用于算 5s 增量（纯内存，重启丢了下轮重建基线）
     pub(crate) live_last: RwLock<HashMap<String, (u64, u64)>>,
+    /// agent 总量 5s 批量刷基线：hostname -> 上轮 per-host 累计（conns 行汇总）。
+    /// 根因→修法：包循环零 agents 写锁后，info.rx/tx 只在 live tick 里 5s 刷一次，
+    /// 基线存此表（与 live_last 的 per-tunnel 基线分开）。
+    pub(crate) live_last_host: RwLock<HashMap<String, (u64, u64)>>,
     /// 上分钟累计快照：key 同 traffic，用于算增量
     pub(crate) last_total: RwLock<HashMap<String, (u64, u64)>>,
     /// 已见 tunnel：随 traffic.json 落盘，重启后读回，已知 key 首轮只建基线不 push

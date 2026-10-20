@@ -208,11 +208,9 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                             if let Some((st, pe)) = waiter {
                                 if let Some(tx) = st.read().await.get(&id).cloned() {
                                     let _ = tx.send(payload.to_vec());
-                                    if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                                        h.info.rx_bytes += payload.len() as u64;
-                                    }
-                                    // 连接行不记：ingress 侧泵（TCP/UDP/HTTP 各入口）已按公网字节累计，
-                                    // 此处再记会 double count。
+                                    // agent 级 rx 不在此记（WSS 包级写锁是另一条饿死链；
+                                    // 连接行在 ingress 侧已累计，此处再记会 double count；
+                                    // 总量由 5s live tick 批量刷）。
                                 } else {
                                     // 早到（Open 未处理/占位未命中）：缓存，泵启动后 drain。
                                     let mut p = pe.write().await;
@@ -234,10 +232,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
             }
             Some((id, payload)) = out_rx.recv() => {
                 if ws_send.send(WsMsg::Binary(encode_data(id, &payload).into())).await.is_err() { break; }
-                if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                    h.info.tx_bytes += payload.len() as u64;
-                }
-                // 连接行不记：同上，ingress 侧已累计。
+                // agent 级 tx 不在此记（同上，包循环零 agents 写锁；连接行 ingress 侧已累计）。
             }
         }
     }

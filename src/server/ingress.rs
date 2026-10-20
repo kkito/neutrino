@@ -70,6 +70,32 @@ async fn pick_port(s: &S, port: u16, kind: &str) -> Option<String> {
 static STREAM_CTR: std::sync::LazyLock<AtomicUsize> =
     std::sync::LazyLock::new(|| AtomicUsize::new(0));
 
+/// UDP session 建时目标解析（纯函数，无锁、无 await）。
+/// 根因→修法：旧代码收包循环每包 agents.read() 全表扫描找 proxy + limiter_for 写锁，
+/// BT flood 高 pps 下锁排队，/api/tunnels+overview 的 agents.read() 饿死 6s+ pending。
+/// 新路径：session 建立时调一次（快照来自单次 agents.read），包循环只用缓存零锁。
+/// 返回 (hostname, traffic_key, proxy名, rate_bps)。
+pub(crate) fn resolve_udp_session(
+    snapshot: &[(&str, Vec<ProxyConfig>)],
+    port: u16,
+) -> Option<(String, String, String, Option<u64>)> {
+    snapshot
+        .iter()
+        .find_map(|(host, proxies)| {
+            proxies
+                .iter()
+                .find(|p| p.enabled && p.remote_port == port && p.ptype == "udp")
+                .map(|p| {
+                    (
+                        host.to_string(),
+                        crate::server::state::traffic_key(host, &p.name),
+                        p.name.clone(),
+                        crate::server::ratelimit::limit_of(p.rate_limit.as_deref()),
+                    )
+                })
+        })
+}
+
 fn next_sid() -> u32 {
     // even ids from server; wrap-safe
     ((STREAM_CTR.fetch_add(1, Ordering::Relaxed) as u32).wrapping_mul(2)).wrapping_add(2)
@@ -614,7 +640,10 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                                         tokio::time::sleep(d).await;
                                     }
                                 }
-                                // 连接行 rx 累计（公网->agent 字节）
+                                // 连接行 rx 累计（公网->agent 字节；tick/live 只读 conns。
+                                // 根因→修法：旧代码另有 agents.write() 做 agent 级 rx 记账，
+                                // 高 pps 下写锁饿死 /api/tunnels+overview 的读；agent 级总量
+                                // 由 30s persist 循环批量刷（见 mod.rs），包循环零 agents 锁。）
                                 if let Some(c) = s_rx.conns.write().await.get_mut(&(sid as u64)) {
                                     c.rx += n as u64;
                                 }
@@ -634,7 +663,7 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                                         tokio::time::sleep(d).await;
                                     }
                                 }
-                                // 连接行 tx 累计（agent->公网字节）
+                                // 连接行 tx 累计（agent->公网字节；同上，包循环零 agents 锁）
                                 if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
                                     c.tx += chunk.len() as u64;
                                 }
@@ -705,14 +734,18 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         }
         tracing::info!("udp ingress on 0.0.0.0:{port}");
         log_ev(&s2, format!("udp listening :{port}"));
-        // peer -> (stream_id, last_seen)
-        let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant)> = HashMap::new();
+        // peer -> (stream_id, last_seen, outbox sender 缓存, 下行 limiter 缓存)。
+        // 根因→修法：包循环零 agents 锁 + 零 rate_limiters 锁——outbox sender 与
+        // limiter 都在建 session 时缓存（单次 agents.read 快照 + limiter_for 一次），
+        // 每包只 take（Mutex 临界区极短）+ 发包，不再全表扫描/拿写锁。
+        use crate::server::ratelimit::RateLimiter;
+        let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>)> = HashMap::new();
         let mut buf = vec![0u8; 65535];
         loop {
             // expire old sessions（conns 表 UDP 行同步删）
-            sessions.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(120));
+            sessions.retain(|_, (_, t, _, _)| t.elapsed() < Duration::from_secs(120));
             {
-                let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _)| *id).collect();
+                let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _, _, _)| *id).collect();
                 s2.conns.write().await.retain(|_, c| c.proto != "udp" || live.contains(&(c.id as u32)));
             }
             let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -720,7 +753,7 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                 Err(_) => continue,
             };
             let sid = match sessions.get_mut(&peer) {
-                Some((id, t)) => {
+                Some((id, t, _, _)) => {
                     *t = Instant::now();
                     *id
                 }
@@ -748,21 +781,24 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                         port,
                     });
                     // agent->internet pump for this peer（回包方向同压：与收包共用映射级 limiter，双向总量）。
+                    // 快照一次：单次 agents.read 拿全表 proxies 快照，纯函数解析出目标，
+                    // 建 limiter + 缓存 outbox，后续每包零锁。
                     let sock2 = sock.clone();
                     let s3 = s2.clone();
-                    let aid3 = aid.clone();
-                    let up_limiter = {
+                    let (_sess_host, sess_key, _sess_pname, sess_bps) = {
                         let ag = s2.agents.read().await;
-                        let hit = ag.values().find_map(|h| {
-                            h.info.proxies.iter()
-                                .find(|p| p.enabled && p.remote_port == port && p.ptype == "udp")
-                                .map(|p| (crate::server::state::traffic_key(&h.info.hostname, &p.name), crate::server::ratelimit::limit_of(p.rate_limit.as_deref())))
-                        });
-                        match hit {
-                            Some((key, Some(b))) if !key.is_empty() => Some(crate::server::ratelimit::limiter_for(&s2, &key, b).await),
-                            _ => None,
+                        let snap: Vec<(&str, Vec<ProxyConfig>)> = ag.values().map(|h| (h.info.hostname.as_str(), h.info.proxies.clone())).collect();
+                        match resolve_udp_session(&snap, port) {
+                            Some(v) => v,
+                            None => continue,
                         }
                     };
+                    let out_cached = out.clone();
+                    let sess_limiter = match sess_bps {
+                        Some(b) => Some(crate::server::ratelimit::limiter_for(&s2, &sess_key, b).await),
+                        None => None,
+                    };
+                    let up_limiter = sess_limiter.clone();
                     tokio::spawn(async move {
                         while let Some(chunk) = drx.recv().await {
                             if let Some(l) = &up_limiter {
@@ -780,14 +816,11 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                                 }
                             }
                             let _ = sock2.send_to(&chunk, peer).await;
-                            if let Some(h) = s3.agents.write().await.get_mut(&aid3)
-                            {
-                                h.info.tx_bytes += chunk.len() as u64;
-                            }
+                            // agent 级 tx 不在此记（包循环零 agents 锁；conns 行 tx 已记，
+                            // 总量由 persist 循环批量刷）。
                         }
                     });
-                    let _ = out;
-                    sessions.insert(peer, (id, Instant::now()));
+                    sessions.insert(peer, (id, Instant::now(), out_cached, sess_limiter));
                     // UDP 连接行（peer 一行；since 每次收包刷新见下）
                     {
                         let ag = s2.agents.read().await;
@@ -820,22 +853,15 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
             };
             // internet -> agent (each datagram = one data frame)
             let payload = buf[..n].to_vec();
-            // udp 下行限速（收包方向）：按 port 查 proxy 快照，同映射共享 limiter；整包为一块。
-            // 根因→修法：udp 无连接概念、session per peer，窗口必须按映射共享（不能按 peer 建）。
-            // pick_port 式全表扫描已有同等开销在前（pick_port/owner 扫描），此处再查一次可接受。
+            // udp 下行限速（收包方向）：session 缓存的 limiter 直接 take，整包为一块。
+            // 根因→修法：旧代码每包 agents.read 全表扫描 + limiter_for 写锁，
+            // BT flood 下锁排队饿死 /api/tunnels+overview。新路径 session 建时缓存，
+            // 每包只 take（Mutex 临界区极短，零 agents/rate_limiters 锁）。
+            // 窗口按映射共享（sess 建时同 key 同 limiter，见 limiter_for 同 key 复用）。
             {
-                let (key, bps) = {
-                    let ag = s2.agents.read().await;
-                    ag.values()
-                        .find_map(|h| {
-                            h.info.proxies.iter()
-                                .find(|p| p.enabled && p.remote_port == port && p.ptype == "udp")
-                                .map(|p| (crate::server::state::traffic_key(&h.info.hostname, &p.name), crate::server::ratelimit::limit_of(p.rate_limit.as_deref())))
-                        })
-                        .unwrap_or_default()
-                };
-                if let (false, Some(b)) = (key.is_empty(), bps) {
-                    let d = crate::server::ratelimit::limiter_for(&s2, &key, b).await.take(payload.len()).await;
+                let lim = sessions.get(&peer).and_then(|(_, _, _, l)| l.clone());
+                if let Some(l) = lim {
+                    let d = l.take(payload.len()).await;
                     if !d.is_zero() {
                         tokio::time::sleep(d).await;
                     }
@@ -850,30 +876,22 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     c.since = chrono::Local::now().timestamp();
                 }
             }
-            // find owner agent of this stream
+            // 发给 session 建时缓存的 outbox sender（零 agents 锁）。
+            // 根因→修法：旧代码每包全表扫描 agents 找 owner + agents.write() 记 rx，
+            // BT flood 高 pps 下锁排队，/api/tunnels+overview 的 agents.read() 饿死 6s+。
+            // sessions 表建时已缓存 (sid -> outbox sender)，包循环只碰 sessions+conns。
+            // agent 级 rx 由 persist 循环批量刷（conns 行 rx 为准）。
             let owner: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>> = {
-                let ag = s2.agents.read().await;
-                let ob = s2.outbox.read().await;
-                // stream registry: scan agents' incoming for sid
-                let mut found = None;
-                for (aid, h) in ag.iter() {
-                    if h.incoming.read().await.contains_key(&sid) {
-                        found = ob.get(aid).cloned();
-                        break;
+                sessions.get(&peer).and_then(|(id, _, o, _)| {
+                    if *id == sid {
+                        Some(o.clone())
+                    } else {
+                        None
                     }
-                }
-                found
+                })
             };
             if let Some(o) = owner {
-                let _ = o.send((sid, payload.clone()));
-                // rx accounting
-                let mut agm = s2.agents.write().await;
-                for h in agm.values_mut() {
-                    if h.incoming.try_read().map(|m| m.contains_key(&sid)).unwrap_or(false) {
-                        h.info.rx_bytes += payload.len() as u64;
-                        break;
-                    }
-                }
+                let _ = o.send((sid, payload));
             }
         }
     });
@@ -884,6 +902,26 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// RED：UDP session 目标解析必须是纯函数（不碰 agents 锁）。
+    /// 根因→修法：旧收包循环每包 agents.read() 全表扫描找 proxy，
+    /// BT flood 高 pps 下读锁排队，/api/tunnels+overview 的 agents.read() 饿死
+    /// 6s+ pending（live/conns/traffic 不碰 agents 锁所以 1ms 正常）。
+    /// 修法：session 建立时缓存 (aid,outbox,proxy名,limiter)，包循环零锁。
+    #[test]
+    fn red_udp_session_resolve_is_pure() {
+        // 期望 API：给定 proxies 快照 + port，返回 (hostname, proxy名, rate bps)，
+        // 全程无 .await、无锁。先写断言，函数不存在即红。
+        let proxies = vec![crate::common::proto::ProxyConfig {
+            name: "u".into(), ptype: "udp".into(), local_ip: "127.0.0.1".into(),
+            local_port: 9999, link_agent: "".into(), link_host: "".into(), link_port: 0,
+            rate_limit: Some("1m".into()), domains: vec![], remote_port: 51413,
+            set_x_forwarded_proto: None, basic_auth: None, enabled: true,
+        }];
+        let r = super::resolve_udp_session(&[("h", proxies)], 51413);
+        assert_eq!(r, Some(("h".to_string(), "h/u".to_string(), "u".to_string(), Some(1048576u64))));
+        // 端口无映射 -> None（包直接丢，不建 session）
+        assert_eq!(super::resolve_udp_session(&[("h", vec![])], 51413), None);
+    }
     #[test]
     fn fallback_routes_tunnel_when_matched() {
         // 命中隧道：无论路径/Host 形式都透传（WebUI `/` 不抢）

@@ -1508,6 +1508,67 @@ async fn e2e_tcp_ratelimit_throttles_downlink() {
     let _ = (env_f, dt_l);
 }
 
+/// 回归：UDP flood 时 /api/tunnels 必须秒回——UDP 收包循环每包拿
+/// agents.write() 全表扫描（旧代码），BT uTP flood 下写锁常驻，
+/// tunnels 的 agents.read() 饿死 6s+（线上 /api/overview pending 根因；
+/// live/conns/traffic 不读 agents 锁所以都 1ms 正常）。
+/// 修法：session 建时缓存 aid+outbox sender，每包只碰 conns 行 + 本地累计，
+/// agent rx 按秒批量刷一次。
+#[tokio::test]
+async fn e2e_udp_flood_does_not_starve_tunnels_api() {
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, peer)) = back.recv_from(&mut b).await else { break };
+            let _ = back.send_to(&b[..n], peer).await; // 回包，保证双向都有量
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"1m\"\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // flood 3s：8 并发 UDP flood（多 peer 多 session，压出 BT uTP 量级 pps）。
+    // 每包 server 侧拿 agents.write() 做 rx/tx 记账（收包循环 + 回包泵各一次），
+    // 写锁常驻 -> /api/tunnels 的 agents.read() 饿死 pending（线上 6s+ 根因；
+    // live/conns/traffic 不碰 agents 锁所以都 1ms 正常）。
+    let mut floods = vec![];
+    for _ in 0..8 {
+        let rp = rport;
+        floods.push(tokio::spawn(async move {
+            let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            cli.connect(format!("127.0.0.1:{rp}")).await.unwrap();
+            let pkt = vec![0xEEu8; 1024];
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < Duration::from_secs(3) {
+                let _ = cli.send(&pkt).await;
+            }
+        }));
+    }
+    let flood = tokio::spawn(async move {
+        for f in floods {
+            let _ = f.await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await; // 让 flood 先起来
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let t0 = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        cli.get(format!("{}/api/tunnels", env.web_base)).bearer_auth(&jwt).send(),
+    )
+    .await
+    .expect("flood 下 /api/tunnels 3s 无响应：agents 锁被 UDP 包循环饿死");
+    assert!(r.unwrap().status().is_success());
+    eprintln!("[udp-starve] tunnels latency under flood: {:?}", t0.elapsed());
+    flood.await.unwrap();
+    let _ = env;
+}
+
 /// 回归：5s 实时快照——tcp 跑量后 /api/live 10s 内可见该 tunnel 且 rx_5s>0。
 /// 旧代码无 live tick、无 /api/live 路由，此 GET 直接 404 而红。
 #[tokio::test]
