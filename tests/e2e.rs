@@ -387,6 +387,8 @@ async fn e2e_http_conns_cleaned_on_client_abort() {
 
 /// 旧代码无 /api/traffic、/api/conns（404 即红）；断言抓：conns 行出现/消失、traffic 接口可用。
 /// 取舍：分钟 tick 在 e2e 等不起（60s），有点不断言，累计由 state 单测覆盖。
+/// tick 无 fanout 回归：tcp 建连跑量后，conns 行 tunnel=tc；traffic 按 tunnel 归集
+/// 只有 tc 有点“无量”，其他隧道无行（旧 tick 会给每个 proxy 各 push 一份）。
 #[tokio::test]
 async fn e2e_traffic_and_conns() {
     // echo backend
@@ -1357,4 +1359,80 @@ async fn link_hot_update() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(released, "link listen not released after hot update");
+}
+
+/// RED 现场：server 重启后 agent 无感知、tm hang 60s+。kill server 模拟重启，
+/// agent 必须 60s 内重拨（心跳超时 45s + backoff 1s，留余量到 100s 上限轮询）、
+/// 新 server 上线后 overview 再次出现该 agent。
+/// 旧代码裸 next() 永等：agent 进程不退出但永远不重连，此断言挂到超时。
+#[tokio::test]
+async fn e2e_server_restart_agent_redials() {
+    let env = boot("").await;
+    let c = reqwest::Client::new();
+    // agent 先在线（overview 有 e2e）
+    let jwt = login(&env.web_base).await;
+    let mut online = false;
+    for _ in 0..40 {
+        let o: serde_json::Value = c
+            .get(format!("{}/api/overview", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "e2e") {
+            online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(online, "agent never came online before kill");
+    // kill server = 模拟重启（agent 侧 TCP 半开：无 FIN、无 RST）
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mut env = env;
+    env._srv.kill().await.unwrap();
+    let _ = env._srv.wait().await;
+    // 新 server 同端口同 data/期望态起来（agent 应凭心跳超时自动重拨回来）
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{}", env.http_port),
+            "--data",
+            env.data_dir.to_str().unwrap(),
+            "--desired",
+            env.data_dir.join("../desired.toml").to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    env._srv = srv;
+    wait_for(&format!("127.0.0.1:{}", env.http_port)).await;
+    let jwt = login(&env.web_base).await;
+    // 心跳 45s + backoff，100s 上限轮询等 agent 回来
+    let mut back = false;
+    for _ in 0..500 {
+        let o: serde_json::Value = c
+            .get(format!("{}/api/overview", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "e2e") {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(back, "agent did not redial after server restart (heartbeat gap!)");
+    let _ = env;
 }

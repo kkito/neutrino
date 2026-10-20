@@ -57,6 +57,32 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
         return;
     }
     let agent_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // 单 flight：同 hostname 旧会话先踢掉，保证路由唯一。
+    // 根因→修法：旧代码允许多会话并存，两会话抢流、404/502 来回跳。
+    // 新 Hello 到达即抢路由：清旧 agent 行 + 路由表引用 + 关旧连接（ctl 发 Error 触发对端退出）。
+    {
+        let stale: Vec<String> = {
+            let ag = s.agents.read().await;
+            crate::server::state::stale_ids_for_hostname(
+                &ag.iter().map(|(id, h)| (id.clone(), h.info.hostname.clone())).collect(),
+                &hostname,
+            )
+        };
+        for old in stale {
+            if let Some(h) = s.agents.read().await.get(&old) {
+                let _ = h.ctl.send(ServerMsg::Error { reason: "superseded by new session".into() });
+            }
+            s.agents.write().await.remove(&old);
+            s.outbox.write().await.remove(&old);
+            for v in s.domains.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            for v in s.tcp_ports.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            log_ev(&s, format!("agent '{hostname}' superseded stale session {old}"));
+        }
+    }
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     let incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> =
@@ -96,8 +122,12 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     if ws_send.send(WsMsg::Text(w.into())).await.is_err() {
         return;
     }
-    // server-side heartbeat: Ping every 15s, track RTT on Pong
+    // server-side heartbeat: Ping every 15s, track RTT on Pong.
+    // 根因→修法：旧代码只发不验，半开连接的幽灵 agent 行永久占路由、
+    // 流量递过去 hang 死（这次 tm 现场）。任何帧都刷新 last_seen，
+    // 超 IDLE_KICK_SECS 无声即判定死亡、break 出主循环走统一 cleanup。
     let last_ping = Arc::new(RwLock::new(None::<Instant>));
+    let last_seen = Arc::new(RwLock::new(chrono::Utc::now().timestamp()));
     {
         let ctl = ctl_tx.clone();
         let lp = last_ping.clone();
@@ -121,9 +151,23 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
         });
     }
 
+    // 主循环：ws 帧 / ctl 下发 / outbox 回包三路 + 心跳看门狗。
+    // 根因→修法：旧代码裸 select! 永等，server 重启后 agent 侧半开感知不到、
+    // server 侧僵尸行也永久占路由（tm hang 60s+）。任何帧刷新 last_seen，
+    // deadline 到仍无声即 break 走统一 cleanup（清 agents/outbox/路由表）。
     loop {
+        let idle_for = chrono::Utc::now().timestamp() - *last_seen.read().await;
+        let remain = (crate::server::state::IDLE_KICK_SECS - idle_for).max(1) as u64;
         tokio::select! {
-            msg = ws_recv.next() => {
+            msg = tokio::time::timeout(Duration::from_secs(remain), ws_recv.next()) => {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => {
+                        log_ev(&s, format!("agent '{hostname}' heartbeat timeout, kicking stale session {agent_id}"));
+                        break;
+                    }
+                };
+                *last_seen.write().await = chrono::Utc::now().timestamp();
                 let Some(Ok(m)) = msg else { break };
                 match m {
                     WsMsg::Text(t) => {
@@ -147,6 +191,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                 }
                             }
                             Ok(ClientMsg::Open { stream, kind, host, port }) if kind == "egress" => {
+                                insert_egress_conn(&s, stream, &hostname, &host, port).await;
                                 spawn_egress_dial(&s, &agent_id, stream, host, port, ctl_tx.clone());
                             }
                             Ok(ClientMsg::Open { stream, kind, host, .. }) if kind == "link" => {
@@ -182,7 +227,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                     WsMsg::Close(_) => break,
                     _ => {}
                 }
-            }
+            } // end msg arm
             Some(m) = ctl_rx.recv() => {
                 let t = serde_json::to_string(&m).unwrap();
                 if ws_send.send(WsMsg::Text(t.into())).await.is_err() { break; }
@@ -365,8 +410,14 @@ fn spawn_link_relay(
             s.conns.write().await.remove(&cid);
             return;
         };
+        let s_link = s.clone();
+        let s_link2 = s.clone();
         let mut a2e = tokio::spawn(async move {
             while let Some(chunk) = drx_entry.recv().await {
+                // link 连接行 rx 累计（入口 client -> 出口目标，tick 归集用）
+                if let Some(c) = s_link.conns.write().await.get_mut(&cid) {
+                    c.rx += chunk.len() as u64;
+                }
                 if exit_out.send((sid_exit, chunk)).is_err() {
                     break;
                 }
@@ -374,6 +425,10 @@ fn spawn_link_relay(
         });
         let mut e2a = tokio::spawn(async move {
             while let Some(chunk) = drx_exit.recv().await {
+                // link 连接行 tx 累计（出口目标 -> 入口 client，tick 归集用）
+                if let Some(c) = s_link2.conns.write().await.get_mut(&cid) {
+                    c.tx += chunk.len() as u64;
+                }
                 if entry_out.send((sid_entry, chunk)).is_err() {
                     break;
                 }
@@ -414,6 +469,30 @@ fn spawn_link_relay(
 /// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
 /// 根因→修法：与 ingress 对称但方向相反——ingress 是 server 收连接让 agent 拨本地，
 /// egress 是 agent 发 Open 让 server 拨公网；泵结构复用 tcp ingress（incoming/outbox）。
+/// egress 建流记账：agent Open{egress} 到达即插 conns 行（tunnel 固定为 "egress"，
+/// peer=发起 agent，target=真实目标）。拨号失败/流结束处 remove。
+/// 根因→修法：旧代码 egress 全程只记 agent 级 rx/tx，tick 无法按 tunnel 归集；
+/// conns 行是 tick 唯一的 per-tunnel 流量来源，egress 必须建行。
+/// 返回 Ok 插行成功；agent 已掉线时返回 Err，调用方直接回 Close。
+pub(crate) async fn insert_egress_conn(s: &S, sid: u32, hostname: &str, host: &str, port: u16) {
+    s.conns.write().await.insert(
+        sid as u64,
+        super::state::ConnInfo {
+            id: sid as u64,
+            proto: "egress".into(),
+            peer: hostname.into(),
+            public_port: 0,
+            agent: hostname.into(),
+            tunnel: "egress".into(),
+            remote_port: 0,
+            target: format!("{host}:{port}"),
+            since: chrono::Local::now().timestamp(),
+            rx: 0,
+            tx: 0,
+        },
+    );
+}
+
 fn spawn_egress_dial(
     s: &S,
     agent_id: &str,
@@ -458,6 +537,7 @@ fn spawn_egress_dial(
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
                 }
+                s.conns.write().await.remove(&(sid as u64));
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: format!("dial refused: {e}"),
@@ -469,6 +549,7 @@ fn spawn_egress_dial(
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
                 }
+                s.conns.write().await.remove(&(sid as u64));
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: "dial timeout 30s".into(),
@@ -487,6 +568,7 @@ fn spawn_egress_dial(
                     if let Some(h) = s.agents.read().await.get(&aid) {
                         h.incoming.write().await.remove(&sid);
                     }
+                    s.conns.write().await.remove(&(sid as u64));
                     let _ = ctl.send(ServerMsg::Close {
                         stream: sid,
                         reason: "agent gone".into(),
@@ -515,12 +597,18 @@ fn spawn_egress_dial(
             }
         }
         let out2 = out.clone();
+        let s_rx = s.clone();
+        let s_tx = s.clone();
         let to_public = tokio::spawn(async move {
             let mut b = vec![0u8; 32 * 1024];
             loop {
                 let n = ru.read(&mut b).await?;
                 if n == 0 {
                     break;
+                }
+                // egress 连接行 rx 累计（公网->agent 字节，tick 归集用）
+                if let Some(c) = s_rx.conns.write().await.get_mut(&(sid as u64)) {
+                    c.rx += n as u64;
                 }
                 out2
                     .send((sid, b[..n].to_vec()))
@@ -530,6 +618,10 @@ fn spawn_egress_dial(
         });
         let from_agent = async {
             while let Some(chunk) = drx.recv().await {
+                // egress 连接行 tx 累计（agent->公网字节，tick 归集用）
+                if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
+                    c.tx += chunk.len() as u64;
+                }
                 wu.write_all(&chunk).await?;
             }
             anyhow::Ok::<()>(())
@@ -542,6 +634,8 @@ fn spawn_egress_dial(
             h.incoming.write().await.remove(&sid);
             h.pending.write().await.remove(&sid);
         }
+        // egress 流结束清 conns 行（tick 只读 conns 归集，行不消失则增量永远涨）
+        s.conns.write().await.remove(&(sid as u64));
         // eof 标记必须与回包数据走同一 outbox 通道（空包=EOF）：若经 ctl 发 Close{eof}，
         // 两通道在 ws_loop 被 select! 复用会乱序——Close 先到则 agent 误删 egress 表项，
         // 在途数据查不到表项进 pending 死缓冲，client 得空 BODY（见 egress e2e flaky 根因）。

@@ -1,5 +1,6 @@
 //! agent 会话：WSS 长连 + Register/Config + Binary 分发 + 建流。
 use crate::common::proto::*;
+use crate::server::state::IDLE_KICK_SECS;
 use super::{AgentFileConfig, Upstream};
 use super::stream::http_response_pump;
 use futures_util::{SinkExt, StreamExt};
@@ -112,8 +113,20 @@ pub(crate) async fn session(
         });
     }
 
-    // reader loop
-    while let Some(msg) = stream.next().await {
+    // reader loop：带心跳超时——timeout 内无任何 server 帧即判半开
+    // （server 重启/nginx 不掐下游时裸 next() 永 pend，外层重拨进不去）。
+    // 根因→修法：旧代码只发 Ping 不验 Pong，这次 tm hang 60s+ 無感知就卡死在这里。
+    loop {
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(IDLE_KICK_SECS as u64),
+            stream.next(),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(_) => anyhow::bail!("heartbeat timeout: no server frame for {IDLE_KICK_SECS}s"),
+        };
+        let Some(msg) = msg else { break };
         let msg = msg?;
         match msg {
             Message::Text(t) => match serde_json::from_str::<ServerMsg>(&t) {

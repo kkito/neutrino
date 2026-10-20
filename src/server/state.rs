@@ -74,6 +74,31 @@ pub(crate) struct ConnInfo {
     pub(crate) tx: u64,
 }
 
+/// 心跳空闲上限（双向共用）：server 每 15s 下发 Ping，agent 侧任何帧都算活；
+/// 超过此秒数无任何帧即判半开（server 重启/nginx 不掐下游时 reader 永 pend）。
+/// 现场：server 11:29 重启，agent 60s+ 无感知，tm hang。取 45s（3×Ping 周期）。
+pub(crate) const IDLE_KICK_SECS: i64 = 45;
+
+/// 纯判定：now-last_seen 超限即僵尸（单测覆盖心跳语义；真实看门狗在 tunnel.rs 主循环用 timeout 实现）。
+/// RED 现场：last=0, now=60 -> true；刚活跃 -> false。
+#[allow(dead_code)] // 看门狗逻辑在 tunnel.rs 用 timeout 内联实现，此函数只锁语义防回归
+pub(crate) fn is_idle_stale(last_seen_unix: i64, now_unix: i64) -> bool {
+    now_unix - last_seen_unix > IDLE_KICK_SECS
+}
+
+/// 同 hostname 旧会话 id（单 flight 踢人用）：新 Hello 到达即抢路由，旧行必须清，
+/// 否则两会话抢流、404/502 来回跳。纯函数单测覆盖。
+pub(crate) fn stale_ids_for_hostname(
+    agents: &HashMap<String, String>,
+    hostname: &str,
+) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|(_, h)| h.as_str() == hostname)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 pub(crate) fn traffic_key(hostname: &str, name: &str) -> String {
     format!("{hostname}/{name}")
 }
@@ -226,6 +251,47 @@ pub(crate) async fn save_traffic(s: &S, path: &str) {
     }
 }
 
+/// tick 一步：pure 版——输入 per-tunnel 当前累计，逐 key 算增量 push。
+/// 根因→修法：旧 tick 拿 agent 级累计给该 agent 下每个 proxy 各 push 一份，
+/// 多隧道流量翻 N 倍；调用方必须先按 tunnel 归集好 currents 再调此函数。
+///
+/// currents 只含本轮有连接活动的 tunnel（调用方以 conns 表为准过滤）；
+/// 空闲隧道不 push，保持旧点数（断流恢复时前端按缺失点补 0 画线）。
+/// pure 聚合：conns 表行 (rx,tx) 按 agent+tunnel 归集，返回每 tunnel 当前累计。
+/// tick 时用它生成 currents，空闲隧道自然缺席（不 push）。
+pub(crate) fn aggregate_conns(conns: &HashMap<u64, ConnInfo>) -> HashMap<String, (u64, u64)> {
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    for c in conns.values() {
+        let k = traffic_key(&c.agent, &c.tunnel);
+        let e = out.entry(k).or_insert((0, 0));
+        e.0 = e.0.saturating_add(c.rx);
+        e.1 = e.1.saturating_add(c.tx);
+    }
+    out
+}
+
+/// tick 入口：conns 表行累计 -> per-tunnel 增量 push（聚合+增量一步到位）。
+/// 调用方（60s tick）每轮调一次即可；e2e/单测锁死该入口，防旧 fanout 回归。
+pub(crate) fn tick_from_conns(
+    traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
+    last: &mut HashMap<String, (u64, u64)>,
+    conns: &HashMap<u64, ConnInfo>,
+) {
+    tick_traffic(traffic, last, &aggregate_conns(conns));
+}
+
+pub(crate) fn tick_traffic(
+    traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
+    last: &mut HashMap<String, (u64, u64)>,
+    currents: &HashMap<String, (u64, u64)>,
+) {
+    for (k, cur) in currents {
+        let prev = last.get(k).cloned().unwrap_or(*cur);
+        tick_one(traffic.entry(k.clone()).or_default(), prev, *cur);
+        last.insert(k.clone(), *cur);
+    }
+}
+
 /// tick 一步：算增量、push 队尾、裁剪。返回本分钟增量。
 pub(crate) fn tick_one(
     q: &mut VecDeque<(u64, u64)>,
@@ -300,6 +366,96 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
     #[test]
+    fn tick_from_conns_end_to_end_no_fanout() {
+        // tick 入口：conns 表 -> per-tunnel 增量，一步到位。
+        // snail 7 隧道只有 trans-bt-tcp 有 2 条连接跑量，其余 0：
+        // 有量只记一条，无量不 push（旧代码 7 条各记一份）。
+        let mut m: HashMap<u64, ConnInfo> = HashMap::new();
+        let row = |id, tunnel: &str, rx, tx| ConnInfo {
+            id,
+            proto: "tcp".into(),
+            peer: "1.2.3.4:5".into(),
+            public_port: 51413,
+            agent: "snail-kkito".into(),
+            tunnel: tunnel.into(),
+            remote_port: 51413,
+            target: "172.28.0.10:51413".into(),
+            since: 0,
+            rx,
+            tx,
+        };
+        m.insert(1, row(1, "trans-bt-tcp", 1000, 2000));
+        m.insert(2, row(2, "trans-bt-tcp", 500, 500));
+        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut last: HashMap<String, (u64, u64)> = HashMap::new();
+        // 首轮建基线：last 为空时以当前值为基线，增量 0
+        super::tick_from_conns(&mut traffic, &mut last, &m);
+        assert_eq!(*traffic["snail-kkito/trans-bt-tcp"].back().unwrap(), (0, 0));
+        m.get_mut(&1).unwrap().rx += 100;
+        m.get_mut(&1).unwrap().tx += 200;
+        super::tick_from_conns(&mut traffic, &mut last, &m);
+        assert_eq!(*traffic["snail-kkito/trans-bt-tcp"].back().unwrap(), (100, 200));
+        // 其他 6 条隧道一行都没有
+        assert_eq!(traffic.len(), 1);
+    }
+    #[test]
+    fn aggregate_conns_sums_per_tunnel() {
+        // conns 行按 agent+tunnel 归集：同 tunnel 多连接求和，不同 tunnel 分开。
+        // link 行 rx/tx 为 0（双 pump 未记连接行），归集后为 0 点，不污染。
+        let mut m: HashMap<u64, ConnInfo> = HashMap::new();
+        let row = |id, agent: &str, tunnel: &str, rx, tx| ConnInfo {
+            id,
+            proto: "tcp".into(),
+            peer: "1.2.3.4:5".into(),
+            public_port: 80,
+            agent: agent.into(),
+            tunnel: tunnel.into(),
+            remote_port: 80,
+            target: "127.0.0.1:80".into(),
+            since: 0,
+            rx,
+            tx,
+        };
+        m.insert(1, row(1, "h", "web", 10, 20));
+        m.insert(2, row(2, "h", "web", 5, 5));
+        m.insert(3, row(3, "h", "db", 7, 7));
+        m.insert(4, row(4, "h", "dblink", 0, 0)); // link 未记行
+        let out = super::aggregate_conns(&m);
+        assert_eq!(out["h/web"], (15, 25));
+        assert_eq!(out["h/db"], (7, 7));
+        assert_eq!(out["h/dblink"], (0, 0));
+    }
+    #[test]
+    fn tick_skips_idle_tunnels_and_zero_fills_on_return() {
+        // 空闲隧道（无流量、conns 表无该 tunnel 行）本轮不 push，保持旧点数；
+        // 断流后恢复时补 0 点对齐，避免 WebUI 折线断裂。
+        // 此单测定 tick 入口的过滤语义：只 push 有增量或有连接的行。
+        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        traffic.insert("h/idle".into(), [(1u64, 1u64)].into_iter().collect());
+        let mut last: HashMap<String, (u64, u64)> = HashMap::new();
+        last.insert("h/idle".into(), (100, 100));
+        // idle 无增量且本轮 conns 无此 tunnel：跳过，不 push
+        let currents: HashMap<String, (u64, u64)> = HashMap::new();
+        super::tick_traffic(&mut traffic, &mut last, &currents);
+        assert_eq!(traffic["h/idle"].len(), 1);
+    }
+    #[test]
+    fn tick_records_per_tunnel_delta_without_fanout() {
+        // 根因→修法：60s tick 曾拿 agent 级累计 (rx,tx) 给该 agent 下每个
+        // proxy 各 push 一份相同增量——snail 7 隧道 traffic.json 数组完全相同。
+        // tick 输入必须是 per-tunnel 当前累计，各记各的增量。
+        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut last: HashMap<String, (u64, u64)> = HashMap::new();
+        last.insert("h/A".into(), (100, 200));
+        last.insert("h/B".into(), (100, 200));
+        let currents: HashMap<String, (u64, u64)> =
+            [("h/A".into(), (150, 260)), ("h/B".into(), (100, 200))].into();
+        super::tick_traffic(&mut traffic, &mut last, &currents);
+        // A 只记自己的 50/60；B 无流量记 0（旧代码会给 B 也记 50/60）
+        assert_eq!(*traffic["h/A"].back().unwrap(), (50, 60));
+        assert_eq!(*traffic["h/B"].back().unwrap(), (0, 0));
+    }
+    #[test]
     fn traffic_pure_fns() {
         // Task1 基座：key/增量/加总/裁剪纯函数
         assert_eq!(super::traffic_key("h", "web"), "h/web");
@@ -352,6 +508,26 @@ mod tests {
         assert_eq!(s2.traffic.read().await["h/web"].len(), 1);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+    #[test]
+    fn idle_kick_threshold() {
+        // RED 现场：server 11:29 重启，agent reader 永 pend、无任何帧。
+        // 60s 无声 -> 僵尸必须踢；刚活跃（5s 内有帧）-> 活着。
+        assert!(super::is_idle_stale(0, 60));
+        assert!(super::is_idle_stale(0, 46));
+        assert!(!super::is_idle_stale(0, 45));
+        assert!(!super::is_idle_stale(100, 105));
+    }
+
+    #[test]
+    fn same_hostname_old_session_is_stale() {
+        // 新 Hello 同 hostname 时旧 agent_id 必须清（单 flight），否则两会话抢流。
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert("old-id".into(), "snail".into());
+        m.insert("other".into(), "macmini".into());
+        assert_eq!(super::stale_ids_for_hostname(&m, "snail"), vec!["old-id".to_string()]);
+        assert!(super::stale_ids_for_hostname(&m, "nobody").is_empty());
+    }
+
     #[test]
     fn conns_cap_evicts_oldest() {
         let mut m: HashMap<u64, super::ConnInfo> = HashMap::new();

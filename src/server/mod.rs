@@ -57,7 +57,9 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     }
     let need_init = shared.password_hash.read().await.is_empty();
     let token = Arc::new(token.to_string());
-    // 60s traffic tick：累计增量 push + 落盘 traffic.json
+    // 60s traffic tick：conns 表行累计 -> per-tunnel 增量 push + 落盘 traffic.json。
+    // 根因→修法：旧 tick 拿 agent 级累计给该 agent 下每个 proxy 各 push 一份，
+    // 多隧道流量翻 N 倍；新 tick 只读 conns 表归集，空闲隧道不 push。
     {
         let s = shared.clone();
         let data = data.to_string();
@@ -66,33 +68,10 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
             loop {
                 iv.tick().await;
                 {
-                    let ag = s.agents.read().await;
+                    let conns = s.conns.read().await;
                     let mut tr = s.traffic.write().await;
                     let mut lt = s.last_total.write().await;
-                    let mut pushed: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    for h in ag.values() {
-                        for p in &h.info.proxies {
-                            if !p.enabled {
-                                continue;
-                            }
-                            let k = state::traffic_key(&h.info.hostname, &p.name);
-                            let cur = (h.info.rx_bytes, h.info.tx_bytes);
-                            let prev = lt.get(&k).cloned().unwrap_or(cur);
-                            let q = tr.entry(k.clone()).or_default();
-                            if pushed.contains(&k) {
-                                // 同 hostname 多 agent 共 key：增量合并到本轮队尾一点
-                                if let Some(b) = q.back_mut() {
-                                    let d = state::minute_delta(prev, cur);
-                                    b.0 += d.0;
-                                    b.1 += d.1;
-                                }
-                            } else {
-                                state::tick_one(q, prev, cur);
-                                pushed.insert(k.clone());
-                            }
-                            lt.insert(k, cur);
-                        }
-                    }
+                    state::tick_from_conns(&mut tr, &mut lt, &conns);
                 }
                 let p = state::traffic_path(&data);
                 state::save_traffic(&s, &p).await;
