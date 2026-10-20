@@ -2,6 +2,7 @@
 pub mod api;
 pub mod auth;
 pub mod http_util;
+pub mod ratelimit;
 pub mod ingress;
 pub mod state;
 pub mod tunnel;

@@ -52,6 +52,8 @@ pub(crate) struct Shared {
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
     /// --listen 解析出的公网端口（HTTP fallback 连接行用）
     pub(crate) public_port: u16,
+    /// 映射级限速窗口：key = traffic_key(hostname, proxy名) -> 共享 limiter（总量语义）。
+    pub(crate) rate_limiters: RwLock<HashMap<String, Arc<crate::server::ratelimit::RateLimiter>>>,
 }
 
 /// 30天分钟点上限

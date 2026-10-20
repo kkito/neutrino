@@ -497,19 +497,26 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         else {
                             return;
                         };
-                        // 连接行目标信息（proxy 名 + 内网目标）
-                        let (pname, target) = {
+                        // 连接行目标信息（proxy 名 + 内网目标）+ 限速快照（总量下行，公网->agent 方向）。
+                        // 根因→修法：限速以 desired 入内存路由表为准，连接建立时快照一次；
+                        // 热更新后新连接用新值，老连接沿用旧 limiter（limiter_for 同 key 更新 limit，老连接自动跟随）。
+                        let (pname, target, rate_key, rate_bps) = {
                             let ag = s3.agents.read().await;
-                            ag.get(&aid)
-                                .and_then(|h| {
-                                    h.info.proxies.iter().find(|p| {
-                                        p.enabled && p.remote_port == port && p.ptype != "udp"
-                                    })
+                            let h = ag.get(&aid);
+                            let p = h.and_then(|h| {
+                                h.info.proxies.iter().find(|p| {
+                                    p.enabled && p.remote_port == port && p.ptype != "udp"
                                 })
-                                .map(|p| {
-                                    (p.name.clone(), format!("{}:{}", p.local_ip, p.local_port))
-                                })
-                                .unwrap_or_default()
+                            });
+                            match (h, p) {
+                                (Some(h), Some(p)) => (
+                                    p.name.clone(),
+                                    format!("{}:{}", p.local_ip, p.local_port),
+                                    crate::server::state::traffic_key(&h.info.hostname, &p.name),
+                                    crate::server::ratelimit::limit_of(p.rate_limit.as_deref()),
+                                ),
+                                _ => (String::new(), String::new(), String::new(), None),
+                            }
                         };
                         let hostname = s3.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
                         let sid = next_sid();
@@ -554,12 +561,25 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         let (mut ri, mut wi) = inbound.into_split();
                         let out2 = out.clone();
                         let s_rx = s3.clone();
+                        let limiter = match rate_bps {
+                            Some(bps) => Some(crate::server::ratelimit::limiter_for(&s3, &rate_key, bps).await),
+                            None => None,
+                        };
                         let to_agent = tokio::spawn(async move {
                             let mut b = vec![0u8; 32 * 1024];
                             loop {
                                 let n = ri.read(&mut b).await?;
                                 if n == 0 {
                                     break;
+                                }
+                                // 限速：总量窗口共享，同映射所有连接超了大家一起等；上行泵不压。
+                                // 零限速时 limiter 为 None，此分支跳过零开销。
+                                // 窗口口径已含时间抵扣（单块口径见 throttle_sleep 单测），此处直接 sleep。
+                                if let Some(l) = &limiter {
+                                    let d = l.take(n).await;
+                                    if !d.is_zero() {
+                                        tokio::time::sleep(d).await;
+                                    }
                                 }
                                 // 连接行 rx 累计（公网->agent 字节）
                                 if let Some(c) = s_rx.conns.write().await.get_mut(&(sid as u64)) {
