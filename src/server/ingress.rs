@@ -490,6 +490,37 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                     let Ok((inbound, peer)) = lis.accept().await else {
                         continue;
                     };
+                    // TCP 收窗口钳制：限速映射的连接收缓冲 64KB（默认 ~6MB/连接）。
+                    // 根因→修法：sleep 截流只压转发节奏，突发全进内核缓冲、网卡照涨；
+                    // 收缓冲小 = 通告窗口小 = 对端单 RTT 在途量小 = 网卡毛刺低。
+                    // 无限速映射跳过（零开销）；setsockopt 失败只 warn 不炸连接。
+                    {
+                        use std::os::fd::AsRawFd;
+                        let need_clamp = {
+                            let ag = s2.agents.read().await;
+                            ag.values().any(|h| {
+                                h.info.proxies.iter().any(|p| {
+                                    p.enabled && p.remote_port == port && p.ptype != "udp" && p.rate_limit.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false)
+                                })
+                            })
+                        };
+                        if need_clamp {
+                            let fd = inbound.as_raw_fd();
+                            let small: libc::c_int = 64 * 1024;
+                            let r = unsafe {
+                                libc::setsockopt(
+                                    fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_RCVBUF,
+                                    &small as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&small) as libc::socklen_t,
+                                )
+                            };
+                            if r != 0 {
+                                tracing::warn!("tcp :{port} SO_RCVBUF clamp failed for {peer}");
+                            }
+                        }
+                    }
                     let s3 = s2.clone();
                     tokio::spawn(async move {
                         let Some(aid) =
@@ -650,6 +681,28 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                 return;
             }
         };
+        // UDP 丢包限速：socket 收缓冲钳到 64KB（默认 ~6MB）。
+        // 根因→修法：UDP 无窗口无背压，sleep 只能拖转发节奏，对端照发、网卡照涨；
+        // 唯一用户态能干的是让内核缓冲变小——超了内核直接丢包，对端 uTP 感知丢包
+        // 后降速（类拥塞语义）。buffer 小 = 丢得早 = 对端发得少 = 网卡数字下来。
+        // 失败只记 warn 不炸（钳不住就退化成旧行为）。
+        {
+            use std::os::fd::AsRawFd;
+            let fd = sock.as_raw_fd();
+            let small: libc::c_int = 64 * 1024;
+            let r = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &small as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&small) as libc::socklen_t,
+                )
+            };
+            if r != 0 {
+                tracing::warn!("udp :{port} SO_RCVBUF clamp failed, unlimited buffer");
+            }
+        }
         tracing::info!("udp ingress on 0.0.0.0:{port}");
         log_ev(&s2, format!("udp listening :{port}"));
         // peer -> (stream_id, last_seen)

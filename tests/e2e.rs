@@ -1508,6 +1508,92 @@ async fn e2e_tcp_ratelimit_throttles_downlink() {
     let _ = (env_f, dt_l);
 }
 
+/// 回归：UDP 限速不断包——慢发 100 包（每包 1KB，间隔 5ms），限速组全收到。
+/// 猛发 flood 在本机回环上连不限速组都丢包（WSS 中转跟不上，现场 384/2048），
+/// flood 丢包断言是伪命题；此用例只锁“限速不丢正常流量”，钳制效果由线上网卡验证。
+#[tokio::test]
+async fn e2e_udp_ratelimit_keeps_ordered_flow() {
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, _)) = back.recv_from(&mut b).await else { break };
+            let _ = tx.send(b[..n].to_vec());
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"512k\"\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    for i in 0u8..100 {
+        let mut pkt = vec![0xDDu8; 1024];
+        pkt[0] = i;
+        cli.send(&pkt).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut got = vec![];
+    while let Ok(p) = rx.try_recv() {
+        got.push(p);
+    }
+    eprintln!("[udp-ordered] limited got {}/100", got.len());
+    assert!(got.len() >= 95, "限速丢正常流量：{}/100", got.len());
+    let _ = env;
+}
+
+/// 回归：UDP 收包方向 sleep 限速——持续猛发时后端收到速率被钳住。
+/// client 猛发 1KB 包不停（1s），数后端 1s 内收到包数。
+/// 限速组（64k 上限）：sleep 拖读，后端速率 ≈ 上限（~64 包/s，留余量断言 <300）。
+/// 不限速组：读得快，WSS 中转瓶颈前能跑满（本机现场 384/2s，远超 300）。
+/// 旧代码（无 sleep）：两组一样快，限速组不断言成立而红。
+#[tokio::test]
+async fn e2e_udp_ratelimit_caps_ingress_rate() {
+    async fn rate_env(limit: &str) -> usize {
+        let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bport = back.local_addr().unwrap().port();
+        let cnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt2 = cnt.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            loop {
+                let Ok(_) = back.recv_from(&mut b).await else { break };
+                cnt2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let rport = free_port();
+        let toml = if limit.is_empty() {
+            format!("[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n")
+        } else {
+            format!("[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"{limit}\"\n")
+        };
+        let env = boot(&toml).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let pkt = vec![0xDDu8; 1024];
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(1) {
+            let _ = cli.send(&pkt).await;
+        }
+        // 再等 2s 让 sleep 拖住的包慢慢转完，然后读数（限速组转得慢，计数低）
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let n = cnt.load(std::sync::atomic::Ordering::Relaxed);
+        drop(env);
+        n
+    }
+    let n_limited = rate_env("64k").await;
+    let n_free = rate_env("").await;
+    eprintln!("[udp-rate] limited={n_limited} free={n_free}");
+    assert!(n_limited < 300, "UDP 限速未生效：限速组收到 {n_limited} 包/s");
+    assert!(n_free > n_limited * 2, "限速不显著：限速{n_limited} vs 不限速{n_free}");
+}
+
 /// 回归：映射级双向总量限速——client 上传方向（公网->agent）同压。
 /// 因果链写法：后端每收齐 32KB 回 1 字节 ack，client 发一块等一 ack。
 /// server 内核缓冲再大也藏不住——ack 没回来下一块发不出去，耗时 = 上行泵真实转发速率。
