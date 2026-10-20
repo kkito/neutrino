@@ -577,6 +577,9 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         };
                         let hostname = s3.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
                         let sid = next_sid();
+                        // 建连日志（每连接一行，量可接受；断开在双泵结束处记）：
+                        // 之前连上谁/去哪/限速多少全黑盒，BT flood 时连 conns 数都看不到。
+                        tracing::info!("tcp accept :{port} peer={peer} -> sid={sid} tunnel={pname} target={target} limit={}", rate_bps.map(|b| b.to_string()).unwrap_or_else(|| "none".into()));
                         // 连接快照行（双泵结束处 remove）
                         {
                             let mut m = s3.conns.write().await;
@@ -678,7 +681,10 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         if let Some(h) = s3.agents.read().await.get(&aid) {
                             h.incoming.write().await.remove(&sid);
                         }
-                        s3.conns.write().await.remove(&(sid as u64));
+                        // 断开日志：conns 行累计 rx/tx 一起记，连接泄漏/流量对不上时有据可查。
+                        if let Some(c) = s3.conns.write().await.remove(&(sid as u64)) {
+                            tracing::info!("tcp close :{port} peer={peer} sid={sid} rx={} tx={}", c.rx, c.tx);
+                        }
                         let _ = ctl.send(ServerMsg::Close {
                             stream: sid,
                             reason: "eof".into(),
@@ -743,7 +749,12 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         let mut buf = vec![0u8; 65535];
         loop {
             // expire old sessions（conns 表 UDP 行同步删）
+            let n_before = sessions.len();
             sessions.retain(|_, (_, t, _, _)| t.elapsed() < Duration::from_secs(120));
+            let n_exp = n_before.saturating_sub(sessions.len());
+            if n_exp > 0 {
+                tracing::debug!("udp :{port} expired {n_exp} sessions ({} alive)", sessions.len());
+            }
             {
                 let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _, _, _)| *id).collect();
                 s2.conns.write().await.retain(|_, c| c.proto != "udp" || live.contains(&(c.id as u32)));

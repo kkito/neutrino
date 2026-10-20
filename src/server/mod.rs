@@ -130,6 +130,13 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                     let mut base = s.live_last_host.write().await;
                     *base = per_host;
                 }
+                // 心跳：tick 停摆一眼可见（debug 级，量大默认不刷屏）。
+                // 根因→修法：后台循环死掉无任何迹象；有心跳行+缺行即告警。
+                {
+                    let nc = s.conns.read().await.len();
+                    let na = s.agents.read().await.len();
+                    tracing::debug!("{}", state::tick_heartbeat("live", &[("conns", nc), ("agents", na)]));
+                }
             }
         });
     }
@@ -143,15 +150,17 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
             let mut iv = tokio::time::interval(Duration::from_secs(60));
             loop {
                 iv.tick().await;
-                {
+                let (nconns, ntun) = {
                     let conns = s.conns.read().await;
                     let mut tr = s.traffic.write().await;
                     let mut lt = s.last_total.write().await;
                     let mut seen = s.seen_tunnels.write().await;
                     state::tick_from_conns(&mut tr, &mut lt, &mut seen, &conns);
-                }
+                    (conns.len(), tr.len())
+                };
                 let p = state::traffic_path(&data);
                 state::save_traffic(&s, &p).await;
+                tracing::info!("{}", state::tick_heartbeat("traffic", &[("conns", nconns), ("tunnels", ntun)]));
             }
         });
     }
@@ -184,14 +193,16 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
             loop {
                 iv.tick().await;
                 // fold live counters into totals
-                {
+                let nagents = {
                     let ag = s.agents.read().await;
                     let mut t = s.totals.write().await;
                     for h in ag.values() {
                         t.insert(h.info.hostname.clone(), (h.info.rx_bytes, h.info.tx_bytes));
                     }
-                }
+                    ag.len()
+                };
                 state::save_state(&s).await;
+                tracing::info!("{}", state::tick_heartbeat("persist", &[("agents", nagents)]));
             }
         });
     }

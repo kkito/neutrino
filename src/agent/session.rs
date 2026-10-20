@@ -209,10 +209,15 @@ pub(crate) async fn session(
                     }
                 }
             }
-            Message::Close(_) => break,
+            Message::Close(_) => {
+                tracing::warn!("ws closed by server");
+                break;
+            }
             _ => {}
         }
     }
+    // 主循环退出 = 掉线（调用方负责重连退避）。之前此处静默，agent 掉线只能去 server 侧猜。
+    tracing::warn!("ws session ended, will redial");
     *egress_out.write().await = None;
     writer.abort();
     anyhow::Ok(())

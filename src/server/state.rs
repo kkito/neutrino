@@ -175,6 +175,15 @@ pub(crate) fn slow_msg(api: &str, elapsed_ms: u64, threshold_ms: u64) -> Option<
     }
 }
 
+/// 后台 tick 心跳行（纯函数，单测锁格式）：`tick <name> k=v k=v`。
+/// 根因→修法：5s live/60s traffic/30s persist 三个后台循环死掉外面看不出来
+/// （无日志、无指标）。新语义：每轮打一行心跳（含关键计数），停摆/卡住一眼可见。
+/// debug 级（量大：5s 一行），排查时 `RUST_LOG=debug` 开。
+pub(crate) fn tick_heartbeat(name: &str, kvs: &[(&str, usize)]) -> String {
+    let parts: Vec<String> = kvs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("tick {name} {}", parts.join(" "))
+}
+
 fn push_ev(s: &S, e: String) {
     if let Ok(mut v) = s.events.try_write() {
         v.push(format_ev(chrono::Local::now(), &e));
@@ -358,8 +367,14 @@ pub(crate) async fn save_traffic(s: &S, path: &str) {
         points: t.iter().map(|(k, q)| (k.clone(), q.iter().cloned().collect())).collect(),
         seen: seen.iter().cloned().collect(),
     };
-    if let Ok(txt) = serde_json::to_string(&file) {
-        let _ = tokio::fs::write(path, txt).await;
+    // 根因→修法：旧代码 write 失败直接吞（let _），盘满/权限问题全靠猜。
+    match serde_json::to_string(&file) {
+        Ok(txt) => {
+            if let Err(e) = tokio::fs::write(path, txt).await {
+                tracing::warn!("persist traffic.json failed: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("persist traffic.json encode failed: {e:#}"),
     }
 }
 
@@ -452,8 +467,13 @@ pub(crate) async fn save_state(s: &S) {
         jwt_secret: s.jwt_secret.clone(),
     };
     let path = format!("{}/state.json", s.data_dir);
-    if let Ok(txt) = serde_json::to_string_pretty(&p) {
-        let _ = tokio::fs::write(&path, txt).await;
+    match serde_json::to_string_pretty(&p) {
+        Ok(txt) => {
+            if let Err(e) = tokio::fs::write(&path, txt).await {
+                tracing::warn!("persist state.json failed: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("persist state.json encode failed: {e:#}"),
     }
 }
 
@@ -637,6 +657,16 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, t0 + 60, "点必须带 tick 的 wall clock ts");
         assert_eq!((q[0].1, q[0].2), (100, 200));
+    }
+    #[test]
+    fn tick_heartbeat_line_has_expected_shape() {
+        // 根因→修法：后台 tick（5s live/60s traffic/30s persist）死掉外面看不出来
+        // （比如 conns 锁卡住，tick 停摆，无任何日志）。新语义：每个 tick 打一行
+        // 心跳（含关键计数），停摆一眼可见。此单测锁死心跳行格式函数。
+        let line = super::tick_heartbeat("live", &[("conns", 12), ("agents", 2)]);
+        assert!(line.contains("tick live"), "{line}");
+        assert!(line.contains("conns=12"), "{line}");
+        assert!(line.contains("agents=2"), "{line}");
     }
     #[test]
     fn slow_msg_fires_only_over_threshold() {
