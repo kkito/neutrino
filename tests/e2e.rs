@@ -1508,6 +1508,27 @@ async fn e2e_tcp_ratelimit_throttles_downlink() {
     let _ = (env_f, dt_l);
 }
 
+/// 回归：请求日志中间件不破坏正常响应——/api/tunnels 200 且 3s 内回。
+/// 根因→修法：加 layer 时曾把 shared move 掉导致编译挂；此用例锁死中间件透明性。
+/// 慢请求告警语义由单测 slow_msg_fires_only_over_threshold 锁。
+#[tokio::test]
+async fn e2e_api_middleware_transparent() {
+    let env = boot("").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let t0 = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        cli.get(format!("{}/api/tunnels", env.web_base)).bearer_auth(&jwt).send(),
+    )
+    .await
+    .expect("中间件下 /api/tunnels 3s 无响应");
+    assert!(r.unwrap().status().is_success());
+    assert!(t0.elapsed() < Duration::from_secs(3));
+    let _ = env;
+}
+
 /// 回归：UDP flood 时 /api/tunnels 必须秒回——UDP 收包循环每包拿
 /// agents.write() 全表扫描（旧代码），BT uTP flood 下写锁常驻，
 /// tunnels 的 agents.read() 饿死 6s+（线上 /api/overview pending 根因；

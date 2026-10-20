@@ -164,6 +164,17 @@ where
     format!("{} {e}", t.format("%m-%d %H:%M:%S"))
 }
 
+/// 慢请求判定（纯函数，单测覆盖）：elapsed_ms > threshold_ms 才返回告警行。
+/// 根因→修法：/api/tunnels pending 6s 全靠猜——无请求日志、无慢告警、无锁等待可见性。
+/// 新语义：所有 /api 请求打耗时日志（中间件），超阈值 warn + 入 events，线上不再靠猜。
+pub(crate) fn slow_msg(api: &str, elapsed_ms: u64, threshold_ms: u64) -> Option<String> {
+    if elapsed_ms > threshold_ms {
+        Some(format!("slow api /api/{api}: {elapsed_ms}ms > {threshold_ms}ms"))
+    } else {
+        None
+    }
+}
+
 fn push_ev(s: &S, e: String) {
     if let Ok(mut v) = s.events.try_write() {
         v.push(format_ev(chrono::Local::now(), &e));
@@ -626,6 +637,14 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, t0 + 60, "点必须带 tick 的 wall clock ts");
         assert_eq!((q[0].1, q[0].2), (100, 200));
+    }
+    #[test]
+    fn slow_msg_fires_only_over_threshold() {
+        // 根因→修法：/api/tunnels pending 6s 全靠猜（无请求日志、无慢告警）。
+        // 新语义：纯函数判定慢请求，handler 统一打慢日志，线上不再靠猜。
+        assert!(super::slow_msg("tunnels", 600, 500).is_some());
+        assert!(super::slow_msg("tunnels", 100, 500).is_none());
+        assert!(super::slow_msg("tunnels", 500, 500).is_none());
     }
     #[test]
     fn traffic_pure_fns() {

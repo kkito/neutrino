@@ -24,8 +24,9 @@ pub(crate) async fn session(
     status: Arc<RwLock<super::web::AgentStatus>>,
     egress_out: super::egress::OutHolder,
 ) -> anyhow::Result<()> {
+    tracing::info!("dial {} as '{}'", up.server_url, up.hostname);
     let (ws, _) = connect_async(up.server_url.as_str()).await?;
-    tracing::info!("ws connected");
+    tracing::info!("ws connected as '{}'", up.hostname);
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     // writer
@@ -90,6 +91,7 @@ pub(crate) async fn session(
     send(&ClientMsg::Register {
         proxies: cfg.proxies.clone(),
     })?;
+    tracing::info!("registered {} proxies", cfg.proxies.len());
 
     // ping loop
     {

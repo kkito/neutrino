@@ -820,6 +820,9 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                             // 总量由 persist 循环批量刷）。
                         }
                     });
+                    // session 级日志（建时一次，包循环不打）：UDP flood 排查看 session 数，
+                    // 每包日志会把盘打爆。
+                    tracing::info!("udp session {peer} -> sid={id} tunnel={_sess_pname} host={_sess_host}");
                     sessions.insert(peer, (id, Instant::now(), out_cached, sess_limiter));
                     // UDP 连接行（peer 一行；since 每次收包刷新见下）
                     {

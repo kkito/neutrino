@@ -726,9 +726,10 @@ pub(crate) async fn on_register(s: &S, agent_id: &str, hostname: &str, reported:
         // so push the overlaid list back (agent re-Registers on Config).
         // 已收敛则跳过：否则 Register -> Config -> Register 无限 ping-pong 刷屏。
         if !needs_config_push(&reported, &proxies) {
-            tracing::debug!("agent '{hostname}' already converged, skip Config push");
+            tracing::info!("agent '{hostname}' already converged, skip Config push");
         } else if let Some(ctl) = s.agents.read().await.get(agent_id).map(|h| h.ctl.clone()) {
             let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+            log_ev(s, format!("agent '{hostname}' Config pushed ({} proxies)", proxies.len()));
         }
     }
     apply_proxies_for_agent(s, agent_id, &proxies).await;

@@ -16,6 +16,31 @@ use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::RwLock};
 use std::collections::HashMap;
 
+/// 请求耗时日志中间件：method path -> status + 耗时；慢请求（>500ms）warn + 入 events。
+async fn api_access_log(
+    axum::extract::State(s): axum::extract::State<S>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl axum::response::IntoResponse {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let t0 = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let ms = t0.elapsed().as_millis() as u64;
+    // 健康检查类高频口降噪：/api/live 5s 一次轮询，只记慢的
+    if path == "/api/live" && ms <= 500 {
+        return resp;
+    }
+    let line = format!("{method} {path} -> {} {ms}ms", resp.status().as_u16());
+    if let Some(w) = state::slow_msg(&path.replace("/api/", ""), ms, 500) {
+        tracing::warn!("{line} SLOW");
+        state::log_ev_err(&s, w);
+    } else {
+        tracing::info!("{line}");
+    }
+    resp
+}
+
 pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
@@ -186,7 +211,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         // 注意：`/` 不单独注册精确路由，否则带隧道 Host 访问 `/` 会被它抢走；
         // 统一走 fallback 按 Host 分流（WebUI vs 隧道）。
         .fallback(fallback_http_ingress)
-        .with_state((shared, token.clone()));
+        .with_state((shared.clone(), token.clone()));
     let lis = TcpListener::bind(listen).await?;
     tracing::info!("server listening ws+webui+http-ingress on {listen}");
     println!("neutrino-server running:");
@@ -197,6 +222,14 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     } else {
         println!("  web login    : admin / (已设置的口令)");
     }
+    // 请求日志中间件：所有请求打耗时（info 级，排查不再靠猜）；
+    // 超 500ms 的 warn + 入 events（WebUI /api/logs 可见）。
+    // 根因→修法：/api/tunnels pending 6s 时无任何请求日志，只能逐段 curl 隔离；
+    // 有此日志一眼看出哪个 API 慢、慢多少。
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shared.clone(),
+        api_access_log,
+    ));
     // ConnectInfo 让 fallback 能取对端 ip:port（连接列表 peer 列用）
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(lis, svc).await?;
