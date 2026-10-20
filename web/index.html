@@ -201,17 +201,18 @@ async function loadTraffic(){
   const peak=pts.reduce((a,p)=>Math.max(a,p[1]+p[2]),0);
   // 卡片标题随粒度联动，消除“周期/窗口”歧义：桶时长与查询范围写明白。
   const bucket=trGran==='min'?'1分钟':(trGran==='hour'?'1小时':'1天');
-  const span=trGran==='min'?'近3小时':(trGran==='hour'?'近7天':'近31天');
+  const span=pts.length>1?Math.round((pts[pts.length-1][0]-pts[0][0])/(trGran==='min'?60:(trGran==='hour'?3600:86400))):0;
+  const spanTxt=(span>0?`实际跨度${span}${trGran==='day'?'天':(trGran==='hour'?'小时':'分钟')}`:'暂无跨度')+`（${trGran==='min'?'每点1分钟':(trGran==='hour'?'每点1小时':'每点1天')}）`;
   const rate=s=>human(Math.round(s/(trGran==='min'?60:(trGran==='hour'?3600:86400))))+'/s';
   document.getElementById('tr-rx-k').textContent=`最近${bucket} rx（均速 ${rate(last[1])}）`;
   document.getElementById('tr-tx-k').textContent=`最近${bucket} tx（均速 ${rate(last[2])}）`;
   document.getElementById('tr-peak-k').textContent=`单${bucket}峰值（rx+tx）`;
-  document.getElementById('tr-sum-k').textContent=`${span}总量（rx/tx）`;
+  document.getElementById('tr-sum-k').textContent=`${spanTxt}总量（rx/tx）`;
   document.getElementById('tr-rx').textContent=human(last[1]);
   document.getElementById('tr-tx').textContent=human(last[2]);
   document.getElementById('tr-peak').textContent=human(peak);
   document.getElementById('tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
-  document.getElementById('tr-hint').textContent=pts.length?`${span}共 ${pts.length} 点 · 每点${bucket}`:'暂无数据（等待下一分钟 tick）';
+  document.getElementById('tr-hint').textContent=pts.length?`${spanTxt} · 共 ${pts.length} 点`:'';
   drawChart(pts);
   loadLive();
   }catch(e){}

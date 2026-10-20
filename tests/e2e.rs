@@ -1530,7 +1530,7 @@ async fn e2e_live_snapshot_within_10s() {
     ))
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    // 持续跑量：后台循环 32KB roundtrip 10s，保证每个 5s 窗口都有增量
+    // 持续跑量：后台循环 32KB roundtrip 10s，保证跨过一个 5s tick（相位随机，6s 不够稳）
     tokio::spawn(async move {
         let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
         let chunk = vec![0xABu8; 32 * 1024];

@@ -109,20 +109,40 @@ pub(crate) async fn api_logs(
 
 /// 分钟点切片：按 gran 把分钟点组成块求和，取后 n 块。返回 (块序列, 每块秒数)。
 /// 根因→修法：hour/day 不另存，由分钟点现算（spec §3）。
+/// 点自带 ts（(ts,rx,tx)），返回 (ts,rx,tx) 块序列。
+/// 根因→修法：旧 slice 返回无 ts 的增量，api 用 now-len*step 反推时间，
+/// 重启/断流后旧点画到错误时间。块 ts 取块内最新点的 ts；ts=0 的旧点
+/// （升级前落盘）回退为 now-(位置)*step 估算，不再全局错位。
 pub(crate) fn slice_points(
-    v: &std::collections::VecDeque<(u64, u64)>,
+    v: &std::collections::VecDeque<(i64, u64, u64)>,
     gran: &str,
     n: usize,
-) -> (Vec<(u64, u64)>, usize) {
+    now: i64,
+) -> (Vec<(i64, u64, u64)>, usize) {
     let per = match gran {
         "hour" => 60,
         "day" => 1440,
         _ => 1,
     };
-    let flat: Vec<(u64, u64)> = v.iter().cloned().collect();
-    let mut chunks: Vec<(u64, u64)> = flat
+    let step: i64 = per as i64 * 60;
+    let flat: Vec<(i64, u64, u64)> = v.iter().cloned().collect();
+    let total = flat.len();
+    let mut chunks: Vec<(i64, u64, u64)> = flat
         .rchunks(per)
-        .map(|c| c.iter().fold((0, 0), |(a, b), (x, y)| (a + x, b + y)))
+        .enumerate()
+        .map(|(ci, c)| {
+            let (r, t) = c.iter().fold((0, 0), |(a, b), (_, x, y)| (a + x, b + y));
+            // 块 ts：块内最新点的 ts；全 0（旧点）则按块位置回退估算
+            let ts = c.iter().map(|(ts, _, _)| *ts).max().unwrap_or(0);
+            let ts = if ts > 0 {
+                ts
+            } else {
+                // ci=0 是最新块：now - ci*step
+                now - ci as i64 * step
+            };
+            let _ = total;
+            (ts, r, t)
+        })
         .collect();
     chunks.reverse();
     let take = chunks.len().min(n);
@@ -172,26 +192,29 @@ pub(crate) async fn api_traffic(
     } else {
         vec![q.tunnel.clone()]
     };
-    let mut series: Vec<(u64, u64)> = vec![];
+    let now = chrono::Local::now().timestamp();
+    // 按 ts 归桶：桶宽 = gran 步长，桶 ts = 桶内最新点 ts 回退对齐。
+    // 根因→修法：旧逻辑按位对齐相加 + now-len*step 反推，不同 key 点数不一、
+    // 重启缺口都错位；新逻辑每个 (ts,rx,tx) 按 ts 落桶，缺桶即 0，不断崖不错位。
+    let mut buckets: std::collections::BTreeMap<i64, (u64, u64)> = Default::default();
     for k in &keys {
         if let Some(v) = tr.get(k) {
-            let (pts, _) = slice_points(v, &gran, n);
-            if pts.len() > series.len() {
-                series.resize(pts.len(), (0, 0));
-            }
-            let off = series.len() - pts.len();
-            for (i, p) in pts.iter().enumerate() {
-                series[off + i].0 += p.0;
-                series[off + i].1 += p.1;
+            let (pts, _) = slice_points(v, &gran, n, now);
+            for (ts, r, t) in pts {
+                let b = ts - ((ts % step) + step) % step;
+                let e = buckets.entry(b).or_insert((0, 0));
+                e.0 += r;
+                e.1 += t;
             }
         }
     }
-    let now = chrono::Local::now().timestamp();
-    let start = now - series.len() as i64 * step;
-    let points: Vec<(i64, u64, u64)> = series
-        .iter()
-        .enumerate()
-        .map(|(i, (r, t))| (start + i as i64 * step, *r, *t))
+    // 只取后 n 桶（n 限制点数，防 30 天分钟点一次全吐）
+    let points: Vec<(i64, u64, u64)> = buckets
+        .into_iter()
+        .rev()
+        .take(n)
+        .rev()
+        .map(|(ts, (r, t))| (ts, r, t))
         .collect();
     Json(serde_json::json!({"points": points})).into_response()
 }
@@ -528,13 +551,16 @@ mod tests {
     fn traffic_slice_math() {
         use std::collections::VecDeque;
         // 180 个分钟点，每点 (60,30)：hour 应=60点求和，day 应=全量求和
-        let v: VecDeque<(u64, u64)> = (0..180).map(|_| (60u64, 30u64)).collect();
-        let (r, _) = super::slice_points(&v, "hour", 2);
+        let v: VecDeque<(i64, u64, u64)> = (0..180).map(|i| (1_760_900_000 + i as i64 * 60, 60u64, 30u64)).collect();
+        let now: i64 = 1_760_935_200;
+        let (r, _) = super::slice_points(&v, "hour", 2, now);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0], (3600, 1800));
-        let (r2, _) = super::slice_points(&v, "day", 31);
+        // 块 ts = 块内最新点 ts（点 ts 按 i 递增 60s）
+        assert_eq!((r[0].1, r[0].2), (3600, 1800));
+        assert!(r[1].0 > r[0].0, "块 ts 必须递增");
+        let (r2, _) = super::slice_points(&v, "day", 31, now);
         assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0], (180 * 60, 180 * 30));
+        assert_eq!((r2[0].1, r2[0].2), (180 * 60, 180 * 30));
     }
     #[test]
     fn webui_survives_refresh() {

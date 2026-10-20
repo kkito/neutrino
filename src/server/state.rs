@@ -44,8 +44,10 @@ pub(crate) struct Shared {
     pub(crate) data_dir: String,
     pub(crate) desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,
     pub(crate) desired_path: String,
-    /// 分钟流量点：key = "hostname/proxy名" -> VecDeque<(rx增量,tx增量)>，cap 43200（30天）
-    pub(crate) traffic: RwLock<HashMap<String, VecDeque<(u64, u64)>>>, 
+    /// 分钟流量点：key = "hostname/proxy名" -> VecDeque<(ts, rx增量, tx增量)>，cap 43200（30天）
+    /// 根因→修法：点必须带落盘时的 wall clock ts，否则 api 用 now-len*60 反推，
+    /// 重启/断流后旧点画到错误时间（18:12 高峰实为 17 点旧账错位）。
+    pub(crate) traffic: RwLock<HashMap<String, VecDeque<(i64, u64, u64)>>>,
     /// 5s 实时快照：key 同 traffic -> (rx_5s, tx_5s)，纯内存不落盘（秒级监控用）
     pub(crate) live: RwLock<HashMap<String, (u64, u64)>>,
     /// 5s tick 上轮累计：key 同 traffic，用于算 5s 增量（纯内存，重启丢了下轮重建基线）
@@ -119,8 +121,8 @@ pub(crate) fn minute_delta(prev: (u64, u64), cur: (u64, u64)) -> (u64, u64) {
 
 /// 后 n 个点求和（聚合口径备用；slice_points 内 rchunks 求和是同口径实现）
 #[allow(dead_code)]
-pub(crate) fn rollup(points: &VecDeque<(u64, u64)>, n: usize) -> (u64, u64) {
-    points.iter().rev().take(n).fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
+pub(crate) fn rollup(points: &VecDeque<(i64, u64, u64)>, n: usize) -> (u64, u64) {
+    points.iter().rev().take(n).fold((0, 0), |(a, b), (_, x, y)| (a + x, b + y))
 }
 
 /// conns 表插入（满 5000 挤掉 id 最小的防 OOM）
@@ -133,7 +135,7 @@ pub(crate) fn insert_conn(m: &mut HashMap<u64, ConnInfo>, c: ConnInfo) {
     m.insert(c.id, c);
 }
 
-pub(crate) fn trim_traffic(v: &mut VecDeque<(u64, u64)>) {
+pub(crate) fn trim_traffic(v: &mut VecDeque<(i64, u64, u64)>) {
     while v.len() > TRAFFIC_CAP {
         v.pop_front();
     }
@@ -240,9 +242,24 @@ pub(crate) fn traffic_path(data_dir: &str) -> String {
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct TrafficFile {
     #[serde(default)]
-    points: HashMap<String, Vec<(u64, u64)>>,
+    points: HashMap<String, Vec<(i64, u64, u64)>>,
     #[serde(default)]
     seen: Vec<String>,
+}
+
+/// 旧点（2 元 [rx,tx]，无 ts）-> 新点（ts=0，后续 api 回退估算）
+fn upgrade_legacy_points(v: serde_json::Value) -> Option<Vec<(i64, u64, u64)>> {
+    let arr = v.as_array()?;
+    let mut out = vec![];
+    for p in arr {
+        let a = p.as_array()?;
+        match a.len() {
+            2 => out.push((0, a[0].as_u64()?, a[1].as_u64()?)),
+            3 => out.push((a[0].as_i64()?, a[1].as_u64()?, a[2].as_u64()?)),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// 启动读回 traffic.json：无文件直接从空开始；坏 json 记一条日志、内存不动。
@@ -254,16 +271,42 @@ pub(crate) async fn load_traffic(s: &S, path: &str) {
     // 根因→修法：TrafficFile 全字段 #[serde(default)]，旧文件也能“成功”解析成
     // 空 points——先判键再解析，否则线上旧 traffic.json 重启即丢全部历史点。
     let file: TrafficFile = match serde_json::from_str::<serde_json::Value>(&txt) {
-        Ok(v) if v.get("points").is_some() => match serde_json::from_value(v) {
-            Ok(f) => f,
-            Err(_) => {
+        Ok(v) if v.get("points").is_some() => {
+            let pts = v.get("points").cloned().unwrap_or_default();
+            let mut points: HashMap<String, Vec<(i64, u64, u64)>> = HashMap::new();
+            let mut bad = false;
+            if let Some(m) = pts.as_object() {
+                for (k, arr) in m {
+                    match upgrade_legacy_points(arr.clone()) {
+                        Some(p) => { points.insert(k.clone(), p); }
+                        None => { bad = true; break; }
+                    }
+                }
+            } else {
+                bad = true;
+            }
+            let seen: Vec<String> = v.get("seen").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or_default();
+            if bad {
                 log_ev_err(s, "traffic load failed: bad json".into());
                 return;
             }
-        },
-        Ok(v) => match serde_json::from_value::<HashMap<String, Vec<(u64, u64)>>>(v) {
-            Ok(m) => TrafficFile { points: m, seen: vec![] },
-            Err(_) => {
+            TrafficFile { points, seen }
+        }
+        Ok(v) => match v.as_object() {
+            Some(m) => {
+                let mut points: HashMap<String, Vec<(i64, u64, u64)>> = HashMap::new();
+                for (k, arr) in m {
+                    match upgrade_legacy_points(arr.clone()) {
+                        Some(p) => { points.insert(k.clone(), p); }
+                        None => {
+                            log_ev_err(s, "traffic load failed: bad json".into());
+                            return;
+                        }
+                    }
+                }
+                TrafficFile { points, seen: vec![] }
+            }
+            None => {
                 log_ev_err(s, "traffic load failed: bad json".into());
                 return;
             }
@@ -276,7 +319,7 @@ pub(crate) async fn load_traffic(s: &S, path: &str) {
     {
         let mut t = s.traffic.write().await;
         for (k, v) in file.points {
-            let mut q: VecDeque<(u64, u64)> = v.into_iter().collect();
+            let mut q: VecDeque<(i64, u64, u64)> = v.into_iter().collect();
             trim_traffic(&mut q);
             t.insert(k, q);
         }
@@ -330,19 +373,31 @@ pub(crate) fn aggregate_conns(conns: &HashMap<u64, ConnInfo>) -> HashMap<String,
 /// push (0,0)，重启那分钟的流量直接吞掉。`seen` 标记区分“从未见过”与
 /// “重启后首次见”：后者不 push，只建基线（不断崖、不吞量、不造假点）。
 pub(crate) fn tick_from_conns(
-    traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
+    traffic: &mut HashMap<String, VecDeque<(i64, u64, u64)>>,
     last: &mut HashMap<String, (u64, u64)>,
     seen: &mut std::collections::HashSet<String>,
     conns: &HashMap<u64, ConnInfo>,
 ) {
-    tick_traffic(traffic, last, seen, &aggregate_conns(conns));
+    tick_from_conns_at(traffic, last, seen, &aggregate_conns(conns), chrono::Local::now().timestamp());
 }
 
-pub(crate) fn tick_traffic(
-    traffic: &mut HashMap<String, VecDeque<(u64, u64)>>,
+/// 可注入 now 的 tick 入口（单测锁 ts 用；线上走 tick_from_conns 即 now）。
+pub(crate) fn tick_from_conns_at(
+    traffic: &mut HashMap<String, VecDeque<(i64, u64, u64)>>,
     last: &mut HashMap<String, (u64, u64)>,
     seen: &mut std::collections::HashSet<String>,
     currents: &HashMap<String, (u64, u64)>,
+    now: i64,
+) {
+    tick_traffic(traffic, last, seen, currents, now);
+}
+
+pub(crate) fn tick_traffic(
+    traffic: &mut HashMap<String, VecDeque<(i64, u64, u64)>>,
+    last: &mut HashMap<String, (u64, u64)>,
+    seen: &mut std::collections::HashSet<String>,
+    currents: &HashMap<String, (u64, u64)>,
+    now: i64,
 ) {
     for (k, cur) in currents {
         // 基线缺失即只建基线不 push，两种情况：
@@ -355,19 +410,20 @@ pub(crate) fn tick_traffic(
             continue;
         }
         let prev = last.get(k).cloned().unwrap_or(*cur);
-        tick_one(traffic.entry(k.clone()).or_default(), prev, *cur);
+        tick_one(traffic.entry(k.clone()).or_default(), prev, *cur, now);
         last.insert(k.clone(), *cur);
     }
 }
 
-/// tick 一步：算增量、push 队尾、裁剪。返回本分钟增量。
+/// tick 一步：算增量、push (ts,rx,tx) 队尾、裁剪。返回本分钟增量。
 pub(crate) fn tick_one(
-    q: &mut VecDeque<(u64, u64)>,
+    q: &mut VecDeque<(i64, u64, u64)>,
     prev: (u64, u64),
     cur: (u64, u64),
+    now: i64,
 ) -> (u64, u64) {
     let d = minute_delta(prev, cur);
-    q.push_back(d);
+    q.push_back((now, d.0, d.1));
     trim_traffic(q);
     d
 }
@@ -456,7 +512,7 @@ mod tests {
         };
         m.insert(1, row(1, "trans-bt-tcp", 1000, 2000));
         m.insert(2, row(2, "trans-bt-tcp", 500, 500));
-        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut traffic: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen = seen_for_test();
         // 首轮建基线：只记 last，不 push 假点（根因→修法：旧代码 push (0,0)，
@@ -466,7 +522,9 @@ mod tests {
         m.get_mut(&1).unwrap().rx += 100;
         m.get_mut(&1).unwrap().tx += 200;
         super::tick_from_conns(&mut traffic, &mut last, &mut seen, &m);
-        assert_eq!(*traffic["snail-kkito/trans-bt-tcp"].back().unwrap(), (100, 200));
+        let last_pt = *traffic["snail-kkito/trans-bt-tcp"].back().unwrap();
+        assert_eq!((last_pt.1, last_pt.2), (100, 200));
+        assert!(last_pt.0 > 0, "线上 tick 点必须带真实 ts");
         // 其他 6 条隧道一行都没有
         assert_eq!(traffic.len(), 1);
     }
@@ -502,14 +560,14 @@ mod tests {
         // 空闲隧道（无流量、conns 表无该 tunnel 行）本轮不 push，保持旧点数；
         // 断流后恢复时补 0 点对齐，避免 WebUI 折线断裂。
         // 此单测定 tick 入口的过滤语义：只 push 有增量或有连接的行。
-        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
-        traffic.insert("h/idle".into(), [(1u64, 1u64)].into_iter().collect());
+        let mut traffic: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
+        traffic.insert("h/idle".into(), [(1700000000i64, 1u64, 1u64)].into_iter().collect());
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
         last.insert("h/idle".into(), (100, 100));
         // idle 无增量且本轮 conns 无此 tunnel：跳过，不 push
         let currents: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen = seen_with(&["h/idle"]);
-        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents, 0);
         assert_eq!(traffic["h/idle"].len(), 1);
     }
     #[test]
@@ -517,18 +575,18 @@ mod tests {
         // 回归：重启后 conns 累计从 0 重建，已见 key 首轮只建基线不 push。
         // 旧代码首轮 push (0,0) 假点，图表重启处多个 0 断崖；新语义序列保持为空，
         // 次轮才 push 真增量。
-        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut traffic: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen = seen_with(&["h/w"]);
         let currents: HashMap<String, (u64, u64)> = [("h/w".into(), (5000, 9000))].into();
         // 模拟重启：last 丢了但 seen 还在（随 traffic.json 读回）
-        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents, 0);
         assert!(traffic["h/w"].is_empty(), "首轮不应 push 假点");
         // 全新 key：同样只建基线
-        let mut traffic2: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut traffic2: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
         let mut last2: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen2 = seen_for_test();
-        super::tick_traffic(&mut traffic2, &mut last2, &mut seen2, &currents);
+        super::tick_traffic(&mut traffic2, &mut last2, &mut seen2, &currents, 0);
         assert!(traffic2["h/w"].is_empty());
         assert!(seen2.contains("h/w"));
     }
@@ -537,17 +595,33 @@ mod tests {
         // 根因→修法：60s tick 曾拿 agent 级累计 (rx,tx) 给该 agent 下每个
         // proxy 各 push 一份相同增量——snail 7 隧道 traffic.json 数组完全相同。
         // tick 输入必须是 per-tunnel 当前累计，各记各的增量。
-        let mut traffic: HashMap<String, VecDeque<(u64, u64)>> = HashMap::new();
+        let mut traffic: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
         let mut last: HashMap<String, (u64, u64)> = HashMap::new();
         last.insert("h/A".into(), (100, 200));
         last.insert("h/B".into(), (100, 200));
         let mut seen = seen_with(&["h/A", "h/B"]);
         let currents: HashMap<String, (u64, u64)> =
             [("h/A".into(), (150, 260)), ("h/B".into(), (100, 200))].into();
-        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents);
+        super::tick_traffic(&mut traffic, &mut last, &mut seen, &currents, 0);
         // A 只记自己的 50/60；B 无流量记 0（旧代码会给 B 也记 50/60）
-        assert_eq!(*traffic["h/A"].back().unwrap(), (50, 60));
-        assert_eq!(*traffic["h/B"].back().unwrap(), (0, 0));
+        assert_eq!((traffic["h/A"].back().unwrap().1, traffic["h/A"].back().unwrap().2), (50, 60));
+        assert_eq!((traffic["h/B"].back().unwrap().1, traffic["h/B"].back().unwrap().2), (0, 0));
+    }
+    #[test]
+    fn traffic_points_carry_wallclock_ts() {
+        // 根因→修法：流量点只存增量不存时间，api_traffic 用 now-len*60 反推，
+        // 重启/断流后旧点被画到错误时间（18:12 高峰实为 17 点旧账错位）。
+        // 新语义：每点带落盘时的 wall clock ts，重启读回后时间不错位。
+        let mut traffic: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
+        let mut last: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut seen = seen_for_test();
+        let t0: i64 = 1_760_933_880; // 2026-10-20 18:00:00 HKT 前后
+        super::tick_from_conns_at(&mut traffic, &mut last, &mut seen, &HashMap::from([("h/w".into(), (5000u64, 9000u64))]), t0);
+        super::tick_from_conns_at(&mut traffic, &mut last, &mut seen, &HashMap::from([("h/w".into(), (5100u64, 9200u64))]), t0 + 60);
+        let q = &traffic["h/w"];
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, t0 + 60, "点必须带 tick 的 wall clock ts");
+        assert_eq!((q[0].1, q[0].2), (100, 200));
     }
     #[test]
     fn traffic_pure_fns() {
@@ -555,9 +629,9 @@ mod tests {
         assert_eq!(super::traffic_key("h", "web"), "h/web");
         assert_eq!(super::minute_delta((100, 200), (150, 250)), (50, 50));
         assert_eq!(super::minute_delta((100, 200), (90, 250)), (0, 50)); // 回绕饱和
-        let v: VecDeque<(u64, u64)> = (0..10).map(|i| (i, i * 2)).collect();
+        let v: VecDeque<(i64, u64, u64)> = (0..10).map(|i| (0, i, i * 2)).collect();
         assert_eq!(super::rollup(&v, 3), (7 + 8 + 9, 14 + 16 + 18));
-        let mut big: VecDeque<(u64, u64)> = (0..43_300).map(|i| (i as u64, 0)).collect();
+        let mut big: VecDeque<(i64, u64, u64)> = (0..43_300).map(|i| (0, i as u64, 0)).collect();
         super::trim_traffic(&mut big);
         assert_eq!(big.len(), 43_200);
     }
@@ -591,7 +665,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let p = dir.join("traffic.json").to_str().unwrap().to_string();
         let s: S = Arc::new(Shared::default());
-        s.traffic.write().await.insert("h/web".into(), [(1u64, 2u64)].into_iter().collect());
+        s.traffic.write().await.insert("h/web".into(), [(1700000000i64, 1u64, 2u64)].into_iter().collect());
         super::save_traffic(&s, &p).await;
         let s2: S = Arc::new(Shared::default());
         super::load_traffic(&s2, &p).await;
