@@ -567,6 +567,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         }];
         assert_eq!(resolve_proxies(Some(want.clone()), vec![]).len(), 1);
         assert_eq!(resolve_proxies(Some(want.clone()), vec![])[0].name, "d");

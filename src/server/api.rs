@@ -570,6 +570,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         };
         assert!(validate_proxy(&ok_http).is_ok());
         let mut bad = ok_http.clone();

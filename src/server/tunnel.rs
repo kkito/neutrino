@@ -727,6 +727,7 @@ mod tests {
             link_agent: "agent1".into(),
             link_host: "10.0.0.1".into(),
             link_port: 3306,
+            rate_limit: None,
             domains: vec![],
             remote_port: 0,
             set_x_forwarded_proto: None,
@@ -747,6 +748,7 @@ mod tests {
             link_agent: "agent1".into(),
             link_host: "10.0.0.1".into(),
             link_port: 3306,
+            rate_limit: None,
             domains: vec![],
             remote_port: 0,
             set_x_forwarded_proto: None,
@@ -793,6 +795,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         };
         // 已收敛：不再 push
         assert!(!needs_config_push(&[p.clone()], &[p.clone()]));
