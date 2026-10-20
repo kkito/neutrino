@@ -740,6 +740,27 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
             };
             // internet -> agent (each datagram = one data frame)
             let payload = buf[..n].to_vec();
+            // udp 下行限速（收包方向）：按 port 查 proxy 快照，同映射共享 limiter；整包为一块。
+            // 根因→修法：udp 无连接概念、session per peer，窗口必须按映射共享（不能按 peer 建）。
+            // pick_port 式全表扫描已有同等开销在前（pick_port/owner 扫描），此处再查一次可接受。
+            {
+                let (key, bps) = {
+                    let ag = s2.agents.read().await;
+                    ag.values()
+                        .find_map(|h| {
+                            h.info.proxies.iter()
+                                .find(|p| p.enabled && p.remote_port == port && p.ptype == "udp")
+                                .map(|p| (crate::server::state::traffic_key(&h.info.hostname, &p.name), crate::server::ratelimit::limit_of(p.rate_limit.as_deref())))
+                        })
+                        .unwrap_or_default()
+                };
+                if let (false, Some(b)) = (key.is_empty(), bps) {
+                    let d = crate::server::ratelimit::limiter_for(&s2, &key, b).await.take(payload.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+            }
             // UDP 连接行 rx 累计 + since 刷新（peer 行线性查找）
             {
                 let peer_s = peer.to_string();

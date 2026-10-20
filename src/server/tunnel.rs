@@ -410,10 +410,36 @@ fn spawn_link_relay(
             s.conns.write().await.remove(&cid);
             return;
         };
+        // link 限速：双端都在 server，无本地 socket，上下行都吃 VPS 带宽 -> 双向共用同一 limiter（总量语义）。
+        // 查表以 server 存为准（与 resolve_link 同源）。
+        let link_limiter = {
+            let ag = s.agents.read().await;
+            let bps = ag.get(&entry_aid).and_then(|h| {
+                h.info.proxies.iter()
+                    .find(|p| p.enabled && p.ptype == "link" && p.name == link_name)
+                    .and_then(|p| crate::server::ratelimit::limit_of(p.rate_limit.as_deref()))
+            });
+            match bps {
+                Some(b) => {
+                    let host = ag.get(&entry_aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
+                    let key = crate::server::state::traffic_key(&host, &link_name);
+                    Some(crate::server::ratelimit::limiter_for(&s, &key, b).await)
+                }
+                None => None,
+            }
+        };
         let s_link = s.clone();
         let s_link2 = s.clone();
+        let ll1 = link_limiter.clone();
+        let ll2 = link_limiter.clone();
         let mut a2e = tokio::spawn(async move {
             while let Some(chunk) = drx_entry.recv().await {
+                if let Some(l) = &ll1 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
                 // link 连接行 rx 累计（入口 client -> 出口目标，tick 归集用）
                 if let Some(c) = s_link.conns.write().await.get_mut(&cid) {
                     c.rx += chunk.len() as u64;
@@ -425,6 +451,12 @@ fn spawn_link_relay(
         });
         let mut e2a = tokio::spawn(async move {
             while let Some(chunk) = drx_exit.recv().await {
+                if let Some(l) = &ll2 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
                 // link 连接行 tx 累计（出口目标 -> 入口 client，tick 归集用）
                 if let Some(c) = s_link2.conns.write().await.get_mut(&cid) {
                     c.tx += chunk.len() as u64;
