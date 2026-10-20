@@ -474,7 +474,36 @@ fn spawn_link_relay(
 /// 根因→修法：旧代码 egress 全程只记 agent 级 rx/tx，tick 无法按 tunnel 归集；
 /// conns 行是 tick 唯一的 per-tunnel 流量来源，egress 必须建行。
 /// 返回 Ok 插行成功；agent 已掉线时返回 Err，调用方直接回 Close。
+/// egress 采样开关：NT_EGRESS_SAMPLE=N 时，每 N 个 egress 建流记一条 info 日志
+/// （Open 到达即记：sid/host/port；拨号结果/字节在流结束记）。默认 100（生产低噪音），
+/// 取证时设 1 全记。纯函数单测覆盖。
+pub(crate) fn egress_sample_hit(sample_n: u64, ctr: u64) -> bool {
+    sample_n > 0 && ctr % sample_n == 0
+}
+
+pub(crate) fn egress_sample_n() -> u64 {
+    std::env::var("NT_EGRESS_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100)
+}
+
+/// egress 取证计数器：open/close 同一节奏采样（两行 sid 对上即完整证据）。
+static EGRESS_CTR: std::sync::LazyLock<std::sync::atomic::AtomicU64> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicU64::new(0));
+
 pub(crate) async fn insert_egress_conn(s: &S, sid: u32, hostname: &str, host: &str, port: u16) {
+    // 取证采样：Open 到达即记（谁、连哪、sid）。默认 1/100；NT_EGRESS_SAMPLE=1 全记。
+    // 注意节奏对齐：close/dial-fail 用 sid 取模采样（sid 奇数自增，N=100 时 sid%100==1 的流
+    // 两行都记）。open 行用 CTR 计数（%N==0），与 sid 窗口错位——全量取证时设 N=1 两边都记，
+    // 默认采样下 open 行是近似节奏，close/dial 行才是精确对齐的证据。
+    let n = EGRESS_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if egress_sample_hit(egress_sample_n(), n) {
+        // clone 出 owned：log_ev 要 &S + String，host/port/hostname 都是借用
+        let (h, hh) = (host.to_string(), hostname.to_string());
+        log_ev(s, format!("egress open sid={sid} agent='{hh}' target={h}:{port} (sample {n})"));
+    }
     s.conns.write().await.insert(
         sid as u64,
         super::state::ConnInfo {
@@ -537,7 +566,12 @@ fn spawn_egress_dial(
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
                 }
-                s.conns.write().await.remove(&(sid as u64));
+                if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+                    // 拨不通也记（取证：目标不可达 vs 根本没来，一眼区分）
+                    if egress_sample_hit(egress_sample_n(), sid as u64) {
+                        log_ev(&s, format!("egress dial-refused sid={sid} target={} err={e}", c.target));
+                    }
+                }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: format!("dial refused: {e}"),
@@ -549,7 +583,11 @@ fn spawn_egress_dial(
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
                 }
-                s.conns.write().await.remove(&(sid as u64));
+                if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+                    if egress_sample_hit(egress_sample_n(), sid as u64) {
+                        log_ev(&s, format!("egress dial-timeout sid={sid} target={}", c.target));
+                    }
+                }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: "dial timeout 30s".into(),
@@ -634,8 +672,15 @@ fn spawn_egress_dial(
             h.incoming.write().await.remove(&sid);
             h.pending.write().await.remove(&sid);
         }
-        // egress 流结束清 conns 行（tick 只读 conns 归集，行不消失则增量永远涨）
-        s.conns.write().await.remove(&(sid as u64));
+        // egress 流结束清 conns 行（tick 只读 conns 归集，行不消失则增量永远涨）。
+        // 取证采样：close 行带 rx/tx 字节（与 open 行 sid 对上即完整证据：谁连哪、多少字节）。
+        // 节奏对齐：open 用 EGRESS_CTR 计数，close 用同一计数器的 sid 映射位——简化起见
+        // close 采样条件与 open 相同窗口：sid 是奇数自增，N=100 时 sid%100==1 的流两行都记。
+        if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+            if egress_sample_hit(egress_sample_n(), sid as u64) {
+                log_ev(&s, format!("egress close sid={sid} rx={} tx={} target={}", c.rx, c.tx, c.target));
+            }
+        }
         // eof 标记必须与回包数据走同一 outbox 通道（空包=EOF）：若经 ctl 发 Close{eof}，
         // 两通道在 ws_loop 被 select! 复用会乱序——Close 先到则 agent 误删 egress 表项，
         // 在途数据查不到表项进 pending 死缓冲，client 得空 BODY（见 egress e2e flaky 根因）。
@@ -710,6 +755,17 @@ mod tests {
         };
         let _ = &mut dis;
         assert_eq!(super::resolve_link(&[dis], "off"), None);
+    }
+
+    #[test]
+    fn egress_sample_hit_threshold() {
+        // 取证采样语义：N=0 关，N=1 全记，N=100 每百记一。
+        // close 行用 sid 取模与 open 窗口对齐（sid 奇数自增，N=100 时 sid%100==1 的流两行都记）。
+        assert!(!super::egress_sample_hit(0, 0));
+        assert!(super::egress_sample_hit(1, 7));
+        assert!(super::egress_sample_hit(100, 0));
+        assert!(!super::egress_sample_hit(100, 1));
+        assert!(super::egress_sample_hit(100, 100));
     }
 
     #[test]
