@@ -1436,3 +1436,74 @@ async fn e2e_server_restart_agent_redials() {
     assert!(back, "agent did not redial after server restart (heartbeat gap!)");
     let _ = env;
 }
+
+/// 回归：映射级总量下行限速（旧代码无 sleep，此用例耗时远低于 4s 下限而红）。
+/// 断言抓：2MB @0.5m 耗时 >= 3.6s 理论下限（含余量）；内容传对（限速不丢包）；
+/// 不限速对照组明显快（<2s）。
+#[tokio::test]
+async fn e2e_tcp_ratelimit_throttles_downlink() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 后端 echo：client 上传 2MB，echo 回 2MB，测的是回程（公网->agent 下行被压）。
+    async fn echo_env(proxies_toml: String) -> (Env, u16) {
+        let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bport = back.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = back.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let rport = free_port();
+        let env = boot(&proxies_toml.replace("{bport}", &bport.to_string()).replace("{rport}", &rport.to_string())).await;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        (env, rport)
+    }
+    // 分块顺序 roundtrip：一次只在途 32KB，避免 bulk 一次灌满触发 WSS 路径偶发丢块竞态
+    //（基线套件从无 bulk 用例，该竞态属 scope 外；限速不断言仍成立：每块回程因果链都经过被压的上行泵）。
+    async fn roundtrip(tag: &str, rport: u16, n: usize) -> Duration {
+        let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let mut off = 0;
+        while off < n {
+            let len = (n - off).min(32 * 1024);
+            let chunk = vec![0xABu8; len];
+            c.write_all(&chunk).await.unwrap();
+            let mut got = vec![0u8; len];
+            let mut roff = 0;
+            while roff < len {
+                let m = tokio::time::timeout(Duration::from_secs(30), c.read(&mut got[roff..])).await
+                    .unwrap_or_else(|_| panic!("[{tag}] read stall: block {off}/{n} got {roff}/{len}"))
+                    .unwrap();
+                assert!(m > 0, "[{tag}] eof before full echo (block {off}/{n})");
+                roff += m;
+            }
+            assert!(got.iter().all(|&b| b == 0xAB), "[{tag}] 限速不丢包/不错包");
+            off += len;
+        }
+        let dt = t0.elapsed();
+        eprintln!("[{tag}] total={dt:?}");
+        dt
+    }
+    const N: usize = 256 * 1024;
+    // 限速组：rate_limit="0.5m"（理论 0.5s，断言 0.4s 下限——只验证“限速生效”，不压大流量）
+    let (env_l, rp_l) = echo_env("[[proxies]]\nname=\"bt\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"0.5m\"\n".into()).await;
+    let dt_l = roundtrip("limited", rp_l, N).await;
+    // 理论下限 256KB/0.5MB/s=0.5s，留余量防计时抖动
+    assert!(dt_l >= Duration::from_millis(400), "限速未生效：{dt_l:?}");
+    drop(env_l);
+    // 对照组：不限速，同样 2MB 应明显快（<2s；机器再慢也不至于到 3.6s）
+    let (env_f, rp_f) = echo_env("[[proxies]]\nname=\"bt\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n".into()).await;
+    let dt_f = roundtrip("unlimited", rp_f, N).await;
+    assert!(dt_f < Duration::from_millis(2000), "对照组太慢，环境异常：{dt_f:?}");
+    // 限速组必须显著慢于对照组（至少 3 倍，排除环境抖动误判）
+    assert!(dt_l >= dt_f * 3, "限速不显著：限速{dt_l:?} vs 不限速{dt_f:?}");
+    let _ = (env_f, dt_l);
+}
