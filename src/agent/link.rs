@@ -62,6 +62,9 @@ use crate::common::proto::{encode_data, ClientMsg};
 use crate::common::quic::encode_frame;
 
 static CTR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+// kudus link 专用 sid 计数器：与 WSS CTR 同奇数序列但基址错开（避免与 egress_streams
+// 全局表里其他 kudus 流 sid 碰撞——deliver 按 sid 查表，撞车即错投对方泵导致双端 hang）。
+static CTR_KUDUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x10000001);
 
 /// Config 同步 link 监听：新 link 起 serve_link，消失的 abort，session 级持有。
 /// 根因→修法：监听与 session 同命——重连即全量重建，不残留旧监听。
@@ -259,7 +262,13 @@ async fn serve_link_quic(link_name: String, bind: String, holder: super::egress:
 
 async fn handle_link_conn_with(inbound: TcpStream, link_name: String, tx: &Tx) -> anyhow::Result<()> {
     // sid 取奇数：server 偶数 sid，避免碰撞（同 egress）。
-    let sid = CTR.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1;
+    // kudus 走独立计数器：link 与 pump_tcp（open_stream 同 egress_streams 全局表）
+    // 共享 sid 命名空间，基址错开防撞车错投（已现网踩坑：首流 sid=1 双泵互投 hang）。
+    let sid = if matches!(tx, Tx::Kudus(_)) {
+        CTR_KUDUS.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1
+    } else {
+        CTR.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1
+    };
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     super::egress::egress_streams().write().await.insert(sid, dtx);
     // host=link名（server 以此查表，port 忽略）；目标以 server 存为准。

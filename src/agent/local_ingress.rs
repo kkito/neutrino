@@ -102,18 +102,34 @@ async fn handle_conn(
     let proxies = status.read().await.proxies.clone();
     let http_names: Vec<String> = proxies
         .iter()
-        .filter(|p| p.ptype == "http" && p.enabled)
+        .filter(|p| p.enabled && (p.ptype == "http" || p.ptype == "link"))
         .map(|p| p.name.clone())
         .collect();
     let label = strip_ingress_name(&host, suffix);
     let proxy = label.as_deref().and_then(|l| {
-        proxies.iter().find(|p| p.ptype == "http" && p.enabled && p.name == *l)
+        proxies
+            .iter()
+            .find(|p| p.enabled && p.name == *l && (p.ptype == "http" || p.ptype == "link"))
     });
     let Some(p) = proxy.cloned() else {
         let (code, body) = directory_page(&http_names);
         respond(&mut inbound, code, "text/plain", &[], &body).await?;
         return Ok(());
     };
+    // link 隧道：纯 TCP 转发到本机 link 入口监听（http 语义由远端出口处理；无 auth/XFP）。
+    if p.ptype == "link" {
+        let mut up = match tokio::net::TcpStream::connect((p.local_ip.as_str(), p.local_port)).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!("local ingress link dial {}:{} failed: {e:#}", p.local_ip, p.local_port);
+                respond(&mut inbound, 502, "text/plain", &[], b"agent dial refused\n").await?;
+                return Ok(());
+            }
+        };
+        up.write_all(&buf).await?;
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut up).await;
+        return Ok(());
+    }
     // 头收集成 HeaderMap（basic_auth 校验用；与 server 入口同语义）
     let mut headers = http::HeaderMap::new();
     for ln in head_str.lines().skip(1) {

@@ -22,12 +22,27 @@ pub(crate) struct Pkt {
     pub(crate) out: mpsc::UnboundedSender<Vec<u8>>,
     pub(crate) key: [u8; 32],
     pub(crate) session: u32,
-    pub(crate) next_seq: Arc<std::sync::atomic::AtomicU32>,
+    // 可靠发送上下文：重传缓冲 + 对端 ACK 快照（累计+sack，收包侧更新）。
+    // 根因→修法：旧 next_seq 发完即忘，跨机丢包即永久少块（avatar/blob 截断）；
+    // 现 DATA 帧先进 retx 登记、ACK 清、超时重发。seq 0 保留（SYN/FIN/纯 ACK）。
+    pub(crate) rel: Arc<std::sync::Mutex<RelSend>>,
+}
+
+pub(crate) struct RelSend {
+    retx: crate::common::kudus::RetxBuf,
+    ack: u32,
+    sack: [u8; 32],
+}
+
+impl RelSend {
+    pub(crate) fn new() -> Self {
+        Self { retx: crate::common::kudus::RetxBuf::new(1), ack: 0, sack: [0u8; 32] }
+    }
 }
 
 impl Pkt {
-    pub(crate) fn send(&self, flags: u8, ack: u32, sack: [u8; 32], body: &[u8]) -> anyhow::Result<()> {
-        let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// 组一帧 datagram 并经写泵发出（调用方已定好 flags/seq/ack/sack）。
+    fn emit(&self, flags: u8, seq: u32, ack: u32, sack: [u8; 32], body: &[u8]) -> anyhow::Result<()> {
         let h = KudusHdr { ver: 1, flags, seq, ack, sack, ts_ms: now_ms() };
         let mut plain = encode_hdr(&h).to_vec();
         plain.extend_from_slice(body);
@@ -40,21 +55,63 @@ impl Pkt {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
     }
+    fn ack_snap(&self) -> (u32, [u8; 32]) {
+        let r = self.rel.lock().unwrap();
+        (r.ack, r.sack)
+    }
+    /// 发一帧当前 ACK 快照（收包回执用；纯 ACK 不占可靠序列）。
+    pub(crate) fn send_ack_only(&self) {
+        let (ack, sack) = self.ack_snap();
+        let _ = self.emit(FLAG_ACK, 0, ack, sack, &[]);
+    }
+    /// 对端 ACK 到达：清重传缓冲。
+    pub(crate) fn on_ack(&self, ack: u32, sack: [u8; 32]) {
+        self.rel.lock().unwrap().retx.on_ack(ack, &sack);
+    }
+    /// 收包侧推进 ACK 快照（主循环从重排缓冲取 ack()/sack() 后调用）。
+    pub(crate) fn set_ack(&self, ack: u32, sack: [u8; 32]) {
+        let mut r = self.rel.lock().unwrap();
+        r.ack = ack;
+        r.sack = sack;
+    }
+    /// 超时包：吐出待重传 (seq,body)，调用方原样重发。
+    pub(crate) fn take_expired(&self) -> Vec<(u32, Vec<u8>)> {
+        self.rel.lock().unwrap().retx.take_expired(crate::common::kudus::KUDUS_RTO, now_ms())
+    }
+    pub(crate) fn send(&self, flags: u8, _ack: u32, _sack: [u8; 32], body: &[u8]) -> anyhow::Result<()> {
+        if flags & FLAG_DATA != 0 {
+            // 可靠 DATA：登记重传后发（捎带当前收包 ACK 快照）。
+            let seq = self.rel.lock().unwrap().retx.on_send(body.to_vec());
+            let (ack, sack) = self.ack_snap();
+            self.emit(flags, seq, ack, sack, body)
+        } else {
+            let (ack, sack) = self.ack_snap();
+            self.emit(flags, 0, ack, sack, body)
+        }
+    }
+    /// 指定 seq 原样重发（重传泵用，不重新登记、不占新 seq）。
+    pub(crate) fn resend(&self, seq: u32, body: &[u8]) {
+        let (ack, sack) = self.ack_snap();
+        let _ = self.emit(FLAG_DATA, seq, ack, sack, body);
+    }
     pub(crate) fn send_ctrl(&self, m: &ClientMsg) -> anyhow::Result<()> {
         let j = serde_json::to_vec(m)?;
         self.send(FLAG_DATA, 0, [0u8; 32], &j)
     }
     /// 字节流发送（TCP/HTTP/egress/link）：按 [`KUDUS_DATA_CHUNK`] 切片，
-    /// 每片独立 DATA 帧独立 seq（v1 无重排缓冲，依赖链路保序；loopback 实测保序）。
+    /// 每片独立 DATA 帧独立 seq（接收侧重排缓冲保序，跨机乱序/丢包可恢复）。
     /// 根因→修法：泵单次 read 可达 32KB，单 datagram 装不下会整包丢（静默断流），
     /// 必须在此切片；UDP 数据报语义不可切（见下 `send_udp`）。
+    /// 注意：agent 上行 TCP 同样先套 dgram 帧（与 server 下行对称），否则 server 读循环
+    /// decode_dgram 拆帧错位——e2e 里 got 0 即上行 256KB 全被当成坏帧丢了。
     pub(crate) fn send_data_stream(&self, sid: u32, chunk: &[u8]) {
         if chunk.is_empty() {
             let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
             return;
         }
         for piece in chunk.chunks(KUDUS_DATA_CHUNK) {
-            if self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, piece)).is_err() {
+            let inner = crate::common::quic::encode_dgram(piece);
+            if self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &inner)).is_err() {
                 break;
             }
         }
@@ -94,8 +151,21 @@ pub(crate) async fn session(
         out: out_tx.clone(),
         key,
         session: session_id,
-        next_seq: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        rel: Arc::new(std::sync::Mutex::new(RelSend::new())),
     };
+    // 重传泵：50ms 扫一次超时未确认包，原样重发（带当前 ACK 快照）。
+    {
+        let p = pkt.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                iv.tick().await;
+                for (seq, body) in p.take_expired() {
+                    p.resend(seq, &body);
+                }
+            }
+        });
+    }
     *kudus_out.write().await = Some(pkt.clone());
     let ctx = Arc::new(KCtx {
         proxies: RwLock::new(cfg.proxies.clone()),
@@ -118,9 +188,12 @@ pub(crate) async fn session(
     let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<(KudusHdr, Vec<u8>)>();
     let rsock = sock.clone();
     let rkey = key;
-    let reader = tokio::spawn(async move {
+    let rpkt = pkt.clone();
+    let reader = tokio::spawn(async move { 
+        let pkt = rpkt; // 读泵内 ACK/重排专用克隆（主循环仍持有一份）
         let mut buf = vec![0u8; 2048];
-        let mut win = crate::server::kudus::SeqWindow::new(0);
+        // server 下行 seq 从 KUDUS_SEQ_GAP 起跳（与 agent 上行 seq 域隔离，见 common 注释）。
+        let mut rxbuf = crate::common::kudus::ReorderBuf::new(crate::common::kudus::KUDUS_SEQ_GAP);
         loop {
             let n = match rsock.recv(&mut buf).await {
                 Ok(n) => n,
@@ -141,7 +214,23 @@ pub(crate) async fn session(
             if !crate::server::kudus::ts_fresh(h.ts_ms) {
                 continue;
             }
-            if h.flags & FLAG_DATA != 0 && !win.check(h.seq) {
+            // ACK 处理：所有包（DATA/ACK/控制）都可能捎带 ack，清重传缓冲。
+            // 根因→修法：旧代码 ack=0 发完即忘，对端 ACK 也没人读，重传无从触发。
+            pkt.on_ack(h.ack, h.sack);
+            if h.flags & FLAG_DATA != 0 {
+                // 纯 ACK/DATA 的 ack 域直接进重传缓冲（捎带确认）。
+                // 根因→修法：旧代码只读了重排没读确认，重传永远不清、洞永远不补。
+                // 注意：重排窗口锚定 KUDUS_SEQ_GAP，只收 server 下行 DATA；
+                // server 15s 心跳 Ping 走控制面（同样 FLAG_DATA 帧但 seq=下行序列），同样进窗保序。
+                let ready = rxbuf.push(h.seq, body.to_vec());
+                for body in ready {
+                    if dec_tx.send((h, (body))).is_err() {
+                        break;
+                    }
+                }
+                // 重排推进即更新 ACK 快照 + 立刻回纯 ACK（丢包即 SACK 催补）。
+                pkt.set_ack(rxbuf.ack(), rxbuf.sack());
+                pkt.send_ack_only();
                 continue;
             }
             if dec_tx.send((h, body.to_vec())).is_err() {
@@ -224,8 +313,12 @@ pub(crate) async fn session(
                     let _ = pkt.send_ctrl(&ClientMsg::Pong { ts });
                 }
                 ServerMsg::Close { stream, .. } => {
+                    // server eof 语义（与 WSS/QUIC 对齐）：主表删后，link/egress 泵侧推空包
+                    // 触发 to_local 退出；纯删表不推包会导致 client 侧 hang 住不断（已现网踩坑）。
                     ctx.streams.write().await.remove(&stream);
-                    super::egress::egress_streams().write().await.remove(&stream);
+                    if let Some(tx) = super::egress::egress_streams().write().await.remove(&stream) {
+                        let _ = tx.send(vec![]);
+                    }
                 }
                 ServerMsg::Config { proxies } => {
                     *ctx.proxies.write().await = proxies.clone();
@@ -244,16 +337,13 @@ pub(crate) async fn session(
         }
         if let Some((id, payload)) = decode_data(&body) {
             // server 下行统一 dgram 套帧（TCP 切片亦套帧保边界，与 quic 读循环对称）：
-            // 逐个拆投；非 dgram 即裸字节（兼容控制面空包/EOF）。
-            let mut off = 0;
-            let mut delivered = false;
-            while let Some((dg, used)) = decode_dgram(&payload[off..]) {
-                off += used;
-                delivered = true;
-                deliver(&ctx, id, dg).await;
-            }
-            if !delivered {
-                deliver(&ctx, id, payload).await;
+            // 单 datagram 单帧，frame = [sid][dgram(len+payload)]，拆一层即得整片；
+            // 非 dgram 即裸字节（兼容控制面空包/EOF）。重排补齐攒出的多包在读泵已逐个
+            // 投进 dec 通道，到这里每次 body 恰一帧——无需合并，直接拆一次。
+            if let Some((dg, _)) = decode_dgram(payload) {
+                deliver(&ctx, id, dg.to_vec()).await;
+            } else {
+                deliver(&ctx, id, payload.to_vec()).await;
             }
         }
     }
@@ -268,15 +358,18 @@ pub(crate) async fn session(
     anyhow::Ok(())
 }
 
-async fn deliver(ctx: &Arc<KCtx>, id: u32, payload: &[u8]) {
+async fn deliver(ctx: &Arc<KCtx>, id: u32, payload: Vec<u8>) {
     if let Some(tx) = ctx.streams.read().await.get(&id).cloned() {
-        let _ = tx.send(payload.to_vec());
-    } else if payload.is_empty() && super::egress::egress_streams().read().await.contains_key(&id) {
-        super::egress::egress_streams().write().await.remove(&id);
+        let _ = tx.send(payload);
+    } else if payload.is_empty() {
+        // 空载荷 = server eof 标记：删表 + 推空包触发 to_local 退出（同 Close 分支）。
+        if let Some(tx) = super::egress::egress_streams().write().await.remove(&id) {
+            let _ = tx.send(vec![]);
+        }
     } else if let Some(tx) = super::egress::egress_streams().read().await.get(&id).cloned() {
-        let _ = tx.send(payload.to_vec());
+        let _ = tx.send(payload);
     } else {
-        ctx.pending.write().await.entry(id).or_default().push(payload.to_vec());
+        ctx.pending.write().await.entry(id).or_default().push(payload);
     }
 }
 
@@ -301,7 +394,18 @@ async fn open_stream(
         return open_udp_stream(ctx, pkt, sid, port).await;
     }
     if kind == "link" {
-        let local = TcpStream::connect((host.as_str(), port)).await?;
+        // 出口 dial：server 侧 resolve_link 已把 host/port 换成真实目标
+        // （link 出口 agent 无需查表，直接拨）。失败即回 Close{link denied}。
+        let local = match TcpStream::connect((host.as_str(), port)).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("kudus link egress dial {host}:{port} failed: {e:#}");
+                let c = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+                let _ = pkt.send_ctrl(&c);
+                return Ok(());
+            }
+        };
+        tracing::debug!("kudus link egress stream {sid} -> {host}:{port}");
         return pump_tcp(ctx, pkt, sid, local, false).await;
     }
     let proxies = ctx.proxies.read().await.clone();

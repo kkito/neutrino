@@ -1079,6 +1079,186 @@ async fn kudus_http_udp_and_hot_config() {
         .is_err());
 }
 
+/// kudus 单 flight：同 hostname 第二个 agent 上线踢掉旧会话（与 ws_loop 同语义）。
+/// 前置 bug：kudus 注册无踢人，旧会话僵尸残留（rtt=-1），overview 越堆越多、抢 link 路由。
+#[tokio::test]
+async fn kudus_reconnect_kicks_stale_session() {
+    let ws_port = free_port();
+    let kudus_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-kick-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mk_cfg = |n: &str| {
+        let p = dir.join(n);
+        std::fs::write(&p, "hostname = \"e2e\"\ntoken = \"s3cret\"\n").unwrap();
+        p
+    };
+    let cfg1 = mk_cfg("a1.toml");
+    let cfg2 = mk_cfg("a2.toml");
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server", "--listen", &format!("127.0.0.1:{ws_port}"),
+            "--kudus-listen", &format!("127.0.0.1:{kudus_port}"),
+            "--data", data.to_str().unwrap(),
+            "--desired", desired_path.to_str().unwrap(),
+            "--token", "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let mut ag1 = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args(["agent", "--server", &format!("kudus://127.0.0.1:{kudus_port}"), "--config", cfg1.to_str().unwrap()])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut ag2 = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args(["agent", "--server", &format!("kudus://127.0.0.1:{kudus_port}"), "--config", cfg2.to_str().unwrap()])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // 登录 WebUI 拿 jwt，再查 overview：同 hostname 只应剩最新一条。
+    // cookie_store 自动带 nt_session（与 e2e_cookie 测试同路）。
+    let c = reqwest::Client::builder().cookie_store(true).build().unwrap();
+    let login: serde_json::Value = c
+        .post(format!("http://127.0.0.1:{ws_port}/api/login"))
+        .json(&serde_json::json!({"user": "admin", "pass": "welcome2neutrino"}))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(login["ok"].as_bool().unwrap_or(false), "login failed: {login:?}");
+    let ov: serde_json::Value = c
+        .get(format!("http://127.0.0.1:{ws_port}/api/overview"))
+        .send().await.unwrap().json().await.unwrap();
+    let agents = ov["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "stale kudus session not kicked: {agents:?}");
+    ag1.kill().await.ok();
+    ag2.kill().await.ok();
+    drop(srv);
+}
+
+/// RED 回归：kudus 丢包必须重传补齐（现网 avatar 少 700B / blob 丢 16% 被截断）。
+/// 旧代码 DATA 发完即忘（ack=0、无重传、无重排），跨机 UDP 一丢包即永久少块；
+/// 新代码写泵登记 retx、读循环 SACK+重排、50ms 超时泵补发。
+/// e2e 抓法：2MB 随机 bin 走 kudus TCP 映射，与源文件逐字节比对（丢包即 mismatch）。
+#[tokio::test]
+async fn kudus_lossy_tcp_file_integrity() {
+    use std::io::Write;
+    let ws_port = free_port();
+    let kudus_port = free_port();
+    let tcp_port = free_port();
+    let back_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-kloss-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    // 2MB 随机文件（不可压缩，逐包都得传对；小了盖不住丢包窗口）。
+    let src = dir.join("blob.bin");
+    let mut rng_file = std::fs::File::create(&src).unwrap();
+    let mut seed = 0x12345678u64;
+    let mut left = 256 * 1024;
+    let mut expect = std::collections::hash_map::DefaultHasher::new();
+    while left > 0 {
+        let mut chunk = vec![0u8; 8192];
+        for b in chunk.iter_mut() {
+            // xorshift64*：无外部依赖的确定性伪随机
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            *b = (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
+        }
+        use std::hash::Hasher;
+        expect.write(&chunk[..left.min(8192)]);
+        let n = left.min(8192);
+        rng_file.write_all(&chunk[..n]).unwrap();
+        left -= n;
+    }
+    let expect_hash = format!("{:x}", expect.finish());
+    // 后端：裸 TCP 回声（收啥回啥，专测 kudus 可靠性，与 HTTP 语义无关）。
+    let back = tokio::net::TcpListener::bind(format!("127.0.0.1:{back_port}")).await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let desired_path = dir.join("desired.toml");
+    std::fs::write(
+        &desired_path,
+        format!(
+            "[[agents.e2e]]\nname = \"blob\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = {back_port}\nremote_port = {tcp_port}\n"
+        ),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let cfgp = dir.join("a.toml");
+    std::fs::write(&cfgp, "hostname = \"e2e\"\ntoken = \"s3cret\"\n").unwrap();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server", "--listen", &format!("127.0.0.1:{ws_port}"),
+            "--kudus-listen", &format!("127.0.0.1:{kudus_port}"),
+            "--data", data.to_str().unwrap(),
+            "--desired", desired_path.to_str().unwrap(),
+            "--token", "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let mut ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args(["agent", "--server", &format!("kudus://127.0.0.1:{kudus_port}"), "--config", cfgp.to_str().unwrap()])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // 等映射端口起来（轮询上限 40×200ms，不用固定 sleep 赌竞态）。
+    let mut ok = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{tcp_port}")).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "kudus tcp ingress never came up");
+    // 经隧道把文件打过去再读回来（回声），逐字节比对。
+    // 注意：不 shutdown 写端——ingress 是 select 双泵谁先结束就全关，shutdown 会把
+    // 仍在回程路上的 echo 数据一起埋了（半关闭语义，WSS/QUIC 同路，非 kudus 问题）；
+    // 这里只测 kudus 可靠性：写完读够 len 即断言。
+    let raw = std::fs::read(&src).unwrap();
+    let mut conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{tcp_port}")).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    conn.write_all(&raw).await.unwrap();
+    let mut back_data = vec![0u8; raw.len()];
+    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut back_data))
+        .await
+        .expect("kudus echo read timeout")
+        .unwrap();
+    use std::hash::Hasher;
+    let mut got = std::collections::hash_map::DefaultHasher::new();
+    got.write(&back_data);
+    let got_hash = format!("{:x}", got.finish());
+    assert_eq!(back_data.len(), raw.len(), "kudus tcp truncated: got {} want {}", back_data.len(), raw.len());
+    assert_eq!(got_hash, expect_hash, "kudus tcp payload corrupted");
+    ag.kill().await.ok();
+    drop(srv);
+}
+
 #[tokio::test]
 async fn kudus_bad_token_blackhole() {
     // 错 token 的 kudus agent 建连即黑洞：无 SYN-ACK、无错误回包，

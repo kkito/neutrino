@@ -56,7 +56,8 @@ async fn pick_port(s: &S, port: u16, kind: &str) -> Option<String> {
                     && p.remote_port == port
                     && (p.ptype == kind
                         || (kind == "tcp" && p.ptype == "https")
-                        || (kind == "https" && p.ptype == "tcp"))
+                        || (kind == "https" && p.ptype == "tcp")
+                        || (kind == "tcp" && p.ptype == "http"))
             })
         });
         if ok == Some(true) {
@@ -612,6 +613,8 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         if let Some(h) = s3.agents.read().await.get(&aid) {
                             h.incoming.write().await.insert(sid, dtx);
                         }
+                        // tcp 入口必须 kind="tcp"（agent 按 remote_port 查表；kind="http"
+                        // 走域名查表、空 host 直接 no route 关流——已现网踩坑）。
                         let _ = ctl.send(ServerMsg::Open {
                             stream: sid,
                             kind: "tcp".into(),

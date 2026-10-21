@@ -29,39 +29,18 @@ pub(crate) fn ts_fresh(ts_ms: u64) -> bool {
     now.abs_diff(ts_ms) <= 60_000
 }
 
-/// seq 去重窗口：已见过/低于左沿即重放，返回 false。
-pub(crate) struct SeqWindow {
-    base: u32,
-    seen: std::collections::HashSet<u32>,
+/// 发送侧可靠上下文（server→agent 下行）：重传缓冲 + 对端 ACK 快照。
+/// 与 agent 侧 `Pkt::rel` 对称：写泵登记、读循环清、超时泵重发。
+/// server 下行 seq 起点必须跳过 agent 上行已用区间（见 KUDUS_SEQ_GAP）。
+pub(crate) struct ServerRel {
+    pub(crate) retx: crate::common::kudus::RetxBuf,
+    pub(crate) ack: u32,
+    pub(crate) sack: [u8; 32],
 }
 
-impl SeqWindow {
-    pub(crate) fn new(base: u32) -> Self {
-        Self { base, seen: std::collections::HashSet::new() }
-    }
-    /// 新 seq 返回 true；重放/过旧返回 false。
-    pub(crate) fn check(&mut self, seq: u32) -> bool {
-        if self.seen.contains(&seq) || seq == self.base {
-            return false;
-        }
-        let d = seq.wrapping_sub(self.base);
-        if d >= 0x8000_0000 {
-            return false; // base 之后绕回来的旧 seq：重放/过旧
-        }
-        if d > 1024 {
-            // 大步前跳：窗口前移（丢包太多或初值跳变），旧表清空。
-            self.base = seq;
-            self.seen.clear();
-            self.seen.insert(seq);
-            return true;
-        }
-        self.seen.insert(seq);
-        if self.seen.len() > 2048 {
-            self.base = seq;
-            self.seen.clear();
-            self.seen.insert(seq);
-        }
-        true
+impl ServerRel {
+    pub(crate) fn new() -> Self {
+        Self { retx: crate::common::kudus::RetxBuf::new(crate::common::kudus::KUDUS_SEQ_GAP), ack: 0, sack: [0u8; 32] }
     }
 }
 
@@ -73,6 +52,22 @@ struct Tx {
     peer: Arc<std::sync::RwLock<SocketAddr>>,
     key: [u8; 32],
     session: u32,
+}
+
+/// 写泵用可靠发送：DATA 帧登记重传（seq 分配 + 捎带 ACK 快照），
+/// 控制/FIN 等非 DATA 帧原样发（不占可靠序列）。
+/// 根因→修法：旧写泵全部 ack=0 发完即忘，跨机丢包即截断；现登记+ACK清+超时补。
+fn rel_emit(tx: &Tx, rel: &std::sync::Mutex<ServerRel>, flags: u8, body: &[u8]) -> bool {
+    let (seq, ack, sack) = if flags & FLAG_DATA != 0 {
+        let s = rel.lock().unwrap().retx.on_send(body.to_vec());
+        let r = rel.lock().unwrap();
+        (s, r.ack, r.sack)
+    } else {
+        let r = rel.lock().unwrap();
+        (0, r.ack, r.sack)
+    };
+    let h = KudusHdr { ver: 1, flags, seq, ack, sack, ts_ms: now_ms() };
+    tx.send_pkt(&h, body)
 }
 
 impl Tx {
@@ -109,6 +104,7 @@ async fn handle_conn(
     // 注意：超时/错 token 一律静默返回（黑洞，无回包无事件，见 design §2）；
     // 仅 debug 留痕（默认 info 不可见），方便 RUST_LOG=debug 排错。
     let (mut hostname, mut version) = (String::new(), String::new());
+    // 握手收包同样做 ACK/去重（SYN 重传去重靠 ReorderBuf 之前置的 win 即可，此处轻量处理）。
     let hello_ok = loop {
         match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
             Ok(Some((p, h, body))) => {
@@ -138,6 +134,34 @@ async fn handle_conn(
     if !hello_ok {
         tracing::debug!("kudus hello timeout session={session:08x}");
         return;
+    }
+    // 单 flight：同 hostname 旧会话先踢掉，保证路由唯一（与 ws_loop 同语义）。
+    // 根因→修法：kudus 无连接，旧 agent 断网/重启后 server 侧残留僵尸行（rtt=-1），
+    // 新会话并存抢路由、overview 越堆越多。Hello 到达即抢路由：清旧行 + 路由引用 + 通知。
+    {
+        let stale: Vec<String> = {
+            let ag = s.agents.read().await;
+            crate::server::state::stale_ids_for_hostname(
+                &ag.iter().map(|(id, h)| (id.clone(), h.info.hostname.clone())).collect(),
+                &hostname,
+            )
+        };
+        for old in stale {
+            if let Some(h) = s.agents.read().await.get(&old) {
+                // Error 即整 session 致命（agent 侧 bail → 外层重连），与 ws_loop 踢人同语义；
+                // Close{stream:0} 语义不明（agent 只删流表，0 不在表里）旧 agent 踢不动。
+                let _ = h.ctl.send(ServerMsg::Error { reason: "superseded by new session".into() });
+            }
+            s.agents.write().await.remove(&old);
+            s.outbox.write().await.remove(&old);
+            for v in s.domains.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            for v in s.tcp_ports.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            log_ev(&s, format!("kudus agent '{hostname}' superseded stale session {old}"));
+        }
     }
     // 注册：与 quic.rs/ws_loop 同一套 agents/outbox/incoming/pending 表。
     let agent_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -232,22 +256,24 @@ async fn handle_conn(
             }
         });
     }
-    // 收发循环：读包（解密在分发层已做）→ 控制/数据分发；写泵（ctl/outbox→datagram）。
-    let mut win = SeqWindow::new(0);
+    // 收发循环：读包（解密在分发层已做）→ 控制/数据分发；写泵（ctl/outbox→datagram，可靠登记）。
+    // 上行（agent→server）seq 从 1 开始，重排缓冲同锚（agent 上行首帧 SYN seq=0 不可靠）。
+    let mut rxbuf = crate::common::kudus::ReorderBuf::new(1);
+    let rel = Arc::new(std::sync::Mutex::new(ServerRel::new()));
     let mut fin_acked = false;
-    // 写泵 task：ctl 与 outbox 各自封包发送。
+    // 写泵 task：ctl 与 outbox 各自可靠封包发送（rel_emit 登记重传）。
+    // 注意：单 datagram 单 DATA 帧（1 包 1 帧）：agent 读泵按 seq 重排，多帧合包
+    // 会导致帧边界丢失（decode_data 只取首帧，整包余下字节被吞——undo 里 got 0 的根因之一）。
     let txw = tx.clone();
+    let relw = rel.clone();
     let aidw = agent_id.clone();
     let sw = s.clone();
     let write_task = tokio::spawn(async move {
-        let mut seq: u32 = 1;
         loop {
             tokio::select! {
                 Some(m) = ctl_rx.recv() => {
                     let t = serde_json::to_string(&m).unwrap();
-                    let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
-                    seq = seq.wrapping_add(1);
-                    if !txw.send_pkt(&h, t.as_bytes()) { break; }
+                    if !rel_emit(&txw, &relw, FLAG_DATA, t.as_bytes()) { break; }
                 }
                 Some((id, payload)) = out_rx.recv() => {
                     // outbox 数据：先按流切片（单 datagram 装不下会整包丢→静默断流），
@@ -259,14 +285,11 @@ async fn handle_conn(
                         payload.chunks(crate::common::kudus::KUDUS_DATA_CHUNK).collect()
                     };
                     for piece in pieces {
-                        let b = if piece.is_empty() {
-                            encode_data(id, piece)
-                        } else {
-                            encode_data(id, &encode_dgram(piece))
-                        };
-                        let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
-                        seq = seq.wrapping_add(1);
-                        if !txw.send_pkt(&h, &b) { break; }
+                        // 一片一切一片一帧：dgram 帧头 2B + 流复用头 4B 必须在同一 datagram 内
+                        // 与负载一一对应，否则 agent 侧 decode_dgram 拆帧错位。
+                        let inner = encode_dgram(piece);
+                        let b = encode_data(id, &inner);
+                        if !rel_emit(&txw, &relw, FLAG_DATA, &b) { break; }
                     }
                     if let Some(hh) = sw.agents.write().await.get_mut(&aidw) {
                         hh.info.tx_bytes += payload.len() as u64;
@@ -276,6 +299,35 @@ async fn handle_conn(
             }
         }
     });
+    // 重传泵：50ms 扫一次超时未确认包，原样重发（带当前 ACK 快照）。
+    // 注意：rel 锁必须 try_lock 碰到就跳过——写泵搬 2MB 时长占锁，重传泵若阻塞等锁
+    // 会把 50ms 节拍拖成串行，RTO 永远追不上（loopback 实测 1659577/2097152 即卡死于此）。
+    {
+        let txr = tx.clone();
+        let relr = rel.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                iv.tick().await;
+                let Ok(mut guard) = relr.try_lock() else { continue };
+                let due = guard.retx.take_expired(crate::common::kudus::KUDUS_RTO, now_ms());
+                let (ack, sack) = (guard.ack, guard.sack);
+                drop(guard);
+                if due.is_empty() {
+                    // 无待补包也发纯 ACK 探活（对端 ACK 可能丢了，触发它重发 ACK）。
+                    if ack != 0 {
+                        let h = KudusHdr { ver: 1, flags: FLAG_ACK, seq: 0, ack, sack, ts_ms: now_ms() };
+                        txr.send_pkt(&h, &[]);
+                    }
+                    continue;
+                }
+                for (seq, body) in due {
+                    let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack, sack, ts_ms: now_ms() };
+                    txr.send_pkt(&h, &body);
+                }
+            }
+        });
+    }
     // 读循环
     let read_res = async {
         loop {
@@ -285,9 +337,38 @@ async fn handle_conn(
                 tracing::debug!("kudus stale ts seq={} from {p}", h.seq);
                 continue; // 重放旧包：丢
             }
-            if h.flags & FLAG_DATA != 0 && !win.check(h.seq) {
-                tracing::debug!("kudus replay/dup seq={} from {p}", h.seq);
-                continue; // 重复/过旧 seq：丢
+            // 对端 ACK：DATA 与纯 ACK 帧都捎带（写泵每帧都带快照），清重传缓冲。
+            // 注意：握手完成前 Register 还没重放（见下 SYN-ACK 段），此时 rxbuf 锚 1 收的是
+            // 上行控制帧——但读循环在 handle_conn 握手之后才进，此处只见数据态包。
+            // 上行序列从 1 起（agent SYN seq=0 不可靠帧），rxbuf 同锚无撞车。
+            rel.lock().unwrap().retx.on_ack(h.ack, &h.sack);
+            if h.flags & FLAG_DATA != 0 {
+                // 可靠投递：重排缓冲保序，洞后包缓存等补齐；推进即更新 ACK 快照。
+                // 根因→修法：旧 win.check 到包即投，丢包永久少块；现缓存等补齐后全投。
+                let ready = rxbuf.push(h.seq, body);
+                {
+                    let mut r = rel.lock().unwrap();
+                    r.ack = rxbuf.ack();
+                    r.sack = rxbuf.sack();
+                }
+                if ready.is_empty() {
+                    // 洞后包：只回 ACK+SACK 催补（body 先缓存不投）。
+                    let (ack, sack) = {
+                        let r = rel.lock().unwrap();
+                        (r.ack, r.sack)
+                    };
+                    let ah = KudusHdr { ver: 1, flags: FLAG_ACK, seq: 0, ack, sack, ts_ms: now_ms() };
+                    tx.send_pkt(&ah, &[]);
+                    continue;
+                }
+                for ob in ready {
+                    dispatch_body(&s, &agent_id, &hostname, &ctl_tx, &last_ping, &tx, ob).await;
+                }
+                continue;
+            }
+            if h.flags & FLAG_ACK != 0 {
+                // 纯 ACK：只清重传（上已做），无 body 可分发。
+                continue;
             }
             if h.flags & FLAG_FIN != 0 {
                 // 对端 FIN：回 ACK 即双向关。
@@ -336,15 +417,11 @@ async fn handle_conn(
                 continue;
             }
             if let Some((id, payload)) = decode_data(&body) {
-                // UDP 包带 dgram 内帧：逐个拆投；非 dgram 即裸 TCP/HTTP 字节（egress 下行链路）。
-                let mut off = 0;
-                let mut delivered = false;
-                while let Some((dg, used)) = decode_dgram(&payload[off..]) {
-                    off += used;
-                    delivered = true;
+                // agent 上行 TCP 同样套 dgram 帧（与 server 下行对称，见 agent send_data_stream）：
+                // 拆一层即得整片；非 dgram 即裸字节（兼容控制面空包/EOF）。
+                if let Some((dg, _)) = decode_dgram(payload) {
                     deliver(&s, &agent_id, id, dg).await;
-                }
-                if !delivered {
+                } else {
                     deliver(&s, &agent_id, id, payload).await;
                 }
             }
@@ -372,6 +449,54 @@ async fn handle_conn(
     }
     cleanup(&s, &agent_id, &hostname).await;
     log_ev(&s, format!("kudus agent '{hostname}' disconnected"));
+}
+
+/// 有序包分发：原读循环内控制/数据分支抽出（重排补齐后逐个调用）。
+async fn dispatch_body(
+    s: &S, agent_id: &str, hostname: &str, ctl_tx: &mpsc::UnboundedSender<ServerMsg>,
+    last_ping: &Arc<RwLock<Option<std::time::Instant>>>, tx: &Tx, body: Vec<u8>,
+) {
+    if let Ok(cm) = serde_json::from_slice::<ClientMsg>(&body) {
+        match cm {
+            ClientMsg::Register { proxies } => {
+                on_register(s, agent_id, hostname, proxies).await;
+            }
+            ClientMsg::Ping { ts } => {
+                let _ = ctl_tx.send(ServerMsg::Pong { ts });
+            }
+            ClientMsg::Pong { .. } => {
+                if let Some(t0) = *last_ping.read().await {
+                    let ms = t0.elapsed().as_millis() as i64;
+                    if let Some(hh) = s.agents.write().await.get_mut(agent_id) {
+                        hh.info.rtt_ms = ms;
+                    }
+                }
+            }
+            ClientMsg::Close { stream, .. } => {
+                if let Some(hh) = s.agents.read().await.get(agent_id) {
+                    hh.incoming.write().await.remove(&stream);
+                    hh.pending.write().await.remove(&stream);
+                }
+            }
+            ClientMsg::Open { stream, kind, host, port } if kind == "egress" => {
+                spawn_egress_dial(s, agent_id, stream, host, port, ctl_tx.clone());
+            }
+            ClientMsg::Open { stream, kind, host, .. } if kind == "link" => {
+                spawn_link_relay(s, agent_id, hostname, stream, host, ctl_tx.clone());
+            }
+            _ => {}
+        }
+        return;
+    }
+    if let Some((id, payload)) = decode_data(&body) {
+        // 同上：agent 上行 TCP 套 dgram 帧，拆一层即得整片。
+        if let Some((dg, _)) = decode_dgram(payload) {
+            deliver(s, agent_id, id, dg).await;
+        } else {
+            deliver(s, agent_id, id, payload).await;
+        }
+    }
+    let _ = tx; // ACK 回执由调用方统一发（本函数只分发 body）
 }
 
 async fn on_register_from_body(s: &S, agent_id: &str, hostname: &str, body: &[u8]) {
@@ -471,10 +596,12 @@ mod tests {
 
     #[test]
     fn replay_seq_is_dropped() {
-        let mut seen = SeqWindow::new(100);
-        assert!(seen.check(101));
-        assert!(!seen.check(101)); // replay
-        assert!(!seen.check(50)); // below left edge
+        // 旧 SeqWindow 已被 ReorderBuf 取代：同语义（去重+保序+补洞）走新缓冲验证。
+        // 根因→修法：旧窗口到包即投、无补洞，跨机丢包永久少块（avatar/blob 截断）。
+        let mut seen = crate::common::kudus::ReorderBuf::new(101);
+        assert!(seen.push(101, b"a".to_vec()).len() == 1);
+        assert!(seen.push(101, b"a".to_vec()).is_empty()); // replay：重复投递为空
+        assert!(seen.push(50, b"o".to_vec()).is_empty()); // below left edge：过旧丢弃
     }
 
     #[test]
