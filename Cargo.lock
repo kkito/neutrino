@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "neutrino"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "axum 0.7.9",

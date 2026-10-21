@@ -223,10 +223,18 @@ async fn handle_conn(
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut b = vec![0u8; 32 * 1024];
+            // 背压：kudus 窗口满时异步等 ACK（不卡 reactor，同泵其他流不受影响）。
+            let kudus_pkt = match &tx {
+                OutMsg::Kudus(p) => Some(p.clone()),
+                _ => None,
+            };
             loop {
                 match ri.read(&mut b).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Some(p) = &kudus_pkt {
+                            p.wait_window().await;
+                        }
                         if tx.data(sid, &b[..n]).is_err() {
                             break;
                         }

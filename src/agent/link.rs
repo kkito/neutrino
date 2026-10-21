@@ -322,6 +322,7 @@ async fn handle_link_conn_with(inbound: TcpStream, link_name: String, tx: &Tx) -
                     match ri.read(&mut b).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            p2.wait_window().await;
                             p2.send_data_stream(sid, &b[..n]);
                         }
                     }

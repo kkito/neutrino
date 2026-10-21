@@ -54,6 +54,8 @@ pub(crate) struct KudusSender(pub(crate) crate::agent::kudus_session::Pkt);
 impl Sender for KudusSender {
     fn send_data(&self, sid: u32, chunk: &[u8]) {
         // http_response_pump/egress/link 的 TCP 字节流：逐片发（见 send_data_stream 注释）。
+        // 注意：Sender trait 是同步的，背压不能在此做——由各泵 task 在调 send 前
+        // wait_window().await（异步让出，不卡 reactor）；此处只管切分发送。
         self.0.send_data_stream(sid, chunk);
     }
     fn send_ctrl(&self, m: &ClientMsg) {

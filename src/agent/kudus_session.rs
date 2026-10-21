@@ -74,25 +74,21 @@ impl Pkt {
         r.ack = ack;
         r.sack = sack;
     }
-    /// 超时包：吐出待重传 (seq,body)，调用方原样重发。
-    pub(crate) fn take_expired(&self) -> Vec<(u32, Vec<u8>)> {
-        self.rel.lock().unwrap().retx.take_expired(crate::common::kudus::KUDUS_RTO, now_ms())
-    }
     pub(crate) fn send(&self, flags: u8, _ack: u32, _sack: [u8; 32], body: &[u8]) -> anyhow::Result<()> {
         if flags & FLAG_DATA != 0 {
             // 可靠 DATA：登记重传后发（捎带当前收包 ACK 快照）。
-            let seq = self.rel.lock().unwrap().retx.on_send(body.to_vec());
-            let (ack, sack) = self.ack_snap();
+            // 注意：单次 lock 拿全三件——double-lock 会把 2MB 搬运的临界区串成 4000 次加锁
+            // （blob 219608/2M 即此）。
+            let (seq, ack, sack) = {
+                let mut r = self.rel.lock().unwrap();
+                let s = r.retx.on_send(body.to_vec());
+                (s, r.ack, r.sack)
+            };
             self.emit(flags, seq, ack, sack, body)
         } else {
             let (ack, sack) = self.ack_snap();
             self.emit(flags, 0, ack, sack, body)
         }
-    }
-    /// 指定 seq 原样重发（重传泵用，不重新登记、不占新 seq）。
-    pub(crate) fn resend(&self, seq: u32, body: &[u8]) {
-        let (ack, sack) = self.ack_snap();
-        let _ = self.emit(FLAG_DATA, seq, ack, sack, body);
     }
     pub(crate) fn send_ctrl(&self, m: &ClientMsg) -> anyhow::Result<()> {
         let j = serde_json::to_vec(m)?;
@@ -104,6 +100,20 @@ impl Pkt {
     /// 必须在此切片；UDP 数据报语义不可切（见下 `send_udp`）。
     /// 注意：agent 上行 TCP 同样先套 dgram 帧（与 server 下行对称），否则 server 读循环
     /// decode_dgram 拆帧错位——e2e 里 got 0 即上行 256KB 全被当成坏帧丢了。
+    /// 背压：retx 未确认超 256 包时让出等 ACK（异步 sleep，不占 reactor）——
+    /// 根因→修法：旧无界发送，2MB 切 2000 帧瞬间灌满 UDP 发射队列+对端重排窗，
+    /// 丢包雪崩后重传泵+写泵双双 100% 空转（blob 首传 ok、次传 hang 即此）。
+    /// 注意：旧 `std::thread::sleep` 版会卡死单线程 reactor 上所有同 task 的流
+    /// （单连接的 2000 帧没发完，同 task 第二个连接的 Open 永不到——次传 hang 即此）。
+    pub(crate) async fn wait_window(&self) {
+        for _ in 0..3000 {
+            let n = self.rel.lock().map(|r| r.retx.len()).unwrap_or(0);
+            if n < 256 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
     pub(crate) fn send_data_stream(&self, sid: u32, chunk: &[u8]) {
         if chunk.is_empty() {
             let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
@@ -154,14 +164,34 @@ pub(crate) async fn session(
         rel: Arc::new(std::sync::Mutex::new(RelSend::new())),
     };
     // 重传泵：50ms 扫一次超时未确认包，原样重发（带当前 ACK 快照）。
+    // 注意：take+resend 之间 rel 锁零持有还是一次拿完——写泵上行 2MB 时长占锁，
+    // 重传泵若阻塞等锁会被拖成串行，RTO 形同虚设（与 server 侧 try_lock 对称）。
     {
+        use std::sync::TryLockError;
         let p = pkt.clone();
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
             loop {
                 iv.tick().await;
-                for (seq, body) in p.take_expired() {
-                    p.resend(seq, &body);
+                let due = match p.rel.try_lock() {
+                    Ok(mut r) => {
+                        let d = r.retx.take_expired(crate::common::kudus::KUDUS_RTO, crate::common::kudus::now_ms());
+                        let snap = (r.ack, r.sack);
+                        drop(r);
+                        d.into_iter().map(|(s, b)| (s, b, snap)).collect::<Vec<_>>()
+                    }
+                    Err(TryLockError::WouldBlock) => continue,
+                    Err(TryLockError::Poisoned(_)) => continue,
+                };
+                for (seq, body, (ack, sack)) in due {
+                    let h = crate::common::kudus::KudusHdr { ver: 1, flags: crate::common::kudus::FLAG_DATA, seq, ack, sack, ts_ms: crate::common::kudus::now_ms() };
+                    let mut plain = crate::common::kudus::encode_hdr(&h).to_vec();
+                    plain.extend_from_slice(&body);
+                    if 4 + 24 + plain.len() + 16 > crate::common::kudus::KUDUS_MAX_UDP {
+                        continue;
+                    }
+                    let n = crate::common::kudus::fresh_nonce();
+                    p.out.send(crate::common::kudus::encode_packet(p.session, &n, &crate::common::kudus::seal(&p.key, &n, &plain))).ok();
                 }
             }
         });
@@ -374,6 +404,7 @@ async fn deliver(ctx: &Arc<KCtx>, id: u32, payload: Vec<u8>) {
 }
 
 /// 数据发送：裸字节包封 DATA 帧；UDP 包先套 dgram 帧保边界（超限丢包，不切片）。
+/// 注意：背压由调用方（wait_window）做，此处只分发不阻塞。
 fn send_data(pkt: &Pkt, sid: u32, payload: &[u8], is_udp: bool) {
     if is_udp {
         pkt.send_udp(sid, payload);
@@ -453,11 +484,14 @@ async fn pump_tcp(
         }
     });
     if is_http {
-        let local_to_ws = tokio::spawn(http_response_pump(
-            super::stream::KudusSender(pkt.clone()),
-            sid,
-            lr,
-        ));
+        // 背压：http_response_pump 是同步 Sender trait，内部调 send_data_stream 无等待；
+        // 窗口满时泵 task 提前异步等 ACK（不卡 reactor，同泵其他流不受影响）。
+        // 根因→修法：旧无界发送，大文件切 2000 帧灌满对端重排窗→丢包雪崩→次传 hang。
+        let pktw = pkt.clone();
+        let local_to_ws = tokio::spawn(async move {
+            pktw.wait_window().await;
+            http_response_pump(super::stream::KudusSender(pktw.clone()), sid, lr).await
+        });
         let _ = local_to_ws.await;
         ws_to_local.abort();
     } else {
@@ -469,7 +503,10 @@ async fn pump_tcp(
             loop {
                 match lr.read(&mut b).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => send_data(&pkt2, sid, &b[..n], false),
+                    Ok(n) => {
+                        pkt2.wait_window().await;
+                        send_data(&pkt2, sid, &b[..n], false);
+                    }
                 }
             }
         });

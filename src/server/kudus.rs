@@ -58,9 +58,11 @@ struct Tx {
 /// 控制/FIN 等非 DATA 帧原样发（不占可靠序列）。
 /// 根因→修法：旧写泵全部 ack=0 发完即忘，跨机丢包即截断；现登记+ACK清+超时补。
 fn rel_emit(tx: &Tx, rel: &std::sync::Mutex<ServerRel>, flags: u8, body: &[u8]) -> bool {
+    // 注意：单次 lock 拿全三件——写泵 2MB 切 2000 帧时 double-lock 会把临界区
+    // 串成 4000 次加锁，重传泵 try_lock 永远抢不到，RTO 形同虚设（blob 219608/2M 即此）。
     let (seq, ack, sack) = if flags & FLAG_DATA != 0 {
-        let s = rel.lock().unwrap().retx.on_send(body.to_vec());
-        let r = rel.lock().unwrap();
+        let mut r = rel.lock().unwrap();
+        let s = r.retx.on_send(body.to_vec());
         (s, r.ack, r.sack)
     } else {
         let r = rel.lock().unwrap();
@@ -279,6 +281,15 @@ async fn handle_conn(
                     // outbox 数据：先按流切片（单 datagram 装不下会整包丢→静默断流），
                     // 每片独立 DATA 帧独立 datagram（UDP 访客下行先套 dgram 帧；与 quic.rs::udp_out 同语）。
                     // 空载荷（EOF 标记）不能丢：chunks 为空时补一帧空包。
+                    // 背压：retx 未确认超 256 包时等 ACK 再发（与 agent 侧 send_data 对称）——
+                    // 旧无界发送，2MB 切 2000 帧瞬间灌满对端重排窗，丢包雪崩后双双 100% 空转。
+                    for _ in 0..3000 {
+                        let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
+                        if n < 256 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                     let pieces: Vec<&[u8]> = if payload.is_empty() {
                         vec![&[][..]]
                     } else {

@@ -661,15 +661,43 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         });
                         let s_tx = s3.clone();
                         let from_agent = async {
-                            while let Some(chunk) = drx.recv().await {
-                                // 上行同压：与下行共用同一 limiter（双向总量口径）。
+                            // 首包门：第一个 chunk 必须 5s 内到，否则关连接（防 agent 侧重排
+                            // 洞卡住时 visitor 空等 30s——微信图 tun1 30s 才回 360146 即此）。
+                            let mut pending_first: Option<Vec<u8>> =
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    drx.recv(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(c)) => Some(c),
+                                    _ => {
+                                        tracing::warn!("tcp :{port} sid={sid} first-chunk timeout (reorder hole?), close early");
+                                        None
+                                    }
+                                };
+                            // 首包已到则先写，后续走正常 recv；首包超时直接进 select 收尾。
+                            if let Some(chunk) = pending_first.take() {
                                 if let Some(l) = &limiter_up {
                                     let d = l.take(chunk.len()).await;
                                     if !d.is_zero() {
                                         tokio::time::sleep(d).await;
                                     }
                                 }
-                                // 连接行 tx 累计（agent->公网字节；同上，包循环零 agents 锁）
+                                if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
+                                    c.tx += chunk.len() as u64;
+                                }
+                                wi.write_all(&chunk).await?;
+                            } else {
+                                anyhow::bail!("first chunk timeout");
+                            }
+                            while let Some(chunk) = drx.recv().await {
+                                if let Some(l) = &limiter_up {
+                                    let d = l.take(chunk.len()).await;
+                                    if !d.is_zero() {
+                                        tokio::time::sleep(d).await;
+                                    }
+                                }
                                 if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
                                     c.tx += chunk.len() as u64;
                                 }

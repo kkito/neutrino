@@ -102,6 +102,9 @@ impl RetxBuf {
     pub fn is_empty(&self) -> bool {
         self.seqs.is_empty()
     }
+    pub fn len(&self) -> usize {
+        self.seqs.len()
+    }
 }
 
 /// 单个 UDP datagram 载荷上限（防 IP 分片）。
