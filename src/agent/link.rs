@@ -6,6 +6,57 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::egress::OutHolder;
 use super::quic_session::QCtx;
+use super::kudus_session::KCtx;
+/// Config 同步 link 监听（kudus 版）：任务表挂在 KCtx 上，出站走 KudusOutHolder（Pkt）。
+pub(crate) async fn sync_link_listeners_kudus(
+    ctx: &KCtx,
+    proxies: &[crate::common::proto::ProxyConfig],
+    self_hostname: &str,
+    holder: &super::egress::KudusOutHolder,
+) {
+    use crate::common::proto::valid_link;
+    use std::collections::HashSet;
+    let want: HashSet<String> = proxies
+        .iter()
+        .filter(|p| valid_link(p, self_hostname))
+        .map(|p| p.name.clone())
+        .collect();
+    let mut tasks = ctx.link_tasks.lock().await;
+    let gone: Vec<String> = tasks.keys().filter(|k| !want.contains(*k)).cloned().collect();
+    for k in gone {
+        if let Some(h) = tasks.remove(&k) { h.abort(); }
+    }
+    for p in proxies.iter().filter(|p| valid_link(p, self_hostname)) {
+        if tasks.contains_key(&p.name) { continue; }
+        let bind = format!("{}:{}", p.local_ip, p.local_port);
+        let h = tokio::spawn(serve_link_kudus(p.name.clone(), bind, holder.clone()));
+        tasks.insert(p.name.clone(), h.abort_handle());
+    }
+}
+
+async fn serve_link_kudus(link_name: String, bind: String, holder: super::egress::KudusOutHolder) {
+    let lis = match TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("link '{link_name}' bind {bind} failed: {e:#}");
+            return;
+        }
+    };
+    tracing::info!("link '{link_name}' listen on {bind}");
+    loop {
+        let Ok((inbound, _)) = lis.accept().await else { continue; };
+        let holder = holder.clone();
+        let link_name = link_name.clone();
+        tokio::spawn(async move {
+            let hout = holder.read().await.clone();
+            let Some(p) = hout else { return; };
+            if let Err(e) = handle_link_conn_with(inbound, link_name, &Tx::Kudus(p)).await {
+                tracing::debug!("link conn ended: {e:#}");
+            }
+        });
+    }
+}
+
 use super::web::AgentStatus;
 use crate::common::proto::{encode_data, ClientMsg};
 use crate::common::quic::encode_frame;
@@ -89,10 +140,11 @@ async fn handle_link_conn(
     handle_link_conn_with(inbound, link_name, &Tx::Ws(tx)).await
 }
 
-/// 发送端抽象：WSS 发 Message，QUIC 发 control 复用帧。
+/// 发送端抽象：WSS 发 Message，QUIC 发 control 复用帧，kudus 发封包 datagram。
 enum Tx {
     Ws(mpsc::UnboundedSender<tokio_tungstenite::tungstenite::Message>),
     Quic(mpsc::UnboundedSender<Vec<u8>>),
+    Kudus(super::kudus_session::Pkt),
 }
 
 impl Tx {
@@ -110,6 +162,14 @@ impl Tx {
             }
             Tx::Quic(tx) => {
                 tx.send(encode_frame(j.as_bytes()))?;
+            }
+            Tx::Kudus(p) => {
+                p.send_ctrl(&ClientMsg::Open {
+                    stream: sid,
+                    kind: "link".into(),
+                    host: link_name.to_string(),
+                    port: 0,
+                })?;
             }
         }
         Ok(())
@@ -130,13 +190,15 @@ impl Tx {
                 Tx::Quic(tx) => {
                     let _ = tx.send(encode_frame(j.as_bytes()));
                 }
+                Tx::Kudus(p) => {
+                    let _ = p.send_ctrl(&ClientMsg::Close { stream: sid, reason: "eof".into() });
+                }
             }
         }
     }
 }
 
 /// Config 同步 link 监听（QUIC 版）：任务表挂在 QCtx 上，出站走 QuicOutHolder。
-/// 与 WSS 版对称：holder 由 session 持有、监听 task 只 clone Arc，读时取快照。
 pub(crate) async fn sync_link_listeners_quic(
     ctx: &QCtx,
     proxies: &[crate::common::proto::ProxyConfig],
@@ -236,6 +298,23 @@ async fn handle_link_conn_with(inbound: TcpStream, link_name: String, tx: &Tx) -
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             if tx2.send(encode_frame(&encode_data(sid, &b[..n]))).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        }
+        Tx::Kudus(p) => {
+            let p2 = p.clone();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 32 * 1024];
+                loop {
+                    match ri.read(&mut b).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            use crate::common::kudus::FLAG_DATA;
+                            if p2.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &b[..n])).is_err() {
                                 break;
                             }
                         }

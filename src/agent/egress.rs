@@ -27,18 +27,26 @@ pub(crate) type OutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Message>>>>;
 /// server 侧 handle_conn 读循环同时接受两种帧，无需区分。
 pub(crate) type QuicOutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>;
 
-/// serve 双路：同时持 WSS + QUIC 两个 out holder，哪个连着用哪个。
+/// kudus 出站通道持有者：持已建连的封包器 [`Pkt`]（内含 key/session/seq），
+/// egress Open/data/close 直接封 DATA 帧经写泵发出。
+pub(crate) type KudusOutHolder = Arc<RwLock<Option<crate::agent::kudus_session::Pkt>>>;
+
+/// serve 三路：同时持 WSS + QUIC + kudus 三个 out holder，哪个连着用哪个。
 /// 根因→修法：egress 监听与主链解耦、热重启不碰主链，双路 holder 只需在 handle 时
 /// 选一个 Some 的；transport 切换时旧 holder 被 session 置 None，无残留。
 #[derive(Clone)]
 pub(crate) struct DualOut {
     pub(crate) ws: OutHolder,
     pub(crate) quic: QuicOutHolder,
+    pub(crate) kudus: KudusOutHolder,
 }
 
 impl DualOut {
-    /// QUIC 优先（延迟更低），回退 WSS。
+    /// kudus/QUIC 优先（UDP 延迟更低），回退 WSS。
     async fn pick(&self) -> Option<OutMsg> {
+        if let Some(k) = self.kudus.read().await.clone() {
+            return Some(OutMsg::Kudus(k));
+        }
         if let Some(q) = self.quic.read().await.clone() {
             return Some(OutMsg::Quic(q));
         }
@@ -51,15 +59,20 @@ impl DualOut {
 enum OutMsg {
     Ws(mpsc::UnboundedSender<Message>),
     Quic(mpsc::UnboundedSender<Vec<u8>>),
+    Kudus(super::kudus_session::Pkt),
 }
 
 impl OutMsg {
     fn open(&self, sid: u32, host: String, port: u16) -> anyhow::Result<()> {
-        let open = ClientMsg::Open { stream: sid, kind: "egress".into(), host, port };
+        let open = ClientMsg::Open { stream: sid, kind: "egress".into(), host: host.clone(), port };
         let j = serde_json::to_string(&open)?;
         match self {
             OutMsg::Ws(tx) => tx.send(Message::Text(j.into()))?,
             OutMsg::Quic(tx) => tx.send(crate::common::quic::encode_frame(j.as_bytes()))?,
+            // kudus：egress Open 是控制语义 —— DATA 帧包 proto JSON。
+            OutMsg::Kudus(p) => {
+                p.send_ctrl(&ClientMsg::Open { stream: sid, kind: "egress".into(), host, port })?;
+            }
         }
         Ok(())
     }
@@ -68,6 +81,9 @@ impl OutMsg {
             OutMsg::Ws(tx) => tx.send(Message::Binary(encode_data(sid, chunk).into()))?,
             OutMsg::Quic(tx) => {
                 tx.send(crate::common::quic::encode_frame(&encode_data(sid, chunk)))?
+            }
+            OutMsg::Kudus(p) => {
+                let _ = p.send(crate::common::kudus::FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
             }
         }
         Ok(())
@@ -80,6 +96,9 @@ impl OutMsg {
                 }
                 OutMsg::Quic(tx) => {
                     let _ = tx.send(crate::common::quic::encode_frame(j.as_bytes()));
+                }
+                OutMsg::Kudus(p) => {
+                    let _ = p.send_ctrl(&ClientMsg::Close { stream: sid, reason: "eof".into() });
                 }
             }
         }

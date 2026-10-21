@@ -1,5 +1,6 @@
 //! Agent side: out-bound WSS, local dial, stream pumps.
 pub mod egress;
+pub mod kudus_session;
 pub mod link;
 pub mod quic_session;
 pub mod session;
@@ -177,7 +178,8 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
     // 出站通道持有者：session 建连后注入，egress 监听经它发 Open/数据。
     let egress_out: self::egress::OutHolder = Arc::new(RwLock::new(None));
     let quic_egress_out: self::egress::QuicOutHolder = Arc::new(RwLock::new(None));
-    let dual_out = || self::egress::DualOut { ws: egress_out.clone(), quic: quic_egress_out.clone() };
+    let kudus_egress_out: self::egress::KudusOutHolder = Arc::new(RwLock::new(None));
+    let dual_out = || self::egress::DualOut { ws: egress_out.clone(), quic: quic_egress_out.clone(), kudus: kudus_egress_out.clone() };
     // egress 热重启通道：WebUI 保存只 abort/重起本监听，不断 WSS 主链。
     let (egress_tx, egress_rx) = tokio::sync::watch::channel(0u64);
     let egress_cur: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
@@ -334,14 +336,19 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
             st.hostname = up.hostname.clone();
             st.transport = match crate::common::quic::parse_server_url(&up.server_url) {
                 crate::common::quic::Transport::Quic { .. } => "quic".into(),
+                crate::common::quic::Transport::Kudus { .. } => "kudus".into(),
                 _ => "wss".into(),
             };
         }
-        // transport 选路：quic:// 走 QUIC 会话，其余走 WSS 老路。
-        // QUIC 也要 egress 通道：session 注入的是 quic framer，egress 侧需同构。
+        // transport 选路：quic:// 走 QUIC 会话，kudus:// 走 kudus 会话，其余走 WSS 老路。
+        // QUIC/kudus 也要 egress 通道：session 注入的是各自 framer/Pkt，egress 侧同构。
         let is_quic = matches!(
             crate::common::quic::parse_server_url(&up.server_url),
             crate::common::quic::Transport::Quic { .. }
+        );
+        let is_kudus = matches!(
+            crate::common::quic::parse_server_url(&up.server_url),
+            crate::common::quic::Transport::Kudus { .. }
         );
         // run session in a task so the watcher can abort it on redial
         // QUIC/WSS 闭包都要 'static：status/egress holder 每次 clone 进去，
@@ -350,6 +357,11 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
             let (up2, cfg2, st2, qh) = (up.clone(), cfg.clone(), status.clone(), quic_egress_out.clone());
             tokio::spawn(async move {
                 quic_session::session(up2, cfg2, st2, qh).await
+            })
+        } else if is_kudus {
+            let (up2, cfg2, st2, kh) = (up.clone(), cfg.clone(), status.clone(), kudus_egress_out.clone());
+            tokio::spawn(async move {
+                kudus_session::session(up2, cfg2, st2, kh).await
             })
         } else {
             let (up2, cfg2, st2, eh) = (up.clone(), cfg.clone(), status.clone(), egress_out.clone());

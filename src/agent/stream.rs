@@ -33,7 +33,6 @@ impl Sender for WsSender {
 
 #[derive(Clone)]
 pub(crate) struct QuicSender(pub(crate) mpsc::UnboundedSender<Vec<u8>>);
-
 impl Sender for QuicSender {
     fn send_data(&self, sid: u32, chunk: &[u8]) {
         use crate::common::quic::encode_frame;
@@ -44,6 +43,21 @@ impl Sender for QuicSender {
         if let Ok(j) = serde_json::to_vec(m) {
             let _ = self.0.send(encode_frame(&j));
         }
+    }
+}
+
+/// kudus 发送端：包 [`Pkt`] 封帧（每包独立加密 datagram），泵逻辑与 WSS/QUIC 同构。
+/// 根因→修法：`http_response_pump` 只依赖 `Sender`，kudus 只需实现一次即复用三分支。
+#[derive(Clone)]
+pub(crate) struct KudusSender(pub(crate) crate::agent::kudus_session::Pkt);
+
+impl Sender for KudusSender {
+    fn send_data(&self, sid: u32, chunk: &[u8]) {
+        use crate::common::kudus::FLAG_DATA;
+        let _ = self.0.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
+    }
+    fn send_ctrl(&self, m: &ClientMsg) {
+        let _ = self.0.send_ctrl(m);
     }
 }
 

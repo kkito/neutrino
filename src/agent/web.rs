@@ -181,7 +181,7 @@ fn merge_upstream_toml(raw: &str, up: &Upstream) -> toml::Value {
 
 /// validate upstream fields the same way api_settings does.
 fn validate_server_url(s: &str) -> bool {
-    s.starts_with("ws://") || s.starts_with("wss://") || s.starts_with("quic://")
+    s.starts_with("ws://") || s.starts_with("wss://") || s.starts_with("quic://") || s.starts_with("kudus://")
 }
 
 
