@@ -32,6 +32,9 @@ thiserror = "1"
 toml = "0.8"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+quinn = { version = "0.11", features = ["rustls-ring"] }
+rcgen = "0.13"
+sha2 = "0.10"
 
 [dev-dependencies]
 # e2e cookie 续登测试用（主包不开 cookies 避免二进制膨胀）
