@@ -148,7 +148,7 @@ pub(crate) async fn session(
         crate::common::quic::Transport::Kudus { host, port } => (host, port),
         _ => anyhow::bail!("kudus: bad --server scheme (want kudus://host:port)"),
     };
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr: SocketAddr = crate::common::quic::resolve_server_addr(&host, port).await?;
     let sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
     sock.connect(addr).await?;
     let key = derive_key(&up.token);

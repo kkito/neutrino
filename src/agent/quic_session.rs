@@ -86,7 +86,7 @@ pub(crate) async fn session(
         crate::common::quic::Transport::Quic { host, port } => (host, port),
         _ => anyhow::bail!("quic: bad --server scheme (want quic://host:port)"),
     };
-    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let addr: std::net::SocketAddr = crate::common::quic::resolve_server_addr(&host, port).await?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()

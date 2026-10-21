@@ -118,6 +118,17 @@ pub fn parse_server_url(url: &str) -> Transport {
     Transport::Invalid
 }
 
+/// 解析 kudus/quic 上行地址：IP 字面量直解，域名走 DNS。
+/// 根因→修法：旧代码 "{host}:{port}".parse::<SocketAddr>() 遇域名直接 bail
+/// （macmini 配 kudus://hk.kkito.cn 会话 0 秒结束，2026-10-22 现场）。
+pub async fn resolve_server_addr(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
+    use tokio::net::lookup_host;
+    lookup_host(format!("{host}:{port}"))
+        .await?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {host}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +166,18 @@ mod tests {
         assert!(decode_dgram(&[]).is_none());
         let big = vec![0u8; 65528];
         assert!(encode_dgram_checked(&big).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_server_addr_ip_and_hostname() {
+        // 根因→修法：kudus/quic session 用 "{host}:{port}".parse::<SocketAddr>()，
+        // 域名（如 hk.kkito.cn）直接 bail，会话 0 秒结束（macmini 2026-10-22 现场）。
+        // IP 字面量保持直解，域名走 DNS。
+        let a = resolve_server_addr("127.0.0.1", 36182).await.unwrap();
+        assert_eq!(a.to_string(), "127.0.0.1:36182");
+        let b = resolve_server_addr("localhost", 36182).await.unwrap();
+        assert_eq!(b.port(), 36182);
+        assert!(resolve_server_addr("nonexistent.invalid.", 36182).await.is_err());
     }
 
     #[test]
