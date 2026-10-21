@@ -9,6 +9,7 @@ use std::fmt;
 pub enum Transport {
     Ws(String),
     Quic { host: String, port: u16 },
+    Kudus { host: String, port: u16 },
     Invalid,
 }
 
@@ -94,6 +95,19 @@ pub fn parse_server_url(url: &str) -> Transport {
             if let Ok(port) = p.parse::<u16>() {
                 if !h.is_empty() && port != 0 {
                     return Transport::Quic {
+                        host: h.to_string(),
+                        port,
+                    };
+                }
+            }
+        }
+    }
+    if let Some(rest) = url.strip_prefix("kudus://") {
+        let rest = rest.trim_end_matches('/');
+        if let Some((h, p)) = rest.rsplit_once(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                if !h.is_empty() && port != 0 {
+                    return Transport::Kudus {
                         host: h.to_string(),
                         port,
                     };

@@ -36,6 +36,8 @@ quinn = { version = "0.11", features = ["rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 # e2e cookie 续登测试用（主包不开 cookies 避免二进制膨胀）
