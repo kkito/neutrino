@@ -2,7 +2,7 @@
 
 ## 一句话：是 server/agent 模式吗？
 
-**是，但方向反直觉**：不是 server 主动连内网，而是**内网 agent 单条 WSS 出站长连打到公网 server**，
+**是，但方向反直觉**：不是 server 主动连内网，而是**内网 agent 单条出站长连打到公网 server**（默认 WSS，可选 QUIC），
 所有隧道都复用这一条连接。公网进来的访问者流量，由 server 通过这条长连"反向"捎回内网。
 所以内网主机不需要公网 IP、不开任何入站端口——这就是"隐身"的来源。
 
@@ -59,7 +59,7 @@ flowchart TB
 
 关键点：
 
-- **控制帧**走 WSS Text JSON（`hello/register/ping/pong/open/close/config`），**数据帧**走 WSS Binary
+- **控制帧**走 WSS Text JSON（`hello/register/ping/pong/open/close/config`），**数据帧**走 WSS Binary；QUIC 传输时控制走 control stream 的 length-prefixed JSON，数据走 control 复用帧（UDP 套 dgram 内帧）
   `[stream_id:u32 BE][payload]`，server 用偶数 id。TCP/HTTP 每连接一个 stream 全双工；
   UDP 每个 peer 一个 stream，每帧即一个 datagram。
 - HTTP（与 ws/WebUI 同端口 `--listen`）：axum 先匹配 `/ws`、`/api/*`，其余按 `Host` 路由到隧道 agent

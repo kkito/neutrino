@@ -574,6 +574,226 @@ async fn e2e_udp_and_hot_config() {
     assert_eq!(r.status(), 404);
 }
 
+/// QUIC 版 boot：server 同时开 --quic-listen，agent 用 quic:// 拨号。
+/// 其余与 WSS 版一致（desired/HTTP 入站同端口，Host 路由不变）。
+async fn boot_quic(proxies_toml: &str) -> Env {
+    let ws_port = free_port();
+    let quic_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-quic-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(
+        &cfg_path,
+        format!("hostname = \"e2e\"\ntoken = \"s3cret\"\n{proxies_toml}"),
+    )
+    .await
+    .unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--quic-listen",
+            &format!("127.0.0.1:{quic_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent",
+            "--server",
+            &format!("quic://127.0.0.1:{quic_port}"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Env {
+        http_port: ws_port,
+        web_base: format!("http://127.0.0.1:{ws_port}"),
+        data_dir: data,
+        _srv: srv,
+        _ag: ag,
+    }
+}
+
+#[tokio::test]
+async fn quic_http_udp_and_hot_config() {
+    // RED（Task 2 结束时）：server 只回 Welcome，Register 无响应，路由表空，
+    // http 404 + udp 超时。本测试锁定 Task 3–4 的完整语义：
+    // QUIC 建连→Register 收敛→http/udp 透传→热配清空路由消失。
+    // http backend: fixed body
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                let body = "quic-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // udp echo backend
+    let uback = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ubport = uback.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, p)) = uback.recv_from(&mut b).await else {
+                break;
+            };
+            let _ = uback.send_to(&b[..n], p).await;
+        }
+    });
+    let rport = free_port();
+    let env = boot_quic(&format!(
+        "[[proxies]]\nname=\"web\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"q.e2e.test\"]\n\
+         [[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={ubport}\nremote_port={rport}\n"
+    ))
+    .await;
+    // http 透传（轮询等 Register 收敛，上限 8s）
+    let mut ok = false;
+    for _ in 0..40 {
+        if http_get_via(&env, "q.e2e.test").await.contains("quic-ok") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "quic http never converged");
+    // udp 回声
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    cli.send(b"ping-quic").await.unwrap();
+    let mut b = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), cli.recv(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&b[..n], b"ping-quic");
+    // hot config：清空后 http 404（路由摘除），udp 无响应（超时即断言）。
+    let jwt = login(&env.web_base).await;
+    let c = reqwest::Client::new();
+    let r = c
+        .post(format!("{}/api/config", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"hostname": "e2e", "proxies": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let mut gone = false;
+    for _ in 0..40 {
+        if http_get_via(&env, "q.e2e.test").await.contains("404") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(gone, "quic hot-config clear did not take effect");
+    let cli2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    cli2.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    cli2.send(b"ping-after-clear").await.unwrap();
+    let mut b2 = vec![0u8; 64];
+    assert!(tokio::time::timeout(Duration::from_secs(3), cli2.recv(&mut b2))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn quic_bad_token_closes() {
+    // 错 token 的 QUIC agent 建连即被 401 close：server 侧 agents 表无此 hostname，
+    // WebUI conns 为空；旧代码（Task 2 前）无 QUIC 监听，connect 直接超时。
+    let ws_port = free_port();
+    let quic_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-quic-bad-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--quic-listen",
+            &format!("127.0.0.1:{quic_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(&cfg_path, "hostname = \"bad\"\ntoken = \"wrong\"\n")
+        .await
+        .unwrap();
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent",
+            "--server",
+            &format!("quic://127.0.0.1:{quic_port}"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // agents 表应无 bad（401 close 后无注册），conns 为空。
+    let jwt = login(&format!("http://127.0.0.1:{ws_port}")).await;
+    let c = reqwest::Client::new();
+    let agents: serde_json::Value = c
+        .get(format!("http://127.0.0.1:{ws_port}/api/overview"))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = agents.get("agents").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    assert!(!arr.iter().any(|a| a.get("hostname").and_then(|h| h.as_str()) == Some("bad")));
+    drop(ag);
+    drop(srv);
+}
+
 #[tokio::test]
 async fn e2e_desired_crud_flows_to_agent() {
     // backend: fixed body

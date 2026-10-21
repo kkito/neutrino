@@ -1,13 +1,54 @@
 //! agent 流泵：HTTP 响应泵 + chunked 编解码纯函数 + idle 收尾。
+//! 发送端经 `Sender` 抽象：WSS 用 WsSender（Message），QUIC 用 QuicSender（复用帧）。
 use crate::common::proto::*;
-use super::session::Ctx;
-use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-pub(crate) async fn http_response_pump(ctx: Arc<Ctx>, sid: u32, mut lr: tokio::net::tcp::OwnedReadHalf) {
-    use tokio::io::AsyncReadExt;
-use tokio_tungstenite::tungstenite::Message;
+/// 发包器：agent 数据泵的发送端抽象（WSS 发 Message，QUIC 发 control 复用帧）。
+/// 根因→修法：WSS `out: UnboundedSender<Message>` 与 QUIC `out: UnboundedSender<Vec<u8>>`
+/// 类型不同，泵逻辑相同——`Sender` 统一 `data/ctrl/close` 三种发送，两种传输各实现一次。
+pub(crate) trait Sender: Clone + Send + 'static {
+    fn send_data(&self, sid: u32, chunk: &[u8]);
+    #[allow(dead_code)]
+    fn send_ctrl(&self, m: &ClientMsg);
+    #[allow(dead_code)]
+    fn send_close(&self, sid: u32, reason: &str) {
+        self.send_ctrl(&ClientMsg::Close { stream: sid, reason: reason.into() });
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WsSender(pub(crate) mpsc::UnboundedSender<Message>);
+
+impl Sender for WsSender {
+    fn send_data(&self, sid: u32, chunk: &[u8]) {
+        let _ = self.0.send(Message::Binary(encode_data(sid, chunk).into()));
+    }
+    fn send_ctrl(&self, m: &ClientMsg) {
+        if let Ok(j) = serde_json::to_string(m) {
+            let _ = self.0.send(Message::Text(j.into()));
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct QuicSender(pub(crate) mpsc::UnboundedSender<Vec<u8>>);
+
+impl Sender for QuicSender {
+    fn send_data(&self, sid: u32, chunk: &[u8]) {
+        use crate::common::quic::encode_frame;
+        let _ = self.0.send(encode_frame(&encode_data(sid, chunk)));
+    }
+    fn send_ctrl(&self, m: &ClientMsg) {
+        use crate::common::quic::encode_frame;
+        if let Ok(j) = serde_json::to_vec(m) {
+            let _ = self.0.send(encode_frame(&j));
+        }
+    }
+}
+
+pub(crate) async fn http_response_pump<S: Sender>(tx: S, sid: u32, mut lr: tokio::net::tcp::OwnedReadHalf) {
+    use tokio::io::AsyncReadExt as _;
     let mut b = vec![0u8; 32 * 1024];
     // 首包：必须含完整响应头，否则按裸流透传
     let mut head = vec![];
@@ -29,8 +70,8 @@ use tokio_tungstenite::tungstenite::Message;
     let (hlen, body_prefix) = match hpos {
         Some(i) => (i + 4, head[i + 4..].to_vec()),
         None => {
-            let _ = ctx.out.send(Message::Binary(encode_data(sid, &head).into()));
-            stream_body_until_idle(ctx.clone(), sid, &mut lr).await;
+            tx.send_data(sid, &head);
+            stream_body_until_idle(tx.clone(), sid, &mut lr).await;
             return;
         }
     };
@@ -57,8 +98,8 @@ use tokio_tungstenite::tungstenite::Message;
             }
         };
         let fixed_head = rewrite_chunked_head(&head[..hlen], body.len());
-        let _ = ctx.out.send(Message::Binary(encode_data(sid, &fixed_head).into()));
-        let _ = ctx.out.send(Message::Binary(encode_data(sid, &body).into()));
+        tx.send_data(sid, &fixed_head);
+        tx.send_data(sid, &body);
         return;
     }
     if hdr_txt.lines().any(|l| {
@@ -67,18 +108,18 @@ use tokio_tungstenite::tungstenite::Message;
                 && v.to_lowercase().contains("close"))
     }) {
         // connection: close：先发头（server 靠首包解析状态行），再靠 EOF 收尾。
-        let _ = ctx.out.send(Message::Binary(encode_data(sid, &head[..hlen]).into()));
+        tx.send_data(sid, &head[..hlen]);
         if !body_prefix.is_empty() {
-            let _ = ctx.out.send(Message::Binary(encode_data(sid, &body_prefix).into()));
+            tx.send_data(sid, &body_prefix);
         }
-        stream_body_until_idle(ctx.clone(), sid, &mut lr).await;
+        stream_body_until_idle(tx.clone(), sid, &mut lr).await;
         return;
     }
     let want: usize = content_length(&hdr_txt).unwrap_or(0);
     // 定长响应：先发头 + 已读 body 前缀，server 首包即解析出状态行。
-    let _ = ctx.out.send(Message::Binary(encode_data(sid, &head[..hlen]).into()));
+    tx.send_data(sid, &head[..hlen]);
     if !body_prefix.is_empty() {
-        let _ = ctx.out.send(Message::Binary(encode_data(sid, &body_prefix).into()));
+        tx.send_data(sid, &body_prefix);
     }
     let mut got = body_prefix.len();
     let mut extra = want.saturating_sub(got);
@@ -86,9 +127,7 @@ use tokio_tungstenite::tungstenite::Message;
         match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
             Ok(Ok(n)) => {
-                if ctx.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
-                    break;
-                }
+                tx.send_data(sid, &b[..n]);
                 got += n;
                 extra = want.saturating_sub(got);
             }
@@ -207,15 +246,14 @@ fn greedy_decode_chunked(buf: &[u8]) -> Vec<u8> {
 }
 
 /// 流式透传直到后端 EOF 或 5s 读空闲（chunked/close 连接的收尾方式）。
-pub(crate) async fn stream_body_until_idle(ctx: Arc<Ctx>, sid: u32, lr: &mut tokio::net::tcp::OwnedReadHalf) {
+pub(crate) async fn stream_body_until_idle<S: Sender>(tx: S, sid: u32, lr: &mut tokio::net::tcp::OwnedReadHalf) {
+    use tokio::io::AsyncReadExt as _;
     let mut b = vec![0u8; 32 * 1024];
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(5), lr.read(&mut b)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
             Ok(Ok(n)) => {
-                if ctx.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
-                    break;
-                }
+                tx.send_data(sid, &b[..n]);
             }
         }
     }

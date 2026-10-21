@@ -1,7 +1,7 @@
 //! agent 会话：WSS 长连 + Register/Config + Binary 分发 + 建流。
 use crate::common::proto::*;
 use super::{AgentFileConfig, Upstream};
-use super::stream::http_response_pump;
+use super::stream::{http_response_pump, WsSender};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::{mpsc, RwLock}};
@@ -313,7 +313,7 @@ async fn open_stream(
     // 进了 stream_body_until_idle 的 5s 空闲等待——tcp 回声测试挂 10s 超时。
     let ctx3 = ctx.clone();
     if kind == "http" {
-        let local_to_ws = tokio::spawn(http_response_pump(ctx3, sid, lr));
+        let local_to_ws = tokio::spawn(http_response_pump(WsSender(ctx3.out.clone()), sid, lr));
         // keep-alive 后端不会 FIN，不能等 ws->local 的 EOF：
         // 响应读完即收尾（之前 select! 双向等，curl 挂到 keep-alive 超时约 6s）。
         let _ = local_to_ws.await;

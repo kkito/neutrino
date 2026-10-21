@@ -17,16 +17,79 @@ pub(crate) fn egress_streams(
 }
 
 use super::web::AgentStatus;
-use crate::common::proto::ClientMsg;
+use crate::common::proto::{encode_data, ClientMsg};
 
 /// 出站通道持有者：session 建连后注入 out_tx，断开置 None。
 /// egress 连接 WSS 断开时 fail-fast（直接 502），重连后自动恢复。
 pub(crate) type OutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Message>>>>;
 
+/// QUIC 出站通道持有者：发的是 control 复用帧（len+JSON 或 len+[sid+payload]）。
+/// server 侧 handle_conn 读循环同时接受两种帧，无需区分。
+pub(crate) type QuicOutHolder = Arc<RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>;
+
+/// serve 双路：同时持 WSS + QUIC 两个 out holder，哪个连着用哪个。
+/// 根因→修法：egress 监听与主链解耦、热重启不碰主链，双路 holder 只需在 handle 时
+/// 选一个 Some 的；transport 切换时旧 holder 被 session 置 None，无残留。
+#[derive(Clone)]
+pub(crate) struct DualOut {
+    pub(crate) ws: OutHolder,
+    pub(crate) quic: QuicOutHolder,
+}
+
+impl DualOut {
+    /// QUIC 优先（延迟更低），回退 WSS。
+    async fn pick(&self) -> Option<OutMsg> {
+        if let Some(q) = self.quic.read().await.clone() {
+            return Some(OutMsg::Quic(q));
+        }
+        self.ws.read().await.clone().map(OutMsg::Ws)
+    }
+}
+
+/// 发包统一口：Open 走 JSON 文本语义，data 走二进制语义（QUIC 侧自动套复用帧）。
+#[derive(Clone)]
+enum OutMsg {
+    Ws(mpsc::UnboundedSender<Message>),
+    Quic(mpsc::UnboundedSender<Vec<u8>>),
+}
+
+impl OutMsg {
+    fn open(&self, sid: u32, host: String, port: u16) -> anyhow::Result<()> {
+        let open = ClientMsg::Open { stream: sid, kind: "egress".into(), host, port };
+        let j = serde_json::to_string(&open)?;
+        match self {
+            OutMsg::Ws(tx) => tx.send(Message::Text(j.into()))?,
+            OutMsg::Quic(tx) => tx.send(crate::common::quic::encode_frame(j.as_bytes()))?,
+        }
+        Ok(())
+    }
+    fn data(&self, sid: u32, chunk: &[u8]) -> anyhow::Result<()> {
+        match self {
+            OutMsg::Ws(tx) => tx.send(Message::Binary(encode_data(sid, chunk).into()))?,
+            OutMsg::Quic(tx) => {
+                tx.send(crate::common::quic::encode_frame(&encode_data(sid, chunk)))?
+            }
+        }
+        Ok(())
+    }
+    fn close(&self, sid: u32) {
+        if let Ok(j) = serde_json::to_string(&ClientMsg::Close { stream: sid, reason: "eof".into() }) {
+            match self {
+                OutMsg::Ws(tx) => {
+                    let _ = tx.send(Message::Text(j.into()));
+                }
+                OutMsg::Quic(tx) => {
+                    let _ = tx.send(crate::common::quic::encode_frame(j.as_bytes()));
+                }
+            }
+        }
+    }
+}
+
 /// agent egress 本地监听。端口被占只 warn + 状态标红，不影响 WSS 主链。
 /// 根因→修法：监听 task 与 session/WSS 主链解耦，bind 失败直接返回，
 /// 调用方（run/热重启）只更新 status.egress_err，不 abort 主循环。
-pub(crate) async fn serve_egress(bind: String, http: EgressHttp, out: OutHolder, status: Arc<RwLock<AgentStatus>>) {
+pub(crate) async fn serve_egress(bind: String, http: EgressHttp, out: DualOut, status: Arc<RwLock<AgentStatus>>) {
     // 状态先行：WebUI 立即可见监听目标
     {
         let mut st = status.write().await;
@@ -63,7 +126,7 @@ pub(crate) async fn serve_egress(bind: String, http: EgressHttp, out: OutHolder,
 
 async fn handle_conn(
     mut inbound: tokio::net::TcpStream,
-    out: OutHolder,
+    out: DualOut,
 ) -> anyhow::Result<()> {
     // 读到完整请求头（上限 64K，防慢连接撑内存）
     let mut buf = vec![];
@@ -90,9 +153,8 @@ async fn handle_conn(
             .await;
         return Ok(());
     };
-    let holder = out.read().await.clone();
-    let Some(tx) = holder else {
-        // WSS 未连：fail-fast
+    let Some(tx) = out.pick().await else {
+        // 双路都断：fail-fast
         let _ = inbound
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n")
             .await;
@@ -109,16 +171,7 @@ async fn handle_conn(
     // 在 Open 之前先把回包通道注册到全局表（server 回包+Close 靠它路由）
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     egress_streams().write().await.insert(sid, dtx);
-    let open = ClientMsg::Open {
-        stream: sid,
-        kind: "egress".into(),
-        host,
-        port,
-    };
-    if tx
-        .send(Message::Text(serde_json::to_string(&open).unwrap().into()))
-        .is_err()
-    {
+    if tx.open(sid, host, port).is_err() {
         egress_streams().write().await.remove(&sid);
         let _ = inbound
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n")
@@ -128,12 +181,10 @@ async fn handle_conn(
     if !connect {
         // Forward：原 head 经 Binary 发给 server（由 server 端泵写给公网目标）
         let head = buf[..hlen].to_vec();
-        let _ = tx.send(Message::Binary(crate::common::proto::encode_data(sid, &head).into()));
+        let _ = tx.data(sid, &head);
         // head 之后已读的多余字节（pipeline）也一并转发
         if buf.len() > hlen {
-            let _ = tx.send(Message::Binary(
-                crate::common::proto::encode_data(sid, &buf[hlen..]).into(),
-            ));
+            let _ = tx.data(sid, &buf[hlen..]);
         }
     }
     let (mut ri, mut wi) = inbound.into_split();
@@ -149,23 +200,22 @@ async fn handle_conn(
             return Ok(());
         }
     }
-    let tx2 = tx.clone();
-    let to_server = tokio::spawn(async move {
-        let mut b = vec![0u8; 32 * 1024];
-        loop {
-            match ri.read(&mut b).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx2
-                        .send(Message::Binary(crate::common::proto::encode_data(sid, &b[..n]).into()))
-                        .is_err()
-                    {
-                        break;
+    let to_server = {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 32 * 1024];
+            loop {
+                match ri.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.data(sid, &b[..n]).is_err() {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
+        })
+    };
     let from_server = async {
         loop {
             match drx.recv().await {
@@ -186,11 +236,7 @@ async fn handle_conn(
         _ = from_server => {}
     }
     egress_streams().write().await.remove(&sid);
-    let e = ClientMsg::Close {
-        stream: sid,
-        reason: "eof".into(),
-    };
-    let _ = tx.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+    tx.close(sid);
     Ok(())
 }
 

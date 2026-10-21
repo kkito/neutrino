@@ -33,6 +33,8 @@ pub struct AgentStatus {
     pub egress_err: Option<String>,
     #[serde(default)]
     pub link_err: Option<String>,
+    #[serde(default)]
+    pub transport: String,
 }
 
 #[derive(Clone)]
@@ -179,7 +181,7 @@ fn merge_upstream_toml(raw: &str, up: &Upstream) -> toml::Value {
 
 /// validate upstream fields the same way api_settings does.
 fn validate_server_url(s: &str) -> bool {
-    s.starts_with("ws://") || s.starts_with("wss://")
+    s.starts_with("ws://") || s.starts_with("wss://") || s.starts_with("quic://")
 }
 
 
@@ -252,6 +254,8 @@ mod tests {
     fn server_url_accepts_ws_variants_only() {
         assert!(validate_server_url("ws://127.0.0.1:7440/ws"));
         assert!(validate_server_url("wss://tunnel.nat.kkito.cn:7443/ws"));
+        assert!(validate_server_url("quic://127.0.0.1:7444"));
+        assert!(!validate_server_url("http://127.0.0.1:7440/ws"));
         assert!(!validate_server_url("http://127.0.0.1:7440/"));
         assert!(!validate_server_url("127.0.0.1:7440"));
         assert!(!validate_server_url(""));
