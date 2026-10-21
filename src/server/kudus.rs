@@ -105,7 +105,9 @@ async fn handle_conn(
     let key = derive_key(&token);
     let peer = Arc::new(std::sync::RwLock::new(peer0));
     let tx = Tx { sock: sock.clone(), peer: peer.clone(), key, session };
-    // 握手：首包必须是 SYN + Hello（15s 超时）
+    // 握手：首包必须是 SYN + Hello（15s 超时）。
+    // 注意：超时/错 token 一律静默返回（黑洞，无回包无事件，见 design §2）；
+    // 仅 debug 留痕（默认 info 不可见），方便 RUST_LOG=debug 排错。
     let (mut hostname, mut version) = (String::new(), String::new());
     let hello_ok = loop {
         match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
@@ -117,19 +119,24 @@ async fn handle_conn(
                 match serde_json::from_slice::<ClientMsg>(&body) {
                     Ok(ClientMsg::Hello { hostname: hn, version: v, token: tok }) => {
                         if !check_token(&tok, &token) {
+                            tracing::debug!("kudus hello bad token from {p}");
                             return; // 黑洞：不回包
                         }
                         hostname = hn;
                         version = v;
                         break true;
                     }
-                    _ => return, // 首包非 Hello：丢
+                    _ => {
+                        tracing::debug!("kudus non-hello first packet from {p}");
+                        return; // 首包非 Hello：丢
+                    }
                 }
             }
             _ => break false,
         }
     };
     if !hello_ok {
+        tracing::debug!("kudus hello timeout session={session:08x}");
         return;
     }
     // 注册：与 quic.rs/ws_loop 同一套 agents/outbox/incoming/pending 表。
@@ -275,9 +282,11 @@ async fn handle_conn(
             let (p, h, body) = rx.recv().await.ok_or_else(|| anyhow::anyhow!("gone"))?;
             *peer.write().unwrap() = p;
             if !ts_fresh(h.ts_ms) {
+                tracing::debug!("kudus stale ts seq={} from {p}", h.seq);
                 continue; // 重放旧包：丢
             }
             if h.flags & FLAG_DATA != 0 && !win.check(h.seq) {
+                tracing::debug!("kudus replay/dup seq={} from {p}", h.seq);
                 continue; // 重复/过旧 seq：丢
             }
             if h.flags & FLAG_FIN != 0 {
@@ -425,12 +434,15 @@ pub(crate) async fn run_kudus(s: S, token: Arc<String>, bind: &str) -> anyhow::R
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await?;
         let Some((session, nonce, ct)) = decode_packet(&buf[..n]) else {
+            tracing::debug!("kudus short packet ({}B) from {peer}", n);
             continue; // 短包：丢
         };
         let Some(plain) = open(&key, nonce, ct) else {
+            tracing::debug!("kudus undecryptable packet session={session:08x} from {peer}");
             continue; // 黑洞：解密失败零回包
         };
         let Some((h, body)) = decode_hdr(&plain) else {
+            tracing::debug!("kudus bad inner hdr session={session:08x} from {peer}");
             continue;
         };
         let body = body.to_vec();
