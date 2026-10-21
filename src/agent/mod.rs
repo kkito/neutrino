@@ -2,6 +2,7 @@
 pub mod egress;
 pub mod kudus_session;
 pub mod link;
+pub mod local_ingress;
 pub mod quic_session;
 pub mod session;
 pub mod stream;
@@ -46,6 +47,40 @@ struct EgressCfg {
     pub http: EgressHttp,
 }
 
+/// agent 本地 HTTP 入口（内网 `http://<name><suffix>` 直访名下 http 隧道，不走公网 server）。
+/// 默认关：避免无 root 时 :80 bind 失败刷 warn，也避免用户无感知暴露内网；
+/// suffix 为空同样不启动（与 enabled 双保险，原因写 status.local_ingress_err）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LocalIngress {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "local_ingress_ip_default")]
+    pub listen_ip: String,
+    #[serde(default = "local_ingress_port_default")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub suffix: String,
+}
+
+fn local_ingress_ip_default() -> String {
+    "0.0.0.0".into()
+}
+
+fn local_ingress_port_default() -> u16 {
+    80
+}
+
+impl Default for LocalIngress {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_ip: local_ingress_ip_default(),
+            listen_port: local_ingress_port_default(),
+            suffix: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub(crate) struct AgentFileConfig {
     hostname: String,
@@ -58,6 +93,9 @@ pub(crate) struct AgentFileConfig {
     /// agent 本地出网代理（只本地生效，不走 server desired）。
     #[serde(default)]
     egress: EgressCfg,
+    /// agent 本地 HTTP 入口（内网直访，不走 server；默认关）。
+    #[serde(default)]
+    local_ingress: LocalIngress,
 }
 
 /// Hot-updatable upstream dial config (WebUI can change without restart).
@@ -87,6 +125,7 @@ async fn load_or_default(config_path: &str, url: &str) -> anyhow::Result<AgentFi
                 server: url.to_string(),
                 proxies: vec![],
                 egress: EgressCfg::default(),
+                local_ingress: LocalIngress::default(),
             })
         }
         Err(e) => Err(anyhow::anyhow!("read {config_path}: {e} (see agent.toml.example)")),
@@ -120,6 +159,26 @@ async fn read_egress_file2(path: &str) -> (String, u16, bool) {
             .to_string(),
         h.and_then(|x| x.get("listen_port")).and_then(|x| x.as_integer()).unwrap_or(18080) as u16,
         h.and_then(|x| x.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+    )
+}
+
+/// WebUI 热重启读取的当前 [local_ingress]（agent.toml 唯一来源）。
+/// 供 reload watcher 重起本地入口监听（仿 read_egress_file2）。
+async fn read_local_ingress_file2(path: &str) -> (bool, String, u16, String) {
+    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+    let h = v.get("local_ingress");
+    (
+        h.and_then(|x| x.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+        h.and_then(|x| x.get("listen_ip"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("0.0.0.0")
+            .to_string(),
+        h.and_then(|x| x.get("listen_port")).and_then(|x| x.as_integer()).unwrap_or(80) as u16,
+        h.and_then(|x| x.get("suffix"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
     )
 }
 

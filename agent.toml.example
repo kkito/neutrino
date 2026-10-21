@@ -4,6 +4,13 @@ hostname = "minipc7s"
 token = "welcome2neutrino"
 server = "ws://127.0.0.1:7440/ws"
 
-# 启动本地 WebUI（可选）：
+# 内网 HTTP 入口（可选）：内网经 http://<隧道名><suffix> 直访本地隧道，不走公网。
+# 例：suffix=".local.xxx.com" + 内网 DNS *.local.xxx.com 指到本机 → http://git.local.xxx.com/ 直达 name=git 的 http 隧道。
+# 断网时照常用（本地直连，不依赖上行）；缺失域名回 404 目录页；配 basic_auth 的隧道照常弹框。
+# [local_ingress]
+# enabled = false
+# listen_ip = "0.0.0.0"
+# listen_port = 80
+# suffix = ".local.xxx.com"
 # neutrino agent --server ws://127.0.0.1:7440/ws --config agent.toml \
 #   --web 127.0.0.1:8080 --web-user admin --web-pass neutrino123

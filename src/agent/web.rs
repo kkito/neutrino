@@ -35,6 +35,13 @@ pub struct AgentStatus {
     pub link_err: Option<String>,
     #[serde(default)]
     pub transport: String,
+    /// 本地 HTTP 入口状态（内网直访，不走 server）。
+    #[serde(default)]
+    pub local_ingress_listen: String,
+    #[serde(default)]
+    pub local_ingress_on: bool,
+    #[serde(default)]
+    pub local_ingress_err: Option<String>,
 }
 
 #[derive(Clone)]
@@ -158,6 +165,14 @@ struct SettingsReq {
     egress_ip: Option<String>,
     #[serde(default)]
     egress_port: Option<u16>,
+    #[serde(default)]
+    local_enabled: Option<bool>,
+    #[serde(default)]
+    local_ip: Option<String>,
+    #[serde(default)]
+    local_port: Option<u16>,
+    #[serde(default)]
+    local_suffix: Option<String>,
 }
 
 
@@ -217,7 +232,45 @@ fn merge_egress_toml(mut v: toml::Value, enabled: bool, ip: &str, port: u16) -> 
     v
 }
 
-/// 从 agent.toml 读当前 [egress.http]（缺失给默认值），供 WebUI 部分更新合并。
+/// pure merge step (unit-testable): write [local_ingress] without touching
+/// upstream/proxies/egress. Called after merge_egress_toml on the same value.
+fn merge_local_ingress_toml(mut v: toml::Value, enabled: bool, ip: &str, port: u16, suffix: &str) -> toml::Value {
+    if !v.is_table() {
+        v = toml::Value::Table(Default::default());
+    }
+    let t = v.as_table_mut().unwrap();
+    let li = t
+        .entry("local_ingress".to_string())
+        .or_insert(toml::Value::Table(Default::default()));
+    if !li.is_table() {
+        *li = toml::Value::Table(Default::default());
+    }
+    let h = li.as_table_mut().unwrap();
+    h.insert("enabled".into(), toml::Value::Boolean(enabled));
+    h.insert("listen_ip".into(), toml::Value::String(ip.to_string()));
+    h.insert("listen_port".into(), toml::Value::Integer(port as i64));
+    h.insert("suffix".into(), toml::Value::String(suffix.to_string()));
+    v
+}
+
+/// 从 agent.toml 读当前 [local_ingress]（缺失给默认值），供 WebUI 部分更新合并。
+async fn read_local_ingress_file(path: &str) -> (bool, String, u16, String) {
+    let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
+    let h = v.get("local_ingress");
+    (
+        h.and_then(|x| x.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+        h.and_then(|x| x.get("listen_ip"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("0.0.0.0")
+            .to_string(),
+        h.and_then(|x| x.get("listen_port")).and_then(|x| x.as_integer()).unwrap_or(80) as u16,
+        h.and_then(|x| x.get("suffix"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+    )
+}
 async fn read_egress_file(path: &str) -> (bool, String, u16) {
     let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
     let v: toml::Value = toml::from_str(&raw).unwrap_or(toml::Value::Table(Default::default()));
@@ -288,6 +341,18 @@ mod tests {
         assert_eq!(v["egress"]["http"]["listen_ip"].as_str().unwrap(), "0.0.0.0");
         assert!(v["egress"]["http"]["enabled"].as_bool().unwrap());
         // 上行字段不受影响
+        assert_eq!(v["hostname"].as_str().unwrap(), "h");
+    }
+
+    #[test]
+    fn merge_local_ingress_preserves_and_updates() {
+        // RED: [local_ingress] 合并不动 proxies/upstream/egress，只写四键。
+        let raw = "hostname = \"h\"\ntoken = \"t\"\nserver = \"ws://x/ws\"\n[[proxies]]\nname = \"web\"\n";
+        let v: toml::Value = toml::from_str(raw).unwrap();
+        let v = merge_local_ingress_toml(v, true, "0.0.0.0", 80, ".local.e2e");
+        assert_eq!(v["local_ingress"]["suffix"].as_str().unwrap(), ".local.e2e");
+        assert!(v["local_ingress"]["enabled"].as_bool().unwrap());
+        assert_eq!(v["proxies"][0]["name"].as_str().unwrap(), "web");
         assert_eq!(v["hostname"].as_str().unwrap(), "h");
     }
 
