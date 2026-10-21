@@ -69,6 +69,20 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <div style="margin-top:16px;text-align:right"><button class="btn" onclick="saveEgress()">保存并重启监听</button></div>
 </div>
 </section>
+<section id="sec-li" class="hidden">
+<div class="topbar"><h2>内网入口（local ingress）</h2><span class="corner">agent 本地监听 · 不走 server</span></div>
+<div class="card" style="max-width:440px">
+<p style="color:var(--mut);font-size:13px">内网经 http://&lt;隧道名&gt;&lt;后缀&gt; 直访本地 http 隧道（如 http://git.local.xxx.com/）。保存后只重启本监听，不断上行；断网时照常用。</p>
+<div id="li-stat" style="margin-bottom:8px"></div>
+<label>总开关</label>
+<select id="l-on" style="width:100%;padding:8px;border-radius:8px;background:var(--bg);color:var(--txt);border:1px solid var(--line)">
+<option value="off">关闭</option><option value="on">开启</option></select>
+<label>监听 IP（默认 0.0.0.0 全绑；只本机用填 127.0.0.1）</label><input id="l-ip" placeholder="0.0.0.0">
+<label>监听端口（默认 80；无 root/被占会标错，不影响上行）</label><input id="l-port" placeholder="80" inputmode="numeric">
+<label>泛域名后缀（须以 . 开头，如 .local.xxx.com）</label><input id="l-suffix" placeholder=".local.xxx.com">
+<div style="margin-top:16px;text-align:right"><button class="btn" onclick="saveLocal()">保存并重启监听</button></div>
+</div>
+</section>
 <section id="sec-set" class="hidden">
 <div class="topbar"><h2>设置</h2></div>
 <div class="card" style="max-width:440px">
@@ -87,7 +101,7 @@ let auth='';
 function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
   document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
-function tab(t){ for(const x of ['ov','tn','eg','set']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+function tab(t){ for(const x of ['ov','tn','eg','li','set']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
   document.getElementById('nav-'+x).classList.toggle('on',x===t); } }
 async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
@@ -119,6 +133,15 @@ async function refresh(){
   if(document.activeElement!==document.getElementById('e-ip')) document.getElementById('e-ip').value=(s.egress_listen||'').split(':').slice(0,-1).join(':')||'0.0.0.0';
   if(document.activeElement!==document.getElementById('e-port')) document.getElementById('e-port').value=(s.egress_listen||'').split(':').pop()||'18080';
   document.getElementById('e-on').value=egOn?'on':'off';
+  const liOn=!!s.local_ingress_on;
+  const liStat=document.getElementById('li-stat');
+  if(liStat) liStat.innerHTML = s.local_ingress_err
+    ? '<span class="badge b-warn">异常</span> '+s.local_ingress_err
+    : (liOn ? '<span class="badge b-ok">监听中</span> '+(s.local_ingress_listen||'') : '<span class="badge b-off">未启用</span>');
+  const lip=document.getElementById('l-ip'), lport=document.getElementById('l-port');
+  if(lip && document.activeElement!==lip) lip.value=(s.local_ingress_listen||'').split(':').slice(0,-1).join(':')||'0.0.0.0';
+  if(lport && document.activeElement!==lport) lport.value=(s.local_ingress_listen||'').split(':').pop()||'80';
+  const lon=document.getElementById('l-on'); if(lon) lon.value=liOn?'on':'off';
   if(document.activeElement!==document.getElementById('s-server')) document.getElementById('s-server').value=s.server_url||'';
   if(document.activeElement!==document.getElementById('s-host')) document.getElementById('s-host').value=s.hostname||'';
   document.getElementById('tunnels').innerHTML='<tr><th>name</th><th>type</th><th>目标</th><th>domains/ports</th><th>状态</th></tr>'+
@@ -147,6 +170,19 @@ async function saveEgress(){
   const body={egress_enabled:on};
   if(ip) body.egress_ip=ip;
   if(!isNaN(port)) body.egress_port=port;
+  const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
+  if(r.ok){ const j=await r.json(); toast('已保存 '+(j.note||'')); refresh(); }
+  else { let m=r.status; try{ m=(await r.json()).reason||m; }catch(e){} toast('保存失败: '+m,true); }
+}
+async function saveLocal(){
+  const on=document.getElementById('l-on').value==='on';
+  const ip=document.getElementById('l-ip').value.trim();
+  const port=parseInt(document.getElementById('l-port').value.trim(),10);
+  const suffix=document.getElementById('l-suffix').value.trim();
+  const body={local_enabled:on};
+  if(ip) body.local_ip=ip;
+  if(!isNaN(port)) body.local_port=port;
+  if(suffix) body.local_suffix=suffix;
   const r=await fetch('/api/settings',{method:'POST',headers:hdrs(true),body:JSON.stringify(body)});
   if(r.ok){ const j=await r.json(); toast('已保存 '+(j.note||'')); refresh(); }
   else { let m=r.status; try{ m=(await r.json()).reason||m; }catch(e){} toast('保存失败: '+m,true); }

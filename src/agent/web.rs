@@ -289,11 +289,15 @@ async fn write_settings_toml(
     path: &str,
     up: &Upstream,
     eg: Option<(bool, String, u16)>,
+    li: Option<(bool, String, u16, String)>,
 ) -> anyhow::Result<()> {
     let raw = tokio::fs::read_to_string(path).await.unwrap_or_default();
     let mut v = merge_upstream_toml(&raw, up);
     if let Some((en, ip, port)) = eg {
         v = merge_egress_toml(v, en, &ip, port);
+    }
+    if let Some((en, ip, port, suffix)) = li {
+        v = merge_local_ingress_toml(v, en, &ip, port, &suffix);
     }
     tokio::fs::write(path, toml::to_string_pretty(&v)?).await?;
     Ok(())
@@ -439,10 +443,37 @@ async fn api_settings(
                 Some((enabled, lip, lport))
             }
         };
-        let need_write = changed || eg.is_some();
+        // local ingress 热更新：只写 [local_ingress] + 同通道 bump，双重启不断主链
+        let li = match (r.local_enabled, r.local_ip, r.local_port, r.local_suffix) {
+            (None, None, None, None) => None,
+            (en, ip, port, suffix) => {
+                let cur = read_local_ingress_file(&w.config_path).await;
+                let enabled = en.unwrap_or(cur.0);
+                let lip = ip.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).unwrap_or(cur.1);
+                let lport = port.unwrap_or(cur.2);
+                let lsuffix = suffix.map(|x| x.trim().to_lowercase()).unwrap_or(cur.3).to_lowercase();
+                if lport == 0 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"ok": false, "reason": "local 入口端口非法"})),
+                    )
+                        .into_response();
+                }
+                if enabled && (lsuffix.is_empty() || !lsuffix.starts_with('.')) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"ok": false, "reason": "suffix 须以 . 开头（如 .local.xxx.com）"})),
+                    )
+                        .into_response();
+                }
+                Some((enabled, lip, lport, lsuffix))
+            }
+        };
+        let need_write = changed || eg.is_some() || li.is_some();
         if need_write {
             let egv = eg.clone();
-            if let Err(e) = write_settings_toml(&w.config_path, &up, egv).await {
+            let liv = li.clone();
+            if let Err(e) = write_settings_toml(&w.config_path, &up, egv, liv).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"ok": false, "reason": format!("落盘失败: {e:#}")})),
@@ -459,10 +490,10 @@ async fn api_settings(
                 w.redial.send_replace(n);
                 notes.push("上行已更新，正在重连".into());
             }
-            if eg.is_some() {
+            if eg.is_some() || li.is_some() {
                 let n = w.egress_reload.borrow().wrapping_add(1);
                 w.egress_reload.send_replace(n);
-                notes.push("出网代理已更新，监听重启中".into());
+                notes.push("出网代理/内网入口已更新，监听重启中".into());
             }
         }
     }

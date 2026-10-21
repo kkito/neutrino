@@ -256,9 +256,23 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         });
         *egress_cur.lock().await = Some(h.abort_handle());
     }
+    // local ingress 内网入口（与 session/上行解耦：断网照常本地直连；bind 失败只影响本 task）。
+    let local_cur: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     {
-        // 热重启 watcher：bump 即按 agent.toml 最新 [egress.http] 重起监听
+        let h = tokio::spawn({
+            let li = cfg.local_ingress.clone();
+            let st = status.clone();
+            async move {
+                self::local_ingress::serve_local_ingress(li, st).await;
+            }
+        });
+        *local_cur.lock().await = Some(h.abort_handle());
+    }
+    {
+        // 热重启 watcher：bump 即按 agent.toml 最新 [egress.http]/[local_ingress] 重起两个监听
         let cur2 = egress_cur.clone();
+        let lcur2 = local_cur.clone();
         let st2 = status.clone();
         let mk = dual_out();
         let cfg_path2 = config_path.to_string();
@@ -277,6 +291,9 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
                 if let Some(h) = cur2.lock().await.take() {
                     h.abort();
                 }
+                if let Some(h) = lcur2.lock().await.take() {
+                    h.abort();
+                }
                 let (ip, port, en) = read_egress_file2(&cfg_path2).await;
                 let bind = format!("{ip}:{port}");
                 let http = EgressHttp {
@@ -292,6 +309,21 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
                     }
                 });
                 *cur2.lock().await = Some(h.abort_handle());
+                // local ingress 同节奏重起（读最新 [local_ingress]）
+                let (len, lip, lport, lsuffix) = read_local_ingress_file2(&cfg_path2).await;
+                let li = LocalIngress {
+                    enabled: len,
+                    listen_ip: lip,
+                    listen_port: lport,
+                    suffix: lsuffix,
+                };
+                let lh = tokio::spawn({
+                    let st = st2.clone();
+                    async move {
+                        self::local_ingress::serve_local_ingress(li, st).await;
+                    }
+                });
+                *lcur2.lock().await = Some(lh.abort_handle());
             }
         });
     }
