@@ -243,12 +243,24 @@ async fn handle_conn(
                     if !txw.send_pkt(&h, t.as_bytes()) { break; }
                 }
                 Some((id, payload)) = out_rx.recv() => {
-                    // outbox 数据：UDP 访客下行必须先套 dgram 帧再进复用帧
-                    //（agent 侧读循环按 decode_dgram 拆边界；与 quic.rs::udp_out 同语）。
-                    let b = encode_data(id, &encode_dgram(&payload));
-                    let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
-                    seq = seq.wrapping_add(1);
-                    if !txw.send_pkt(&h, &b) { break; }
+                    // outbox 数据：先按流切片（单 datagram 装不下会整包丢→静默断流），
+                    // 每片独立 DATA 帧独立 datagram（UDP 访客下行先套 dgram 帧；与 quic.rs::udp_out 同语）。
+                    // 空载荷（EOF 标记）不能丢：chunks 为空时补一帧空包。
+                    let pieces: Vec<&[u8]> = if payload.is_empty() {
+                        vec![&[][..]]
+                    } else {
+                        payload.chunks(crate::common::kudus::KUDUS_DATA_CHUNK).collect()
+                    };
+                    for piece in pieces {
+                        let b = if piece.is_empty() {
+                            encode_data(id, piece)
+                        } else {
+                            encode_data(id, &encode_dgram(piece))
+                        };
+                        let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
+                        seq = seq.wrapping_add(1);
+                        if !txw.send_pkt(&h, &b) { break; }
+                    }
                     if let Some(hh) = sw.agents.write().await.get_mut(&aidw) {
                         hh.info.tx_bytes += payload.len() as u64;
                     }

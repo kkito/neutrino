@@ -5,6 +5,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 单个 UDP datagram 载荷上限（防 IP 分片）。
+/// server 下行单流切片上限：proto_frame 预算 ≈1140B（见 KUDUS_MAX_UDP）。
+/// UDP 上行由 [`Pkt::send_udp`] 另行限长，此处只管 TCP/HTTP/egress/link 字节流。
+pub const KUDUS_DATA_CHUNK: usize = 1000;
+/// 单 datagram 上限：以太网 MTU 内，避免 IP 分片（分片=特征+丢包放大）。
 pub const KUDUS_MAX_UDP: usize = 1232;
 /// SACK bitmap 位数（乱序窗口）。
 pub const KUDUS_SACK_BITS: usize = 256;

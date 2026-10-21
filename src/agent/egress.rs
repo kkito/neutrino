@@ -83,7 +83,7 @@ impl OutMsg {
                 tx.send(crate::common::quic::encode_frame(&encode_data(sid, chunk)))?
             }
             OutMsg::Kudus(p) => {
-                let _ = p.send(crate::common::kudus::FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
+                p.send_data_stream(sid, chunk);
             }
         }
         Ok(())

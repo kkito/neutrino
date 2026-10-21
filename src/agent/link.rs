@@ -313,10 +313,7 @@ async fn handle_link_conn_with(inbound: TcpStream, link_name: String, tx: &Tx) -
                     match ri.read(&mut b).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            use crate::common::kudus::FLAG_DATA;
-                            if p2.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &b[..n])).is_err() {
-                                break;
-                            }
+                            p2.send_data_stream(sid, &b[..n]);
                         }
                     }
                 }

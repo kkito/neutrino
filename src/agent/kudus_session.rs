@@ -44,6 +44,31 @@ impl Pkt {
         let j = serde_json::to_vec(m)?;
         self.send(FLAG_DATA, 0, [0u8; 32], &j)
     }
+    /// 字节流发送（TCP/HTTP/egress/link）：按 [`KUDUS_DATA_CHUNK`] 切片，
+    /// 每片独立 DATA 帧独立 seq（v1 无重排缓冲，依赖链路保序；loopback 实测保序）。
+    /// 根因→修法：泵单次 read 可达 32KB，单 datagram 装不下会整包丢（静默断流），
+    /// 必须在此切片；UDP 数据报语义不可切（见下 `send_udp`）。
+    pub(crate) fn send_data_stream(&self, sid: u32, chunk: &[u8]) {
+        if chunk.is_empty() {
+            let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
+            return;
+        }
+        for piece in chunk.chunks(KUDUS_DATA_CHUNK) {
+            if self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, piece)).is_err() {
+                break;
+            }
+        }
+    }
+    /// 单个 UDP 数据报发送：必须装进一个 datagram（保边界不可切），超限丢包 + warn。
+    /// 与 QUIC `encode_dgram_checked` 超限语义对齐：典型 UDP（DNS/语音/游戏包 <1200B）无影响。
+    pub(crate) fn send_udp(&self, sid: u32, dg: &[u8]) {
+        let inner = encode_dgram(dg);
+        if 4 + 24 + HDR_LEN + inner.len() + 16 > KUDUS_MAX_UDP {
+            tracing::warn!("kudus udp datagram too large ({}B), dropped", dg.len());
+            return;
+        }
+        let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &inner));
+    }
 }
 
 pub(crate) async fn session(
@@ -218,7 +243,18 @@ pub(crate) async fn session(
             continue;
         }
         if let Some((id, payload)) = decode_data(&body) {
-            deliver(&ctx, id, payload).await;
+            // server 下行统一 dgram 套帧（TCP 切片亦套帧保边界，与 quic 读循环对称）：
+            // 逐个拆投；非 dgram 即裸字节（兼容控制面空包/EOF）。
+            let mut off = 0;
+            let mut delivered = false;
+            while let Some((dg, used)) = decode_dgram(&payload[off..]) {
+                off += used;
+                delivered = true;
+                deliver(&ctx, id, dg).await;
+            }
+            if !delivered {
+                deliver(&ctx, id, payload).await;
+            }
         }
     }
     // 本端 FIN（200ms ×3 尽力）
@@ -244,10 +280,13 @@ async fn deliver(ctx: &Arc<KCtx>, id: u32, payload: &[u8]) {
     }
 }
 
-/// 数据发送：裸字节包封 DATA 帧；UDP 包先套 dgram 帧保边界。
+/// 数据发送：裸字节包封 DATA 帧；UDP 包先套 dgram 帧保边界（超限丢包，不切片）。
 fn send_data(pkt: &Pkt, sid: u32, payload: &[u8], is_udp: bool) {
-    let inner = if is_udp { encode_dgram(payload) } else { payload.to_vec() };
-    let _ = pkt.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &inner));
+    if is_udp {
+        pkt.send_udp(sid, payload);
+    } else {
+        pkt.send_data_stream(sid, payload);
+    }
 }
 
 async fn open_stream(
@@ -366,19 +405,13 @@ async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyho
     let w = sock.clone();
     let ws_to_udp = tokio::spawn(async move {
         loop {
+            // server 下行已在读循环拆掉 dgram 帧：此处是裸 datagram，直接发。
+            // （与 quic 版不同：quic 下行裸帧靠泵内 decode_dgram 兜底；
+            // kudus 下行统一套帧，读循环已拆，泵内不再二次拆。）
             match tokio::time::timeout(std::time::Duration::from_secs(120), drx.recv()).await {
                 Ok(Some(dg)) => {
-                    let mut off = 0;
-                    let mut any = false;
-                    while let Some((one, used)) = decode_dgram(&dg[off..]) {
-                        off += used;
-                        any = true;
-                        if w.send(one).await.is_err() {
-                            return;
-                        }
-                    }
-                    if !any {
-                        let _ = w.send(&dg).await;
+                    if w.send(&dg).await.is_err() {
+                        return;
                     }
                 }
                 _ => break,

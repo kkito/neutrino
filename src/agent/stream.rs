@@ -53,8 +53,8 @@ pub(crate) struct KudusSender(pub(crate) crate::agent::kudus_session::Pkt);
 
 impl Sender for KudusSender {
     fn send_data(&self, sid: u32, chunk: &[u8]) {
-        use crate::common::kudus::FLAG_DATA;
-        let _ = self.0.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, chunk));
+        // http_response_pump/egress/link 的 TCP 字节流：逐片发（见 send_data_stream 注释）。
+        self.0.send_data_stream(sid, chunk);
     }
     fn send_ctrl(&self, m: &ClientMsg) {
         let _ = self.0.send_ctrl(m);
