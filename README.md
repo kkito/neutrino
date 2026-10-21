@@ -27,7 +27,7 @@ QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）；kudus
 | tcp 透传 | 同上 `type=tcp`（如 51413），lazy listen |
 | udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话 120s 过期；agent 用 connected UDP 透本地 |
 | WebUI 登录 | bcrypt（`genhash` 生成，存 `state.json`；空=初装 admin/welcome2neutrino）+ HS256 JWT（HttpOnly cookie `nt_session` + Bearer 双通道），未登录 `/api/*` 401 |
-| 双 WebUI | server `web/index.html`（总览/隧道表单/日志）+ agent `--web` 本地页（上行状态/只读隧道/改口令），同视觉 token，深色模式 |
+| 双 WebUI | server `web/index.html`（总览/隧道表单/日志）+ agent `--web` 本地页（上行状态/只读隧道/改口令/出网代理/内网入口），同视觉 token，深色模式 |
 | 期望态（server 为准）| `desired.toml`（`[[agents.<hostname]]]`，结构同 ProxyConfig）→ WebUI `GET/POST /api/desired/:hostname` 增删改 → 在线即下发 `Config`，离线 register 时覆盖+回推同步；agent 本地 proxies 忽略 |
 | 多 agent | domain/port → agent 列表轮询；`state.json` 落盘 totals+password_hash（30s + 断线时） |
 
@@ -51,6 +51,23 @@ cargo build
 curl -H 'Host: git.nat.kkito.cn' http://127.0.0.1:7440/   # 隧道域名 Host → 透到 agent 本地
 open http://127.0.0.1:7440/                                # server WebUI（裸 IP/无点 Host）
 open http://127.0.0.1:8080/                                # agent 本地 WebUI（默认 admin/neutrino123）
+
+### agent 内网入口（local ingress：`*.local.xxx.com` 直访，不走公网）
+
+异地内网穿透场景：agent 所在内网另有机器，要直访 agent 名下的 http 隧道（免经公网 server、无需
+内网机器装 agent、无需 server 配隧道域名）。配法（`agent.toml`）：
+
+```toml
+[local_ingress]
+enabled = true
+listen_ip = "0.0.0.0"
+listen_port = 80        # 默认 80：内网 URL 无端口；被占/无 root 时 warn+状态标错，不影响上行
+suffix = ".local.xxx.com"
+```
+
+内网 DNS 把 `*.local.xxx.com` 指到 agent 本机后，`http://git.local.xxx.com/` 直达 name=`git`
+的 http 隧道（基本认证/XFP 与公网入口同语义；未知名回 404 目录页只列隧道名；断网时照常用——
+本地直连本机服务，不依赖上行）。agent 本地 WebUI「内网入口」tab 可改四项并热重启监听。
 ```
 
 ## 后台运行（裸跑，不用 systemd/podman 时）

@@ -856,6 +856,139 @@ async fn boot_kudus(proxies_toml: &str) -> Env {
     }
 }
 
+/// agent 本地入口 e2e：内网 `*.<suffix>` 直访名下 http 隧道（不经 server 公网口）。
+/// 旧代码无 [local_ingress]：本地端口无监听，连接直接被拒（ECONNREFUSED）。
+#[tokio::test]
+async fn local_ingress_http_names() {
+    // backend1: web 固定 body；backend2: sec 固定 body（配 basic_auth u:p）
+    async fn fixed_backend(body: &'static str) -> u16 {
+        let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bport = back.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = back.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut b = vec![0u8; 4096];
+                    let _ = s.read(&mut b).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        bport
+    }
+    let bweb = fixed_backend("local-ok").await;
+    let bsec = fixed_backend("secret-ok").await;
+    let li_port = free_port();
+    // desired.toml 形状：[[agents.e2e]] 数组表；agent.toml 只追加 [local_ingress]。
+    // （隧道以 server desired 为准，agent 本地 [[proxies]] 会被忽略——故此处不写。）
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"web\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bweb}\ndomains=[\"w.e2e.test\"]\n\
+         [[agents.e2e]]\nname=\"sec\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bsec}\nbasic_auth=\"u:p\"\ndomains=[\"s.e2e.test\"]\n"
+    );
+    let agent_extra = format!(
+        "[local_ingress]\nenabled=true\nlisten_ip=\"127.0.0.1\"\nlisten_port={li_port}\nsuffix=\".local.e2e\"\n"
+    );
+    let env = boot_with_desired(&agent_extra, Some(&desired)).await;
+    async fn raw(port: u16, host: &str, auth: Option<&str>) -> String {
+        let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let mut req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n");
+        if let Some(a) = auth {
+            use base64::Engine as _;
+            req.push_str(&format!(
+                "Authorization: Basic {}\r\n",
+                base64::engine::general_purpose::STANDARD.encode(a)
+            ));
+        }
+        req.push_str("Connection: close\r\n\r\n");
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut out = vec![];
+        c.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    // 收敛轮询：本地入口读 status.proxies（server 下发后才有），上限 8s
+    let mut ok = false;
+    for _ in 0..40 {
+        if raw(li_port, "web.local.e2e", None).await.contains("local-ok") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "local ingress hit never converged");
+    // miss 列名（含 web/sec，不含 token）
+    let miss = raw(li_port, "nope.local.e2e", None).await;
+    assert!(miss.contains("404") && miss.contains("web") && miss.contains("sec"), "miss page: {miss}");
+    assert!(!miss.contains("s3cret"), "miss page leaks token: {miss}");
+    // 多 label 越权拒绝
+    let evil = raw(li_port, "evil.deep.local.e2e", None).await;
+    assert!(evil.contains("404"), "multi-label must 404: {evil}");
+    // basic_auth：无头 401（带 WWW-Authenticate），对头 200
+    let noauth = raw(li_port, "sec.local.e2e", None).await;
+    assert!(noauth.contains("401") && noauth.contains("WWW-Authenticate"), "auth missing: {noauth}");
+    let authed = raw(li_port, "sec.local.e2e", Some("u:p")).await;
+    assert!(authed.contains("secret-ok"), "auth ok failed: {authed}");
+    // 大 body 透明透传（64KB 一致）：直调 backend 对比
+    let big_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let big_port = big_backend.local_addr().unwrap().port();
+    let big_body = "B".repeat(65536);
+    let big_clone = big_body.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = big_backend.accept().await.unwrap();
+            let bc = big_clone.clone();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 65536];
+                let _ = s.read(&mut b).await;
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{bc}", bc.len());
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // 热配加一条 big 隧道（走 server /api/config，agent 热更新即时）
+    let jwt = login(&env.web_base).await;
+    let _ = reqwest::Client::new()
+        .post(format!("{}/api/config", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"hostname": "e2e", "proxies": [
+            {"name":"web","type":"http","local_ip":"127.0.0.1","local_port":bweb,"domains":["w.e2e.test"]},
+            {"name":"sec","type":"http","local_ip":"127.0.0.1","local_port":bsec,"basic_auth":"u:p","domains":["s.e2e.test"]},
+            {"name":"big","type":"http","local_ip":"127.0.0.1","local_port":big_port,"domains":["b.e2e.test"]}
+        ]}))
+        .send()
+        .await;
+    let mut big_ok = false;
+    for _ in 0..40 {
+        let r = raw(li_port, "big.local.e2e", None).await;
+        if r.contains(&big_body) {
+            big_ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(big_ok, "64KB body via local ingress mismatch");
+    // 热配清空 → 404（路由即时摘除，无需 reload）
+    let _ = reqwest::Client::new()
+        .post(format!("{}/api/config", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"hostname": "e2e", "proxies": []}))
+        .send()
+        .await;
+    let mut gone = false;
+    for _ in 0..40 {
+        if raw(li_port, "web.local.e2e", None).await.contains("404") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(gone, "local ingress route did not disappear after hot-clear");
+}
+
 #[tokio::test]
 async fn kudus_http_udp_and_hot_config() {
     // kudus 全链路：建连→Register 收敛→http/udp 透传→热配清空路由消失。
