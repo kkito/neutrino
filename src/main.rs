@@ -33,6 +33,9 @@ enum Cmd {
         /// QUIC UDP listen (empty = disabled), e.g. 0.0.0.0:7444
         #[arg(long, default_value = "")]
         quic_listen: String,
+        /// kudus UDP listen (empty = disabled), e.g. 0.0.0.0:7445
+        #[arg(long, default_value = "")]
+        kudus_listen: String,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
         detach: bool,
@@ -153,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             desired,
             token,
             quic_listen,
+            kudus_listen,
             detach,
             log_file,
             pid_file,
@@ -167,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen).await
+            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
             let log = if log_file.is_empty() {

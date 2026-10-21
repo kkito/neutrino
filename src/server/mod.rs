@@ -3,6 +3,7 @@ pub mod api;
 pub mod auth;
 pub mod http_util;
 pub mod ingress;
+pub mod kudus;
 pub mod quic;
 pub mod state;
 pub mod tunnel;
@@ -16,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::RwLock};
 use std::collections::HashMap;
 
-pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str) -> anyhow::Result<()> {
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
         tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
@@ -158,6 +159,18 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
             }
         });
         println!("  quic     : udp://{quic_listen} (agent 用 --server quic://{quic_listen})");
+    }
+    if !kudus_listen.is_empty() {
+        // kudus 独立 UDP 端口（可选，与 WSS/QUIC 共存）：预共享 token，自研可靠传输。
+        let ks = shared.clone();
+        let kt = token.clone();
+        let kb = kudus_listen.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = kudus::run_kudus(ks, kt, &kb).await {
+                tracing::warn!("kudus listener {kb} exited: {e:#}");
+            }
+        });
+        println!("  kudus    : udp-k://{kudus_listen} (agent 用 --server kudus://{kudus_listen})");
     }
     axum::serve(lis, svc).await?;
     Ok(())
