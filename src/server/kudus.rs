@@ -3,6 +3,7 @@
 //! Register/Config 收敛 → 心跳 → 隧道泵。token 错/解密失败一律静默丢包（黑洞）。
 use crate::common::kudus::*;
 use crate::common::proto::*;
+use crate::common::quic::{decode_dgram, encode_dgram};
 use crate::server::state::{log_ev, save_state, AgentHandle, AgentInfo, Shared};
 use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay};
 use std::collections::HashMap;
@@ -65,6 +66,7 @@ impl SeqWindow {
 }
 
 /// 发包器：把 (hdr, proto_frame) 加密成 datagram 发往对端。
+/// UDP 访客包下行：payload 先套 dgram 帧再进复用帧（agent 拆边界用，与 quic.rs 同语）。
 #[derive(Clone)]
 struct Tx {
     sock: Arc<UdpSocket>,
@@ -241,7 +243,9 @@ async fn handle_conn(
                     if !txw.send_pkt(&h, t.as_bytes()) { break; }
                 }
                 Some((id, payload)) = out_rx.recv() => {
-                    let b = encode_data(id, &payload);
+                    // outbox 数据：UDP 访客下行必须先套 dgram 帧再进复用帧
+                    //（agent 侧读循环按 decode_dgram 拆边界；与 quic.rs::udp_out 同语）。
+                    let b = encode_data(id, &encode_dgram(&payload));
                     let h = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
                     seq = seq.wrapping_add(1);
                     if !txw.send_pkt(&h, &b) { break; }
@@ -311,7 +315,17 @@ async fn handle_conn(
                 continue;
             }
             if let Some((id, payload)) = decode_data(&body) {
-                deliver(&s, &agent_id, id, payload).await;
+                // UDP 包带 dgram 内帧：逐个拆投；非 dgram 即裸 TCP/HTTP 字节（egress 下行链路）。
+                let mut off = 0;
+                let mut delivered = false;
+                while let Some((dg, used)) = decode_dgram(&payload[off..]) {
+                    off += used;
+                    delivered = true;
+                    deliver(&s, &agent_id, id, dg).await;
+                }
+                if !delivered {
+                    deliver(&s, &agent_id, id, payload).await;
+                }
             }
         }
         #[allow(unreachable_code)]

@@ -60,7 +60,8 @@ flowchart TB
 关键点：
 
 - **控制帧**走 WSS Text JSON（`hello/register/ping/pong/open/close/config`），**数据帧**走 WSS Binary；QUIC 传输时控制走 control stream 的 length-prefixed JSON，数据走 control 复用帧（UDP 套 dgram 内帧）
-  `[stream_id:u32 BE][payload]`，server 用偶数 id。TCP/HTTP 每连接一个 stream 全双工；
+  `[stream_id:u32 BE][payload]`，server 用偶数 id。kudus 传输时控制与数据都走单 UDP socket 上的加密 datagram
+ （`[session 4B|nonce 24B|密文]`，内层 `[ver|flags|seq|ack|sack|ts][proto_frame]`，key=SHA256(token)）。TCP/HTTP 每连接一个 stream 全双工；
   UDP 每个 peer 一个 stream，每帧即一个 datagram。
 - HTTP（与 ws/WebUI 同端口 `--listen`）：axum 先匹配 `/ws`、`/api/*`，其余按 `Host` 路由到隧道 agent
   （隧道域名→透传，未知点分域名→`404 no such tunnel`，裸 IP/无点→WebUI）；TCP/UDP 仍按 `remote_port` 独立监听；

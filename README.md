@@ -1,7 +1,8 @@
-# neutrino — stealth WSS tunnel + QUIC fast lane (Rust, server|agent 单二进制)
+# neutrino — stealth WSS tunnel + QUIC fast lane + kudus stealth lane (Rust, server|agent 单二进制)
 
 对照 `natproxy/docs/tunnel-requirements.md` + `tunnel-design.md` 实现，M1–M5 全量；
-QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）。
+QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）；kudus 为第三传输
+（自研 UDP 可靠传输，全随机隐身，预共享 token 密钥，无 TLS/证书/协商）。
 
 ## 协议（src/proto.rs）
 
@@ -10,9 +11,10 @@ QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）。
   - S→C: `welcome/ping/pong/open/close/config/error`
 - 数据帧 WSS Binary：`[stream_id:u32 BE][payload]`，server 偶数 id。
   TCP/HTTP 每连接一个 stream 全双工；UDP 每个 peer 一个 stream，每帧即一个 datagram。
-- QUIC 传输（可选）：agent `--server quic://host:port`，server `--quic-listen 0.0.0.0:7444`（独立 UDP 端口，默认不开）。
-  自签证书（指纹打启动日志）+ token 真认证；control stream 走 length-prefixed JSON，数据经 control 复用帧
-  `[stream:u32 BE][payload]`（UDP 包套 dgram 内帧保边界）。WSS 语义全对齐：Register/Config 收敛、心跳、egress/link。
+- kudus 传输（可选）：agent `--server kudus://host:port`，server `--kudus-listen 0.0.0.0:7445`（独立 UDP 端口，默认不开）。
+  预共享 `key=SHA256(token)` + XChaCha20-Poly1305，自研可靠层（SYN/SYN-ACK/ACK+DATA/SACK/FIN，v1 含 SACK+AIMD 拥塞控制）；
+  全随机隐身：每包 24B 随机 nonce，无明文魔数/递增 seq，错 token/重放/任意垃圾零回包（黑洞）；单 datagram ≤1232B（MTU 内）。
+  WSS 语义全对齐：Register/Config 收敛、心跳、egress/link。
 - `ProxyConfig`：`name/type(local http|tcp|https|udp)/local_ip/local_port/domains/remote_port/set_x_forwarded_proto/enabled`（`enabled` 缺省 true，老配置兼容）。
 
 ## 功能对照
@@ -32,7 +34,7 @@ QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）。
 ## 测试
 
 ```bash
-cargo test            # 单元（帧/路由/XFP/JWT/state/期望态/校验/QUIC 成帧/选路） + e2e（含 QUIC http/udp/热配/错 token）
+cargo test            # 单元（帧/路由/XFP/JWT/state/期望态/校验/QUIC 成帧/选路/kudus 包/SACK） + e2e（含三传输 http/udp/热配/错 token/黑洞探针）
 ```
 
 e2e 用 `CARGO_BIN_EXE_neutrino` 起真 server/agent 子进程（`kill_on_drop`，无残留），随机端口，
