@@ -226,7 +226,6 @@ pub(crate) async fn stream_body_until_idle(ctx: Arc<Ctx>, sid: u32, lr: &mut tok
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn chunked_body_decodes_fully_before_forward() {

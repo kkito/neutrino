@@ -241,7 +241,7 @@ pub(crate) fn resolve_link(
 /// Open{link, host/port=真实目标} → 双 channel 对接泵。任一方向结束即双关+清
 /// conns 行（Drop-guard 语义，防 HttpConnGuard 修过的同类僵尸行）。
 /// 根因→修法：link 双端都是 WSS 流（无本地 socket），泵两端都经 incoming/outbox。
-fn spawn_link_relay(
+pub(crate) fn spawn_link_relay(
     s: &S,
     entry_agent_id: &str,
     entry_hostname: &str,
@@ -391,7 +391,7 @@ fn spawn_link_relay(
 /// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
 /// 根因→修法：与 ingress 对称但方向相反——ingress 是 server 收连接让 agent 拨本地，
 /// egress 是 agent 发 Open 让 server 拨公网；泵结构复用 tcp ingress（incoming/outbox）。
-fn spawn_egress_dial(
+pub(crate) fn spawn_egress_dial(
     s: &S,
     agent_id: &str,
     sid: u32,
