@@ -278,7 +278,6 @@ pub(crate) async fn stream_body_until_idle<S: Sender>(tx: S, sid: u32, lr: &mut 
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn chunked_body_decodes_fully_before_forward() {
         // RED: chunked framing（块大小行/`0` 结束块）绝不能透传给 client。

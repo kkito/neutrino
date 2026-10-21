@@ -432,6 +432,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         }];
         assert!(crate::server::tunnel::needs_config_push(&[], &proxies));
         assert!(!crate::server::tunnel::needs_config_push(&proxies, &proxies));

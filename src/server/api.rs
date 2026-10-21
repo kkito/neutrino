@@ -71,14 +71,22 @@ pub(crate) async fn api_tunnels(
         return unauthorized();
     }
     let ag = s.agents.read().await;
+    let lims = s.rate_limiters.read().await;
     let mut out = vec![];
     for hh in ag.values() {
         for p in &hh.info.proxies {
+            // 限速实况：key 同泵侧 traffic_key；无 key = 该映射无流量经过 limiter。
+            let rl = lims.get(&crate::server::state::traffic_key(&hh.info.hostname, &p.name)).map(|l| {
+                let (limit, bytes, sleep_ms) = l.stats();
+                serde_json::json!({"limit_bps": limit, "throttled_bytes": bytes, "sleep_ms": sleep_ms})
+            });
             out.push(serde_json::json!({
                 "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
                 "name": p.name, "enabled": p.enabled,
                 "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
                 "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
+                "rate_limit": p.rate_limit,
+                "ratelimit_stats": rl,
                 "target": format!("{}:{}", p.local_ip, p.local_port),
                 "status": if p.enabled { "online" } else { "disabled" },
             }));
@@ -101,20 +109,40 @@ pub(crate) async fn api_logs(
 
 /// 分钟点切片：按 gran 把分钟点组成块求和，取后 n 块。返回 (块序列, 每块秒数)。
 /// 根因→修法：hour/day 不另存，由分钟点现算（spec §3）。
+/// 点自带 ts（(ts,rx,tx)），返回 (ts,rx,tx) 块序列。
+/// 根因→修法：旧 slice 返回无 ts 的增量，api 用 now-len*step 反推时间，
+/// 重启/断流后旧点画到错误时间。块 ts 取块内最新点的 ts；ts=0 的旧点
+/// （升级前落盘）回退为 now-(位置)*step 估算，不再全局错位。
 pub(crate) fn slice_points(
-    v: &std::collections::VecDeque<(u64, u64)>,
+    v: &std::collections::VecDeque<(i64, u64, u64)>,
     gran: &str,
     n: usize,
-) -> (Vec<(u64, u64)>, usize) {
+    now: i64,
+) -> (Vec<(i64, u64, u64)>, usize) {
     let per = match gran {
         "hour" => 60,
         "day" => 1440,
         _ => 1,
     };
-    let flat: Vec<(u64, u64)> = v.iter().cloned().collect();
-    let mut chunks: Vec<(u64, u64)> = flat
+    let step: i64 = per as i64 * 60;
+    let flat: Vec<(i64, u64, u64)> = v.iter().cloned().collect();
+    let total = flat.len();
+    let mut chunks: Vec<(i64, u64, u64)> = flat
         .rchunks(per)
-        .map(|c| c.iter().fold((0, 0), |(a, b), (x, y)| (a + x, b + y)))
+        .enumerate()
+        .map(|(ci, c)| {
+            let (r, t) = c.iter().fold((0, 0), |(a, b), (_, x, y)| (a + x, b + y));
+            // 块 ts：块内最新点的 ts；全 0（旧点）则按块位置回退估算
+            let ts = c.iter().map(|(ts, _, _)| *ts).max().unwrap_or(0);
+            let ts = if ts > 0 {
+                ts
+            } else {
+                // ci=0 是最新块：now - ci*step
+                now - ci as i64 * step
+            };
+            let _ = total;
+            (ts, r, t)
+        })
         .collect();
     chunks.reverse();
     let take = chunks.len().min(n);
@@ -164,28 +192,56 @@ pub(crate) async fn api_traffic(
     } else {
         vec![q.tunnel.clone()]
     };
-    let mut series: Vec<(u64, u64)> = vec![];
+    let now = chrono::Local::now().timestamp();
+    // 按 ts 归桶：桶宽 = gran 步长，桶 ts = 桶内最新点 ts 回退对齐。
+    // 根因→修法：旧逻辑按位对齐相加 + now-len*step 反推，不同 key 点数不一、
+    // 重启缺口都错位；新逻辑每个 (ts,rx,tx) 按 ts 落桶，缺桶即 0，不断崖不错位。
+    let mut buckets: std::collections::BTreeMap<i64, (u64, u64)> = Default::default();
     for k in &keys {
         if let Some(v) = tr.get(k) {
-            let (pts, _) = slice_points(v, &gran, n);
-            if pts.len() > series.len() {
-                series.resize(pts.len(), (0, 0));
-            }
-            let off = series.len() - pts.len();
-            for (i, p) in pts.iter().enumerate() {
-                series[off + i].0 += p.0;
-                series[off + i].1 += p.1;
+            let (pts, _) = slice_points(v, &gran, n, now);
+            for (ts, r, t) in pts {
+                let b = ts - ((ts % step) + step) % step;
+                let e = buckets.entry(b).or_insert((0, 0));
+                e.0 += r;
+                e.1 += t;
             }
         }
     }
-    let now = chrono::Local::now().timestamp();
-    let start = now - series.len() as i64 * step;
-    let points: Vec<(i64, u64, u64)> = series
-        .iter()
-        .enumerate()
-        .map(|(i, (r, t))| (start + i as i64 * step, *r, *t))
+    // 只取后 n 桶（n 限制点数，防 30 天分钟点一次全吐）
+    let points: Vec<(i64, u64, u64)> = buckets
+        .into_iter()
+        .rev()
+        .take(n)
+        .rev()
+        .map(|(ts, (r, t))| (ts, r, t))
         .collect();
     Json(serde_json::json!({"points": points})).into_response()
+}
+
+/// GET /api/live?tunnel=<key|all>：5s 实时速率快照（纯内存，不落盘）。
+pub(crate) async fn api_live(
+    State((s, _)): State<(S, Arc<String>)>,
+    h: HeaderMap,
+    Query(q): Query<TrafficQ>,
+) -> impl IntoResponse {
+    let s2 = s.clone();
+    if !auth_ok(&h, &s2.jwt_secret) {
+        return unauthorized();
+    }
+    let live = s.live.read().await;
+    let mut rows = vec![];
+    for (k, (r, t)) in live.iter() {
+        if !q.tunnel.is_empty() && q.tunnel != "all" && *k != q.tunnel {
+            continue;
+        }
+        rows.push(serde_json::json!({
+            "tunnel": k, "rx_5s": r, "tx_5s": t,
+            "rx_s": r / 5, "tx_s": t / 5,
+        }));
+    }
+    rows.sort_by(|a, b| a["tunnel"].as_str().cmp(&b["tunnel"].as_str()));
+    Json(serde_json::json!({"live": rows, "interval": 5})).into_response()
 }
 
 /// GET /api/conns：当前连接快照。
@@ -294,6 +350,15 @@ fn validate_proxy(p: &ProxyConfig) -> Result<(), String> {
         "tcp" | "https" | "udp" => {
             if p.remote_port == 0 {
                 return Err(format!("{} proxy requires remote_port", p.ptype));
+            }
+            Ok(())
+        }
+        // link 复用 local_port 做入口监听端口（remote_port 不用，恒 0）；
+        // 对端/目标合法性由 agent 侧 valid_link + server resolve_link 兜底，此处只拦空名/零监听。
+        // rate_limit 故意不校验：非法在运行时 limit_of warn-忽略，不断言拒绝。
+        "link" => {
+            if p.local_port == 0 {
+                return Err("link proxy requires local_port".into());
             }
             Ok(())
         }
@@ -486,13 +551,16 @@ mod tests {
     fn traffic_slice_math() {
         use std::collections::VecDeque;
         // 180 个分钟点，每点 (60,30)：hour 应=60点求和，day 应=全量求和
-        let v: VecDeque<(u64, u64)> = (0..180).map(|_| (60u64, 30u64)).collect();
-        let (r, _) = super::slice_points(&v, "hour", 2);
+        let v: VecDeque<(i64, u64, u64)> = (0..180).map(|i| (1_760_900_000 + i as i64 * 60, 60u64, 30u64)).collect();
+        let now: i64 = 1_760_935_200;
+        let (r, _) = super::slice_points(&v, "hour", 2, now);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0], (3600, 1800));
-        let (r2, _) = super::slice_points(&v, "day", 31);
+        // 块 ts = 块内最新点 ts（点 ts 按 i 递增 60s）
+        assert_eq!((r[0].1, r[0].2), (3600, 1800));
+        assert!(r[1].0 > r[0].0, "块 ts 必须递增");
+        let (r2, _) = super::slice_points(&v, "day", 31, now);
         assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0], (180 * 60, 180 * 30));
+        assert_eq!((r2[0].1, r2[0].2), (180 * 60, 180 * 30));
     }
     #[test]
     fn webui_survives_refresh() {
@@ -504,11 +572,23 @@ mod tests {
         assert!(html.contains("/api/overview"), "boot probe missing");
     }
     #[test]
+    fn webui_edit_uses_row_agent_not_hostsel() {
+        // 根因：隧道表是全 agent 列表，但 saveForm/delRow 用顶部 hostsel 当 target；
+        // 当 hostsel=macmini 时编辑 snail-kkito/trans-bt-tcp，会把该行写进 macmini
+        // 的 desired，凭空造出一条 macmini/trans-bt-tcp。断言抓：保存/删除必须用
+        // 行内 agent（editingAgent/行参），欲缓存不一致时重取该 agent 的 desired。
+        let html = include_str!("../../web/index.html");
+        assert!(html.contains("editingAgent"), "edit must track row agent");
+        assert!(html.contains("delRow('${x.agent}'"), "delete must carry row agent");
+    }
+    #[test]
     fn webui_has_traffic_conns_tabs() {
         let html = include_str!("../../web/index.html");
         assert!(html.contains("sec-tr"), "missing traffic section");
         assert!(html.contains("sec-cn"), "missing conns section");
         assert!(html.contains("/api/traffic"), "missing traffic fetch");
+        assert!(html.contains("/api/live"), "missing live fetch");
+        assert!(html.contains("loadLive"), "missing live refresh");
         assert!(html.contains("/api/conns"), "missing conns fetch");
         assert!(html.contains("<canvas"), "traffic chart must be canvas");
         // 流量卡片标题随粒度联动（桶时长/查询范围写明白，不再用“周期/窗口”模糊词）
@@ -521,6 +601,9 @@ mod tests {
         assert!(html.contains("f-link-agent"), "missing link peer select");
         assert!(html.contains("link_agent"), "missing link fields");
         assert!(html.contains("不能是自己"), "missing link self-loop guard");
+        // 限速表单：输入框 + 回填 + 透传（tcp/udp/link 总量下行，http 隐藏）
+        assert!(html.contains("f-rate"), "missing rate_limit input");
+        assert!(html.contains("rate_limit"), "missing rate_limit fields");
         // 侧边栏版本号：server 版（overview.version）+ agent 页（status.version）
         assert!(html.contains("id=\"ver\""), "missing sidebar version span");
         assert!(html.contains("o.version"), "missing version render");
@@ -570,6 +653,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         };
         assert!(validate_proxy(&ok_http).is_ok());
         let mut bad = ok_http.clone();
@@ -584,6 +668,14 @@ mod tests {
         let mut unk = tcp.clone();
         unk.ptype = "socks".into();
         assert!(validate_proxy(&unk).is_err());
+        // link 类型必须放行（旧 match 无 link 分支，WebUI 存 link 会 400）；
+        // rate_limit 非法不断言拒绝（运行时 warn-忽略，见 limit_of）。
+        let mut link_p = ok_http.clone();
+        link_p.ptype = "link".into();
+        assert!(validate_proxy(&link_p).is_ok());
+        let mut rl = ok_http.clone();
+        rl.rate_limit = Some("abc".into());
+        assert!(validate_proxy(&rl).is_ok());
     }
 
     #[test]

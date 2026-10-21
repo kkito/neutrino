@@ -1,5 +1,6 @@
 //! agent 会话：WSS 长连 + Register/Config + Binary 分发 + 建流。
 use crate::common::proto::*;
+use crate::server::state::IDLE_KICK_SECS;
 use super::{AgentFileConfig, Upstream};
 use super::stream::{http_response_pump, WsSender};
 use futures_util::{SinkExt, StreamExt};
@@ -23,8 +24,9 @@ pub(crate) async fn session(
     status: Arc<RwLock<super::web::AgentStatus>>,
     egress_out: super::egress::OutHolder,
 ) -> anyhow::Result<()> {
+    tracing::info!("dial {} as '{}'", up.server_url, up.hostname);
     let (ws, _) = connect_async(up.server_url.as_str()).await?;
-    tracing::info!("ws connected");
+    tracing::info!("ws connected as '{}'", up.hostname);
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     // writer
@@ -89,6 +91,7 @@ pub(crate) async fn session(
     send(&ClientMsg::Register {
         proxies: cfg.proxies.clone(),
     })?;
+    tracing::info!("registered {} proxies", cfg.proxies.len());
 
     // ping loop
     {
@@ -112,8 +115,20 @@ pub(crate) async fn session(
         });
     }
 
-    // reader loop
-    while let Some(msg) = stream.next().await {
+    // reader loop：带心跳超时——timeout 内无任何 server 帧即判半开
+    // （server 重启/nginx 不掐下游时裸 next() 永 pend，外层重拨进不去）。
+    // 根因→修法：旧代码只发 Ping 不验 Pong，这次 tm hang 60s+ 無感知就卡死在这里。
+    loop {
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(IDLE_KICK_SECS as u64),
+            stream.next(),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(_) => anyhow::bail!("heartbeat timeout: no server frame for {IDLE_KICK_SECS}s"),
+        };
+        let Some(msg) = msg else { break };
         let msg = msg?;
         match msg {
             Message::Text(t) => match serde_json::from_str::<ServerMsg>(&t) {
@@ -194,10 +209,15 @@ pub(crate) async fn session(
                     }
                 }
             }
-            Message::Close(_) => break,
+            Message::Close(_) => {
+                tracing::warn!("ws closed by server");
+                break;
+            }
             _ => {}
         }
     }
+    // 主循环退出 = 掉线（调用方负责重连退避）。之前此处静默，agent 掉线只能去 server 侧猜。
+    tracing::warn!("ws session ended, will redial");
     *egress_out.write().await = None;
     writer.abort();
     anyhow::Ok(())

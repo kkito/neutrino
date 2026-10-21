@@ -80,6 +80,37 @@ pub struct ProxyConfig {
     /// link 对端可达目标 port。
     #[serde(default)]
     pub link_port: u16,
+    /// 映射级总量下行限速（tcp/udp/link），如 "0.5m"。None/空/非法 = 不限速。
+    #[serde(default)]
+    pub rate_limit: Option<String>,
+}
+
+/// 映射级限速速率解析：字符串 -> B/s。口径 MB/s 与 transmission UI 一致：
+/// `500k`=500KB/s，`0.5m`=0.5MB/s，`1.5g`=1.5GB/s；纯数字默认 `m`；
+/// 大小写不敏感；非法/<=0 返回 None（调用方当不限速 + warn，绝不炸 server）。
+pub fn parse_rate_limit(s: &str) -> Option<u64> {
+    let t = s.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    let (num, mult): (&str, f64) = if let Some(n) = t.strip_suffix('k') {
+        (n, 1024.0)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 1024.0 * 1024.0)
+    } else if let Some(n) = t.strip_suffix('g') {
+        (n, 1024.0 * 1024.0 * 1024.0)
+    } else {
+        (t.as_str(), 1024.0 * 1024.0)
+    };
+    let v: f64 = num.trim().parse().ok()?;
+    if !v.is_finite() || v <= 0.0 {
+        return None;
+    }
+    let bps = (v * mult).round() as u64;
+    if bps == 0 {
+        return None;
+    }
+    Some(bps)
 }
 
 /// link 条目校验（纯函数）：对端/目标/监听缺一不可，且禁止自环。
@@ -221,6 +252,25 @@ mod tests {
         }
         let _: ClientMsg = serde_json::from_str(r#"{"t":"pong","ts":5}"#).unwrap();
         let _: ServerMsg = serde_json::from_str(r#"{"t":"ping","ts":5}"#).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_parses_mbps_notation() {
+        // 口径与 transmission UI 一致：1m = 1024*1024 B/s；纯数字默认 m；大小写不敏感
+        assert_eq!(super::parse_rate_limit("0.5m"), Some(524288));
+        assert_eq!(super::parse_rate_limit("500k"), Some(512000));
+        assert_eq!(super::parse_rate_limit("2"), Some(2 * 1024 * 1024));
+        assert_eq!(
+            super::parse_rate_limit("1.5G"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(super::parse_rate_limit(" 1M "), Some(1024 * 1024));
+        // 非法 -> None（调用方当不限速 + warn，绝不炸）
+        assert_eq!(super::parse_rate_limit(""), None);
+        assert_eq!(super::parse_rate_limit("-1m"), None);
+        assert_eq!(super::parse_rate_limit("abc"), None);
+        assert_eq!(super::parse_rate_limit("0"), None);
+        assert_eq!(super::parse_rate_limit("0m"), None);
     }
 
     #[test]

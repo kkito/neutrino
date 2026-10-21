@@ -75,6 +75,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
             }],
         );
         st.save();

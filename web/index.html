@@ -95,6 +95,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <div class="stat"><div class="k" id="tr-peak-k">单桶峰值（rx+tx）</div><div class="v" id="tr-peak">-</div></div>
 <div class="stat"><div class="k" id="tr-sum-k">近3小时总量（rx/tx）</div><div class="v" id="tr-sum" style="font-size:15px">-</div></div>
 </div>
+<div class="card" style="margin-bottom:10px"><div style="font-size:12px;color:var(--mut)">实时速率（5s 快照 · 每5s刷新）</div><div id="live" style="font-size:13px;margin-top:4px">-</div></div>
 <div class="legend"><span><span class="dot" style="background:#4f9cf0"></span>rx 上行</span><span><span class="dot" style="background:#3fb97f"></span>tx 下行</span><span id="tr-hint"></span></div>
 <canvas class="chart" id="chart" width="960" height="260"></canvas>
 </section>
@@ -120,6 +121,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <label id="l-ip">目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）</label><input id="f-ip" value="127.0.0.1">
 <label id="l-lport">目标端口（agent 本机视角）</label><input id="f-lport" type="number" placeholder="如 80">
 <label>入口 Basic 认证（可选，http 隧道：浏览器先弹框登录才放行；格式 user:pass，transmission 这类无登录页的最合适。留空=不校验）</label><input id="f-basic" placeholder="如 admin:一串随机口令" autocomplete="off">
+<label id="l-rate">下行限速（可选，仅 tcp/udp/link 总量：如 0.5m=0.5MB/s、500k；留空=不限速；口径与 transmission 显示一致）</label><input id="f-rate" placeholder="如 0.5m">
 <label><input type="checkbox" id="f-en" checked> 启用</label>
 <div class="row" style="margin-top:16px;justify-content:flex-end">
 <button class="btn ghost" onclick="closeForm()">取消</button>
@@ -127,7 +129,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 </div></div>
 <div id="toast"></div>
 <script>
-let auth='', editing=null, desiredCache=[], trGran='min';
+let auth='', editing=null, editingAgent=null, desiredCache=[], trGran='min';
 function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
   document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
@@ -155,7 +157,7 @@ async function refresh(){
     o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${human(a.rx_bytes)}/${human(a.tx_bytes)}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
   await loadDesired(false);
   const t=await need('/api/tunnels');
-  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
+  document.getElementById('tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>限速</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
     const isLink=x.type==='link';
     const where=isLink?'-':`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
     const tgt=isLink?`${x.link_agent||'?'}→${x.link_host||'?'}:${x.link_port||'?'}`:x.target;
@@ -163,8 +165,8 @@ async function refresh(){
     const st=!x.enabled?'<span class="badge b-off">已禁用</span>':(live?'<span class="badge b-ok">生效中</span>':'<span class="badge b-warn">待同步</span>');
     const btn=x.enabled?`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button class="btn ghost" onclick="toggle('${x.agent_id}','${x.name}',true)">启用</button>`;
     const ed=`<button class="btn ghost" onclick='editRow(${JSON.stringify(x).replace(/'/g,"&#39;")})'>编辑</button>`;
-    const del=`<button class="btn ghost" onclick="delRow('${x.name}')">删除</button>`;
-    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=7>暂无</td></tr>';
+    const del=`<button class="btn ghost" onclick="delRow('${x.agent}','${x.name}')">删除</button>`;
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${x.rate_limit||'-'}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=8>暂无</td></tr>';
   const l=await need('/api/logs');
   document.getElementById('logs').textContent=l.logs.join('\n');
   if(!document.getElementById('sec-tr').classList.contains('hidden')) loadTraffic();
@@ -173,6 +175,17 @@ async function refresh(){
 }
 function human(n){ if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'K'; if(n<1073741824) return (n/1048576).toFixed(1)+'M'; return (n/1073741824).toFixed(2)+'G'; }
 function setGran(g){ trGran=g; for(const b of document.querySelectorAll('#trseg button')) b.classList.toggle('on',b.dataset.g===g); loadTraffic(); }
+async function loadLive(){
+  try{
+  const t=await need('/api/tunnels');
+  const sel=document.getElementById('trtunnel');
+  const tun=sel&&sel.value?sel.value:'all';
+  const j=await need(`/api/live?tunnel=${encodeURIComponent(tun)}`);
+  const rows=j.live||[];
+  document.getElementById('live').innerHTML=rows.length?rows.map(r=>`${r.tunnel} <b>${human(r.rx_s)}/s</b> / <b>${human(r.tx_s)}/s</b>`).join('&nbsp;&nbsp;·&nbsp;&nbsp;'):'暂无流量（等待下一 5s tick）';
+  }catch(e){}
+}
+setInterval(()=>{ if(!document.getElementById('sec-tr').classList.contains('hidden')) loadLive(); },5000);
 async function loadTraffic(){
   try{
   const t=await need('/api/tunnels');
@@ -188,18 +201,20 @@ async function loadTraffic(){
   const peak=pts.reduce((a,p)=>Math.max(a,p[1]+p[2]),0);
   // 卡片标题随粒度联动，消除“周期/窗口”歧义：桶时长与查询范围写明白。
   const bucket=trGran==='min'?'1分钟':(trGran==='hour'?'1小时':'1天');
-  const span=trGran==='min'?'近3小时':(trGran==='hour'?'近7天':'近31天');
+  const span=pts.length>1?Math.round((pts[pts.length-1][0]-pts[0][0])/(trGran==='min'?60:(trGran==='hour'?3600:86400))):0;
+  const spanTxt=(span>0?`实际跨度${span}${trGran==='day'?'天':(trGran==='hour'?'小时':'分钟')}`:'暂无跨度')+`（${trGran==='min'?'每点1分钟':(trGran==='hour'?'每点1小时':'每点1天')}）`;
   const rate=s=>human(Math.round(s/(trGran==='min'?60:(trGran==='hour'?3600:86400))))+'/s';
   document.getElementById('tr-rx-k').textContent=`最近${bucket} rx（均速 ${rate(last[1])}）`;
   document.getElementById('tr-tx-k').textContent=`最近${bucket} tx（均速 ${rate(last[2])}）`;
   document.getElementById('tr-peak-k').textContent=`单${bucket}峰值（rx+tx）`;
-  document.getElementById('tr-sum-k').textContent=`${span}总量（rx/tx）`;
+  document.getElementById('tr-sum-k').textContent=`${spanTxt}总量（rx/tx）`;
   document.getElementById('tr-rx').textContent=human(last[1]);
   document.getElementById('tr-tx').textContent=human(last[2]);
   document.getElementById('tr-peak').textContent=human(peak);
   document.getElementById('tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
-  document.getElementById('tr-hint').textContent=pts.length?`${span}共 ${pts.length} 点 · 每点${bucket}`:'暂无数据（等待下一分钟 tick）';
+  document.getElementById('tr-hint').textContent=pts.length?`${spanTxt} · 共 ${pts.length} 点`:'';
   drawChart(pts);
+  loadLive();
   }catch(e){}
 }
 function drawChart(pts){
@@ -258,6 +273,8 @@ function typeFields(){
   document.getElementById('f-port').classList.toggle('hidden',isHttp||isLink);
   for(const id of ['l-link-agent','f-link-agent','l-link-tgt','f-link-tgt'])
     document.getElementById(id).classList.toggle('hidden',!isLink);
+  document.getElementById('l-rate').classList.toggle('hidden',isHttp);
+  document.getElementById('f-rate').classList.toggle('hidden',isHttp);
   document.getElementById('l-ip').textContent=isLink?'本监听地址（入口 agent 上起监听：0.0.0.0=入口内网可达，127.0.0.1=仅本机）':'目标 IP（agent 本机视角：填 agent 所在机器能访问的地址，127.0.0.1 = agent 本机）';
   document.getElementById('l-lport').textContent=isLink?'本监听端口':'目标端口（agent 本机视角）';
   if(isLink){
@@ -271,13 +288,13 @@ function typeFields(){
     }).catch(()=>{});
   }
 }
-function openForm(){ editing=null; document.getElementById('formtitle').textContent='新增隧道';
-  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic','f-link-ip','f-link-port']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
+function openForm(){ editing=null; editingAgent=document.getElementById('hostsel').value; document.getElementById('formtitle').textContent='新增隧道';
+  for(const id of ['f-name','f-dom','f-ip','f-lport','f-basic','f-rate','f-link-ip','f-link-port']) document.getElementById(id).value=(id==='f-ip'?'127.0.0.1':'');
   document.getElementById('f-link-agent').innerHTML='';
   document.getElementById('f-en').checked=true; typeFields();
   document.getElementById('formwrap').classList.remove('hidden'); }
 function closeForm(){ document.getElementById('formwrap').classList.add('hidden'); }
-function editRow(x){ editing=x.name;
+function editRow(x){ editing=x.name; editingAgent=x.agent;
   document.getElementById('formtitle').textContent='编辑 '+x.name;
   document.getElementById('f-name').value=x.name;
   document.getElementById('f-type').value=x.type||'http'; typeFields();
@@ -286,6 +303,7 @@ function editRow(x){ editing=x.name;
   document.getElementById('f-basic').value=x.basic_auth||'';
   document.getElementById('f-link-ip').value=x.link_host||'';
   document.getElementById('f-link-port').value=x.link_port||'';
+  document.getElementById('f-rate').value=x.rate_limit||'';
   const tgt=(x.target||'').split(':'); document.getElementById('f-ip').value=tgt[0]||'127.0.0.1';
   document.getElementById('f-lport').value=tgt[1]||'';
   if((x.type||'')==='link'){ const sel=document.getElementById('f-link-agent'); sel.innerHTML=`<option>${x.link_agent||''}</option>`; sel.value=x.link_agent||''; }
@@ -304,11 +322,16 @@ function curProxy(){
   if(t==='link'){ p.link_agent=document.getElementById('f-link-agent').value.trim();
     p.link_host=document.getElementById('f-link-ip').value.trim();
     p.link_port=parseInt(document.getElementById('f-link-port').value||'0'); }
+  if(t!=='http'){ const rl=document.getElementById('f-rate').value.trim(); if(rl) p.rate_limit=rl; }
   return p;
 }
 async function saveForm(){
-  const h=document.getElementById('hostsel').value;
+  // 根因→修法：隧道表是全 agent 列表，保存必须用行内 agent（editingAgent），
+  // 不能用顶部 hostsel——否则跨 agent 编辑会把行写进错的 desired，凭空造隧道。
+  const h=editingAgent||document.getElementById('hostsel').value;
   if(!h){ toast('先选 agent',true); return; }
+  // desiredCache 可能是别的 agent 的，保存前现取目标 agent 的 desired
+  try{ const d=await need('/api/desired/'+encodeURIComponent(h)); desiredCache=d.proxies||[]; }catch(e){ toast('取期望配置失败',true); return; }
   const p=curProxy();
   if(!p.name){ toast('名称必填',true); return; }
   if(p.type==='http'&&!p.domains.length){ toast('http 隧道域名必填',true); return; }
@@ -329,10 +352,11 @@ async function saveForm(){
   if(r.ok){ toast('已保存并下发'); closeForm(); refresh(); }
   else { const j=await r.json().catch(()=>({})); toast('保存失败: '+(j.reason||r.status),true); }
 }
-async function delRow(name){
-  const h=document.getElementById('hostsel').value;
-  if(!confirm('删除隧道 '+name+'？')) return;
-  const list=desiredCache.filter(q=>q.name!==name);
+async function delRow(agent,name){
+  const h=agent||document.getElementById('hostsel').value;
+  if(!confirm('删除隧道 '+h+'/'+name+'？')) return;
+  let list;
+  try{ const d=await need('/api/desired/'+encodeURIComponent(h)); list=(d.proxies||[]).filter(q=>q.name!==name); }catch(e){ toast('取期望配置失败',true); return; }
   const r=await fetch('/api/desired/'+encodeURIComponent(h),{method:'POST',headers:hdrs(true),credentials:'same-origin',body:JSON.stringify({proxies:list})});
   if(r.ok){ toast('已删除'); refresh(); } else toast('删除失败',true);
 }

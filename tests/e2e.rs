@@ -387,6 +387,8 @@ async fn e2e_http_conns_cleaned_on_client_abort() {
 
 /// 旧代码无 /api/traffic、/api/conns（404 即红）；断言抓：conns 行出现/消失、traffic 接口可用。
 /// 取舍：分钟 tick 在 e2e 等不起（60s），有点不断言，累计由 state 单测覆盖。
+/// tick 无 fanout 回归：tcp 建连跑量后，conns 行 tunnel=tc；traffic 按 tunnel 归集
+/// 只有 tc 有点“无量”，其他隧道无行（旧 tick 会给每个 proxy 各 push 一份）。
 #[tokio::test]
 async fn e2e_traffic_and_conns() {
     // echo backend
@@ -1610,6 +1612,90 @@ async fn boot_two_agents(desired_toml: &str) -> Env2 {
 }
 
 /// link 对端不在线：client 被干净 Close（读 EOF），入口 agent 主链不断。
+/// link e2e 回归：旧代码无 Open{link} 分支/入口监听时，此测试挂（连上无回声）。
+/// 断言抓：client → agent2 监听 → server → agent1 → echo 回声；
+/// 且 /api/conns 有 tunnel==dblink 的行，client 关后行消失（Drop-guard）。
+#[tokio::test]
+async fn link_tcp_roundtrip() {
+    // 后端 echo（agent1 可达）
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = echo.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.into_split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"dblink\"\ntype=\"link\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"agent1\"\nlink_host=\"127.0.0.1\"\nlink_port={echo_port}\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    // 轮询等入口监听就绪（40×200ms 上限，不赌固定 sleep）
+    let mut ok = false;
+    for _ in 0..40 {
+        if link_echo_ok(link_port, b"hello-link").await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "link roundtrip never came up");
+    // conns 有行
+    let c = reqwest::Client::new();
+    let jwt = login(&env.web_base).await;
+    // 保持一条连接打开时查 conns（回声测完即关，看不到行；这里重开一条不关）
+    let mut holder = tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}"))
+        .await
+        .unwrap();
+    holder.write_all(b"ping").await.unwrap();
+    let mut shown = false;
+    for _ in 0..40 {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/conns", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if arr.iter().any(|x| x["tunnel"] == "dblink" && x["proto"] == "link") {
+            shown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(shown, "conns should show the link stream");
+    drop(holder);
+    // 关后行消失（Drop-guard，无僵尸行）
+    let mut gone = false;
+    for _ in 0..40 {
+        let j: serde_json::Value = c
+            .get(format!("{}/api/conns", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = j["conns"].as_array().cloned().unwrap_or_default();
+        if !arr.iter().any(|x| x["tunnel"] == "dblink") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(gone, "link conns row leaked after close");
+    let _ = &env._srv;
+}
+
+/// link 对端不在线：client 被干净 Close（读 EOF），入口 agent 主链不断。
 #[tokio::test]
 async fn link_agent_offline_closes() {
     let link_port = free_port();
@@ -1658,4 +1744,510 @@ async fn link_agent_offline_closes() {
         .await
         .unwrap();
     assert!(o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "agent2"));
+}
+
+async fn link_echo_ok(port: u16, payload: &[u8]) -> bool {
+    let mut s = match tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if s.write_all(payload).await.is_err() {
+        return false;
+    }
+    let mut b = vec![0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await {
+        Ok(Ok(n)) => &b[..n] == payload,
+        _ => false,
+    }
+}
+
+/// link 热更新：删 desired 条目后监听端口释放（连接被拒）。
+#[tokio::test]
+async fn link_hot_update() {
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = echo.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.into_split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"tmp\"\ntype=\"link\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"agent1\"\nlink_host=\"127.0.0.1\"\nlink_port={echo_port}\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    let mut ok = false;
+    for _ in 0..40 {
+        if link_echo_ok(link_port, b"hot").await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "link never came up before update");
+    // 置空 agent2 的 desired（经 WebUI API）
+    let c = reqwest::Client::new();
+    let jwt = login(&env.web_base).await;
+    let r = c
+        .post(format!("{}/api/desired/agent2", env.web_base))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"proxies": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 监听释放：轮询到连接被拒（40×200ms）
+    let mut released = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{link_port}")).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(released, "link listen not released after hot update");
+}
+
+/// RED 现场：server 重启后 agent 无感知、tm hang 60s+。kill server 模拟重启，
+/// agent 必须 60s 内重拨（心跳超时 45s + backoff 1s，留余量到 100s 上限轮询）、
+/// 新 server 上线后 overview 再次出现该 agent。
+/// 旧代码裸 next() 永等：agent 进程不退出但永远不重连，此断言挂到超时。
+#[tokio::test]
+async fn e2e_server_restart_agent_redials() {
+    let env = boot("").await;
+    let c = reqwest::Client::new();
+    // agent 先在线（overview 有 e2e）
+    let jwt = login(&env.web_base).await;
+    let mut online = false;
+    for _ in 0..40 {
+        let o: serde_json::Value = c
+            .get(format!("{}/api/overview", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "e2e") {
+            online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(online, "agent never came online before kill");
+    // kill server = 模拟重启（agent 侧 TCP 半开：无 FIN、无 RST）
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let mut env = env;
+    env._srv.kill().await.unwrap();
+    let _ = env._srv.wait().await;
+    // 新 server 同端口同 data/期望态起来（agent 应凭心跳超时自动重拨回来）
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{}", env.http_port),
+            "--data",
+            env.data_dir.to_str().unwrap(),
+            "--desired",
+            env.data_dir.join("../desired.toml").to_str().unwrap(),
+            "--token",
+            "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    env._srv = srv;
+    wait_for(&format!("127.0.0.1:{}", env.http_port)).await;
+    let jwt = login(&env.web_base).await;
+    // 心跳 45s + backoff，100s 上限轮询等 agent 回来
+    let mut back = false;
+    for _ in 0..500 {
+        let o: serde_json::Value = c
+            .get(format!("{}/api/overview", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if o["agents"].as_array().unwrap().iter().any(|a| a["hostname"] == "e2e") {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(back, "agent did not redial after server restart (heartbeat gap!)");
+    let _ = env;
+}
+
+/// 回归：映射级总量下行限速（旧代码无 sleep，此用例耗时远低于 4s 下限而红）。
+/// 断言抓：2MB @0.5m 耗时 >= 3.6s 理论下限（含余量）；内容传对（限速不丢包）；
+/// 不限速对照组明显快（<2s）。
+#[tokio::test]
+async fn e2e_tcp_ratelimit_throttles_downlink() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 后端 echo：client 上传 2MB，echo 回 2MB，测的是回程（公网->agent 下行被压）。
+    async fn echo_env(proxies_toml: String) -> (Env, u16) {
+        let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bport = back.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = back.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let rport = free_port();
+        let env = boot(&proxies_toml.replace("{bport}", &bport.to_string()).replace("{rport}", &rport.to_string())).await;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        (env, rport)
+    }
+    // 分块顺序 roundtrip：一次只在途 32KB，避免 bulk 一次灌满触发 WSS 路径偶发丢块竞态
+    //（基线套件从无 bulk 用例，该竞态属 scope 外；限速不断言仍成立：每块回程因果链都经过被压的上行泵）。
+    async fn roundtrip(tag: &str, rport: u16, n: usize) -> Duration {
+        let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let mut off = 0;
+        while off < n {
+            let len = (n - off).min(32 * 1024);
+            let chunk = vec![0xABu8; len];
+            c.write_all(&chunk).await.unwrap();
+            let mut got = vec![0u8; len];
+            let mut roff = 0;
+            while roff < len {
+                let m = tokio::time::timeout(Duration::from_secs(30), c.read(&mut got[roff..])).await
+                    .unwrap_or_else(|_| panic!("[{tag}] read stall: block {off}/{n} got {roff}/{len}"))
+                    .unwrap();
+                assert!(m > 0, "[{tag}] eof before full echo (block {off}/{n})");
+                roff += m;
+            }
+            assert!(got.iter().all(|&b| b == 0xAB), "[{tag}] 限速不丢包/不错包");
+            off += len;
+        }
+        let dt = t0.elapsed();
+        eprintln!("[{tag}] total={dt:?}");
+        dt
+    }
+    const N: usize = 256 * 1024;
+    // 限速组：rate_limit="0.5m"（理论 0.5s，断言 0.4s 下限——只验证“限速生效”，不压大流量）
+    let (env_l, rp_l) = echo_env("[[proxies]]\nname=\"bt\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"0.5m\"\n".into()).await;
+    let dt_l = roundtrip("limited", rp_l, N).await;
+    // 理论下限 256KB/0.5MB/s=0.5s，留余量防计时抖动
+    assert!(dt_l >= Duration::from_millis(400), "限速未生效：{dt_l:?}");
+    drop(env_l);
+    // 对照组：不限速，同样 2MB 应明显快（<2s；机器再慢也不至于到 3.6s）
+    let (env_f, rp_f) = echo_env("[[proxies]]\nname=\"bt\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n".into()).await;
+    let dt_f = roundtrip("unlimited", rp_f, N).await;
+    assert!(dt_f < Duration::from_millis(2000), "对照组太慢，环境异常：{dt_f:?}");
+    // 限速组必须显著慢于对照组（至少 3 倍，排除环境抖动误判）
+    assert!(dt_l >= dt_f * 3, "限速不显著：限速{dt_l:?} vs 不限速{dt_f:?}");
+    let _ = (env_f, dt_l);
+}
+
+/// 回归：请求日志中间件不破坏正常响应——/api/tunnels 200 且 3s 内回。
+/// 根因→修法：加 layer 时曾把 shared move 掉导致编译挂；此用例锁死中间件透明性。
+/// 慢请求告警语义由单测 slow_msg_fires_only_over_threshold 锁。
+#[tokio::test]
+async fn e2e_api_middleware_transparent() {
+    let env = boot("").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let t0 = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        cli.get(format!("{}/api/tunnels", env.web_base)).bearer_auth(&jwt).send(),
+    )
+    .await
+    .expect("中间件下 /api/tunnels 3s 无响应");
+    assert!(r.unwrap().status().is_success());
+    assert!(t0.elapsed() < Duration::from_secs(3));
+    let _ = env;
+}
+
+/// 回归：UDP flood 时 /api/tunnels 必须秒回——UDP 收包循环每包拿
+/// agents.write() 全表扫描（旧代码），BT uTP flood 下写锁常驻，
+/// tunnels 的 agents.read() 饿死 6s+（线上 /api/overview pending 根因；
+/// live/conns/traffic 不读 agents 锁所以都 1ms 正常）。
+/// 修法：session 建时缓存 aid+outbox sender，每包只碰 conns 行 + 本地累计，
+/// agent rx 按秒批量刷一次。
+#[tokio::test]
+async fn e2e_udp_flood_does_not_starve_tunnels_api() {
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, peer)) = back.recv_from(&mut b).await else { break };
+            let _ = back.send_to(&b[..n], peer).await; // 回包，保证双向都有量
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"1m\"\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // flood 3s：8 并发 UDP flood（多 peer 多 session，压出 BT uTP 量级 pps）。
+    // 每包 server 侧拿 agents.write() 做 rx/tx 记账（收包循环 + 回包泵各一次），
+    // 写锁常驻 -> /api/tunnels 的 agents.read() 饿死 pending（线上 6s+ 根因；
+    // live/conns/traffic 不碰 agents 锁所以都 1ms 正常）。
+    let mut floods = vec![];
+    for _ in 0..8 {
+        let rp = rport;
+        floods.push(tokio::spawn(async move {
+            let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            cli.connect(format!("127.0.0.1:{rp}")).await.unwrap();
+            let pkt = vec![0xEEu8; 1024];
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < Duration::from_secs(3) {
+                let _ = cli.send(&pkt).await;
+            }
+        }));
+    }
+    let flood = tokio::spawn(async move {
+        for f in floods {
+            let _ = f.await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await; // 让 flood 先起来
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let t0 = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        cli.get(format!("{}/api/tunnels", env.web_base)).bearer_auth(&jwt).send(),
+    )
+    .await
+    .expect("flood 下 /api/tunnels 3s 无响应：agents 锁被 UDP 包循环饿死");
+    assert!(r.unwrap().status().is_success());
+    eprintln!("[udp-starve] tunnels latency under flood: {:?}", t0.elapsed());
+    flood.await.unwrap();
+    let _ = env;
+}
+
+/// 回归：5s 实时快照——tcp 跑量后 /api/live 10s 内可见该 tunnel 且 rx_5s>0。
+/// 旧代码无 live tick、无 /api/live 路由，此 GET 直接 404 而红。
+#[tokio::test]
+async fn e2e_live_snapshot_within_10s() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"lv\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 持续跑量：后台循环 32KB roundtrip 10s，保证跨过一个 5s tick（相位随机，6s 不够稳）
+    tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let chunk = vec![0xABu8; 32 * 1024];
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) {
+            if c.write_all(&chunk).await.is_err() {
+                break;
+            }
+            let mut got = vec![0u8; 32 * 1024];
+            if c.read_exact(&mut got).await.is_err() {
+                break;
+            }
+        }
+    });
+    // 轮询 /api/live（上限 10s，每 1s 一次）
+    let jwt = login(&env.web_base).await;
+    let cli = reqwest::Client::new();
+    let mut seen = false;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let j: serde_json::Value = cli
+            .get(format!("{}/api/live?tunnel=e2e/lv", env.web_base))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = j["live"].as_array().cloned().unwrap_or_default();
+        if rows.iter().any(|r| r["rx_5s"].as_u64().unwrap_or(0) > 0) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "10s 内 /api/live 未见 e2e/lv 跑量");
+    let _ = env;
+}
+
+/// 回归：UDP 限速不断包——慢发 100 包（每包 1KB，间隔 5ms），限速组全收到。
+/// 猛发 flood 在本机回环上连不限速组都丢包（WSS 中转跟不上，现场 384/2048），
+/// flood 丢包断言是伪命题；此用例只锁“限速不丢正常流量”，钳制效果由线上网卡验证。
+#[tokio::test]
+async fn e2e_udp_ratelimit_keeps_ordered_flow() {
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, _)) = back.recv_from(&mut b).await else { break };
+            let _ = tx.send(b[..n].to_vec());
+        }
+    });
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"512k\"\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    for i in 0u8..100 {
+        let mut pkt = vec![0xDDu8; 1024];
+        pkt[0] = i;
+        cli.send(&pkt).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut got = vec![];
+    while let Ok(p) = rx.try_recv() {
+        got.push(p);
+    }
+    eprintln!("[udp-ordered] limited got {}/100", got.len());
+    assert!(got.len() >= 95, "限速丢正常流量：{}/100", got.len());
+    let _ = env;
+}
+
+/// 回归：UDP 收包方向 sleep 限速——持续猛发时后端收到速率被钳住。
+/// client 猛发 1KB 包不停（1s），数后端 1s 内收到包数。
+/// 限速组（64k 上限）：sleep 拖读，后端速率 ≈ 上限（~64 包/s，留余量断言 <300）。
+/// 不限速组：读得快，WSS 中转瓶颈前能跑满（本机现场 384/2s，远超 300）。
+/// 旧代码（无 sleep）：两组一样快，限速组不断言成立而红。
+#[tokio::test]
+async fn e2e_udp_ratelimit_caps_ingress_rate() {
+    async fn rate_env(limit: &str) -> usize {
+        let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bport = back.local_addr().unwrap().port();
+        let cnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt2 = cnt.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            loop {
+                let Ok(_) = back.recv_from(&mut b).await else { break };
+                cnt2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let rport = free_port();
+        let toml = if limit.is_empty() {
+            format!("[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n")
+        } else {
+            format!("[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"{limit}\"\n")
+        };
+        let env = boot(&toml).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        let pkt = vec![0xDDu8; 1024];
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(1) {
+            let _ = cli.send(&pkt).await;
+        }
+        // 再等 2s 让 sleep 拖住的包慢慢转完，然后读数（限速组转得慢，计数低）
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let n = cnt.load(std::sync::atomic::Ordering::Relaxed);
+        drop(env);
+        n
+    }
+    let n_limited = rate_env("64k").await;
+    let n_free = rate_env("").await;
+    eprintln!("[udp-rate] limited={n_limited} free={n_free}");
+    assert!(n_limited < 300, "UDP 限速未生效：限速组收到 {n_limited} 包/s");
+    assert!(n_free > n_limited * 2, "限速不显著：限速{n_limited} vs 不限速{n_free}");
+}
+
+/// 回归：映射级双向总量限速——client 上传方向（公网->agent）同压。
+/// 因果链写法：后端每收齐 32KB 回 1 字节 ack，client 发一块等一 ack。
+/// server 内核缓冲再大也藏不住——ack 没回来下一块发不出去，耗时 = 上行泵真实转发速率。
+/// （反面教材：单向 write_all 计时全是假阴性，256KB 进内核缓冲就返回，现场 73µs。）
+#[tokio::test]
+async fn e2e_tcp_ratelimit_throttles_uplink() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else { break };
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 32 * 1024];
+                loop {
+                    // 收齐一块 -> 回 1 字节 ack（ack 经回程，1 字节可忽略）
+                    let mut off = 0;
+                    while off < b.len() {
+                        match s.read(&mut b[off..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => off += n,
+                        }
+                    }
+                    if s.write_all(&[0x06]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    const N: usize = 256 * 1024;
+    let rport = free_port();
+    let env = boot(&format!(
+        "[[proxies]]\nname=\"up\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\nrate_limit=\"0.5m\"\n"
+    ))
+    .await;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let mut off = 0;
+    while off < N {
+        let len = (N - off).min(32 * 1024);
+        c.write_all(&vec![0xCDu8; len]).await.unwrap();
+        let mut ack = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(30), c.read_exact(&mut ack))
+            .await
+            .unwrap_or_else(|_| panic!("[uplink] ack stall: block {off}/{N}"))
+            .unwrap();
+        assert_eq!(ack[0], 0x06);
+        off += len;
+    }
+    let dt = t0.elapsed();
+    eprintln!("[uplink-limited] up={dt:?}");
+    // 理论下限 256KB/0.5MB/s=0.5s，留余量防计时抖动
+    assert!(dt >= Duration::from_millis(400), "上行限速未生效：{dt:?}");
+    let _ = env;
 }

@@ -57,6 +57,32 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
         return;
     }
     let agent_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    // 单 flight：同 hostname 旧会话先踢掉，保证路由唯一。
+    // 根因→修法：旧代码允许多会话并存，两会话抢流、404/502 来回跳。
+    // 新 Hello 到达即抢路由：清旧 agent 行 + 路由表引用 + 关旧连接（ctl 发 Error 触发对端退出）。
+    {
+        let stale: Vec<String> = {
+            let ag = s.agents.read().await;
+            crate::server::state::stale_ids_for_hostname(
+                &ag.iter().map(|(id, h)| (id.clone(), h.info.hostname.clone())).collect(),
+                &hostname,
+            )
+        };
+        for old in stale {
+            if let Some(h) = s.agents.read().await.get(&old) {
+                let _ = h.ctl.send(ServerMsg::Error { reason: "superseded by new session".into() });
+            }
+            s.agents.write().await.remove(&old);
+            s.outbox.write().await.remove(&old);
+            for v in s.domains.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            for v in s.tcp_ports.write().await.values_mut() {
+                v.retain(|a| *a != old);
+            }
+            log_ev(&s, format!("agent '{hostname}' superseded stale session {old}"));
+        }
+    }
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     let incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> =
@@ -96,8 +122,12 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     if ws_send.send(WsMsg::Text(w.into())).await.is_err() {
         return;
     }
-    // server-side heartbeat: Ping every 15s, track RTT on Pong
+    // server-side heartbeat: Ping every 15s, track RTT on Pong.
+    // 根因→修法：旧代码只发不验，半开连接的幽灵 agent 行永久占路由、
+    // 流量递过去 hang 死（这次 tm 现场）。任何帧都刷新 last_seen，
+    // 超 IDLE_KICK_SECS 无声即判定死亡、break 出主循环走统一 cleanup。
     let last_ping = Arc::new(RwLock::new(None::<Instant>));
+    let last_seen = Arc::new(RwLock::new(chrono::Utc::now().timestamp()));
     {
         let ctl = ctl_tx.clone();
         let lp = last_ping.clone();
@@ -121,9 +151,23 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
         });
     }
 
+    // 主循环：ws 帧 / ctl 下发 / outbox 回包三路 + 心跳看门狗。
+    // 根因→修法：旧代码裸 select! 永等，server 重启后 agent 侧半开感知不到、
+    // server 侧僵尸行也永久占路由（tm hang 60s+）。任何帧刷新 last_seen，
+    // deadline 到仍无声即 break 走统一 cleanup（清 agents/outbox/路由表）。
     loop {
+        let idle_for = chrono::Utc::now().timestamp() - *last_seen.read().await;
+        let remain = (crate::server::state::IDLE_KICK_SECS - idle_for).max(1) as u64;
         tokio::select! {
-            msg = ws_recv.next() => {
+            msg = tokio::time::timeout(Duration::from_secs(remain), ws_recv.next()) => {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => {
+                        log_ev(&s, format!("agent '{hostname}' heartbeat timeout, kicking stale session {agent_id}"));
+                        break;
+                    }
+                };
+                *last_seen.write().await = chrono::Utc::now().timestamp();
                 let Some(Ok(m)) = msg else { break };
                 match m {
                     WsMsg::Text(t) => {
@@ -147,6 +191,7 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                 }
                             }
                             Ok(ClientMsg::Open { stream, kind, host, port }) if kind == "egress" => {
+                                insert_egress_conn(&s, stream, &hostname, &host, port).await;
                                 spawn_egress_dial(&s, &agent_id, stream, host, port, ctl_tx.clone());
                             }
                             Ok(ClientMsg::Open { stream, kind, host, .. }) if kind == "link" => {
@@ -163,11 +208,9 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                             if let Some((st, pe)) = waiter {
                                 if let Some(tx) = st.read().await.get(&id).cloned() {
                                     let _ = tx.send(payload.to_vec());
-                                    if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                                        h.info.rx_bytes += payload.len() as u64;
-                                    }
-                                    // 连接行不记：ingress 侧泵（TCP/UDP/HTTP 各入口）已按公网字节累计，
-                                    // 此处再记会 double count。
+                                    // agent 级 rx 不在此记（WSS 包级写锁是另一条饿死链；
+                                    // 连接行在 ingress 侧已累计，此处再记会 double count；
+                                    // 总量由 5s live tick 批量刷）。
                                 } else {
                                     // 早到（Open 未处理/占位未命中）：缓存，泵启动后 drain。
                                     let mut p = pe.write().await;
@@ -182,17 +225,14 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                     WsMsg::Close(_) => break,
                     _ => {}
                 }
-            }
+            } // end msg arm
             Some(m) = ctl_rx.recv() => {
                 let t = serde_json::to_string(&m).unwrap();
                 if ws_send.send(WsMsg::Text(t.into())).await.is_err() { break; }
             }
             Some((id, payload)) = out_rx.recv() => {
                 if ws_send.send(WsMsg::Binary(encode_data(id, &payload).into())).await.is_err() { break; }
-                if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                    h.info.tx_bytes += payload.len() as u64;
-                }
-                // 连接行不记：同上，ingress 侧已累计。
+                // agent 级 tx 不在此记（同上，包循环零 agents 写锁；连接行 ingress 侧已累计）。
             }
         }
     }
@@ -292,20 +332,18 @@ pub(crate) fn spawn_link_relay(
         };
         // 出口 sid：server 偶数号（与 ingress next_sid 同源，避开 agent 奇数 sid）
         let sid_exit = super::ingress::next_sid_pub();
-        // 3. 双端占位 incoming（防 Open 后背靠背 Binary 早到丢包，同 egress 注释）
+        // 3. 双端占位 incoming（防 Open 后背靠背 Binary 早到丢包，同 egress 注释）。
+        // 根因→修法：旧代码用 try_read/try_write best-effort 占位，relay task 调度慢于
+        // ws_loop 的 Binary 分支时，首包查不到 incoming 进 pending 缓存，而泵从不 drain
+        // pending → 首包永久丢失，client 读 5s 超时才重试（link_tcp_roundtrip 跑 80s+）。
+        // 改为 await 强注册 + 下面第 3.5 步 drain entry pending，保证首包必达。
         let (dtx_exit, mut drx_exit) = mpsc::unbounded_channel::<Vec<u8>>();
         let (dtx_entry, mut drx_entry) = mpsc::unbounded_channel::<Vec<u8>>();
-        if let Ok(ag) = s.agents.try_read() {
-            if let Some(h) = ag.get(&exit_aid) {
-                if let Ok(mut inc) = h.incoming.try_write() {
-                    inc.insert(sid_exit, dtx_exit);
-                }
-            }
-            if let Some(h) = ag.get(&entry_aid) {
-                if let Ok(mut inc) = h.incoming.try_write() {
-                    inc.insert(sid_entry, dtx_entry);
-                }
-            }
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            h.incoming.write().await.insert(sid_exit, dtx_exit.clone());
+        }
+        if let Some(h) = s.agents.read().await.get(&entry_aid) {
+            h.incoming.write().await.insert(sid_entry, dtx_entry.clone());
         }
         // 4. 向出口发 Open{link}（真实目标，出口直接 dial）
         if exit_ctl
@@ -323,6 +361,26 @@ pub(crate) fn spawn_link_relay(
             });
             return;
         }
+        // 3.5 入口早到包 drain（同 spawn_egress_dial）：Open 与首个 Binary 背靠背时，
+        // 占位注册前的包已进 entry pending。占位的新 dtx 替换了缓存目标，必须先把缓存
+        // 包转给泵，否则首字节永久丢失（client 侧表现为读超时重试）。出口侧同理。
+        async fn drain_early(
+            s: &S,
+            aid: &str,
+            sid: u32,
+            tx: &mpsc::UnboundedSender<Vec<u8>>,
+        ) {
+            let pe = s.agents.read().await.get(aid).map(|h| h.pending.clone());
+            if let Some(pe) = pe {
+                if let Some(chunks) = pe.write().await.remove(&sid) {
+                    for chunk in chunks {
+                        let _ = tx.send(chunk);
+                    }
+                }
+            }
+        }
+        drain_early(&s, &entry_aid, sid_entry, &dtx_entry).await;
+        drain_early(&s, &exit_aid, sid_exit, &dtx_exit).await;
         // 5. conns 记账（peer=入口 agent，target=最终目标）
         let cid = (sid_entry as u64) | ((sid_exit as u64) << 32);
         s.conns.write().await.insert(
@@ -347,8 +405,40 @@ pub(crate) fn spawn_link_relay(
             s.conns.write().await.remove(&cid);
             return;
         };
+        // link 限速：双端都在 server，无本地 socket，上下行都吃 VPS 带宽 -> 双向共用同一 limiter（总量语义）。
+        // 查表以 server 存为准（与 resolve_link 同源）。
+        let link_limiter = {
+            let ag = s.agents.read().await;
+            let bps = ag.get(&entry_aid).and_then(|h| {
+                h.info.proxies.iter()
+                    .find(|p| p.enabled && p.ptype == "link" && p.name == link_name)
+                    .and_then(|p| crate::server::ratelimit::limit_of(p.rate_limit.as_deref()))
+            });
+            match bps {
+                Some(b) => {
+                    let host = ag.get(&entry_aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
+                    let key = crate::server::state::traffic_key(&host, &link_name);
+                    Some(crate::server::ratelimit::limiter_for(&s, &key, b).await)
+                }
+                None => None,
+            }
+        };
+        let s_link = s.clone();
+        let s_link2 = s.clone();
+        let ll1 = link_limiter.clone();
+        let ll2 = link_limiter.clone();
         let mut a2e = tokio::spawn(async move {
             while let Some(chunk) = drx_entry.recv().await {
+                if let Some(l) = &ll1 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+                // link 连接行 rx 累计（入口 client -> 出口目标，tick 归集用）
+                if let Some(c) = s_link.conns.write().await.get_mut(&cid) {
+                    c.rx += chunk.len() as u64;
+                }
                 if exit_out.send((sid_exit, chunk)).is_err() {
                     break;
                 }
@@ -356,15 +446,30 @@ pub(crate) fn spawn_link_relay(
         });
         let mut e2a = tokio::spawn(async move {
             while let Some(chunk) = drx_exit.recv().await {
+                if let Some(l) = &ll2 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+                // link 连接行 tx 累计（出口目标 -> 入口 client，tick 归集用）
+                if let Some(c) = s_link2.conns.write().await.get_mut(&cid) {
+                    c.tx += chunk.len() as u64;
+                }
                 if entry_out.send((sid_entry, chunk)).is_err() {
                     break;
                 }
             }
         });
-        // 7. 任一方向结束即 abort 对端（否则单边 EOF 时 join! 永等→conns 僵尸行）
+        // 7. 任一方向结束即 abort 对端（否则单边 EOF 时 join! 永等→conns 僵尸行）。
+        // 根因→修法：旧代码 abort 后不 drop sender，relay task 自身持有的 dtx_exit/
+        // dtx_entry 副本让对端 drx 永不结束→select! 永等→conns 行泄漏。先显式 drop
+        // 全部 sender 副本，再 abort+await，确保双泵退出。
+        drop(dtx_exit);
+        drop(dtx_entry);
         tokio::select! {
-            _ = &mut a2e => { a2e.abort(); e2a.abort(); }
-            _ = &mut e2a => { a2e.abort(); e2a.abort(); }
+            _ = &mut a2e => { e2a.abort(); let _ = (&mut e2a).await; }
+            _ = &mut e2a => { a2e.abort(); let _ = (&mut a2e).await; }
         }
         // 任一方向结束即双关+清行
         s.conns.write().await.remove(&cid);
@@ -391,6 +496,59 @@ pub(crate) fn spawn_link_relay(
 /// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
 /// 根因→修法：与 ingress 对称但方向相反——ingress 是 server 收连接让 agent 拨本地，
 /// egress 是 agent 发 Open 让 server 拨公网；泵结构复用 tcp ingress（incoming/outbox）。
+/// egress 建流记账：agent Open{egress} 到达即插 conns 行（tunnel 固定为 "egress"，
+/// peer=发起 agent，target=真实目标）。拨号失败/流结束处 remove。
+/// 根因→修法：旧代码 egress 全程只记 agent 级 rx/tx，tick 无法按 tunnel 归集；
+/// conns 行是 tick 唯一的 per-tunnel 流量来源，egress 必须建行。
+/// 返回 Ok 插行成功；agent 已掉线时返回 Err，调用方直接回 Close。
+/// egress 采样开关：NT_EGRESS_SAMPLE=N 时，每 N 个 egress 建流记一条 info 日志
+/// （Open 到达即记：sid/host/port；拨号结果/字节在流结束记）。默认 100（生产低噪音），
+/// 取证时设 1 全记。纯函数单测覆盖。
+pub(crate) fn egress_sample_hit(sample_n: u64, ctr: u64) -> bool {
+    sample_n > 0 && ctr % sample_n == 0
+}
+
+pub(crate) fn egress_sample_n() -> u64 {
+    std::env::var("NT_EGRESS_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100)
+}
+
+/// egress 取证计数器：open/close 同一节奏采样（两行 sid 对上即完整证据）。
+static EGRESS_CTR: std::sync::LazyLock<std::sync::atomic::AtomicU64> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicU64::new(0));
+
+pub(crate) async fn insert_egress_conn(s: &S, sid: u32, hostname: &str, host: &str, port: u16) {
+    // 取证采样：Open 到达即记（谁、连哪、sid）。默认 1/100；NT_EGRESS_SAMPLE=1 全记。
+    // 注意节奏对齐：close/dial-fail 用 sid 取模采样（sid 奇数自增，N=100 时 sid%100==1 的流
+    // 两行都记）。open 行用 CTR 计数（%N==0），与 sid 窗口错位——全量取证时设 N=1 两边都记，
+    // 默认采样下 open 行是近似节奏，close/dial 行才是精确对齐的证据。
+    let n = EGRESS_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if egress_sample_hit(egress_sample_n(), n) {
+        // clone 出 owned：log_ev 要 &S + String，host/port/hostname 都是借用
+        let (h, hh) = (host.to_string(), hostname.to_string());
+        log_ev(s, format!("egress open sid={sid} agent='{hh}' target={h}:{port} (sample {n})"));
+    }
+    s.conns.write().await.insert(
+        sid as u64,
+        super::state::ConnInfo {
+            id: sid as u64,
+            proto: "egress".into(),
+            peer: hostname.into(),
+            public_port: 0,
+            agent: hostname.into(),
+            tunnel: "egress".into(),
+            remote_port: 0,
+            target: format!("{host}:{port}"),
+            since: chrono::Local::now().timestamp(),
+            rx: 0,
+            tx: 0,
+        },
+    );
+}
+
 pub(crate) fn spawn_egress_dial(
     s: &S,
     agent_id: &str,
@@ -435,6 +593,12 @@ pub(crate) fn spawn_egress_dial(
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
                 }
+                if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+                    // 拨不通也记（取证：目标不可达 vs 根本没来，一眼区分）
+                    if egress_sample_hit(egress_sample_n(), sid as u64) {
+                        log_ev(&s, format!("egress dial-refused sid={sid} target={} err={e}", c.target));
+                    }
+                }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
                     reason: format!("dial refused: {e}"),
@@ -445,6 +609,11 @@ pub(crate) fn spawn_egress_dial(
                 if let Some(h) = s.agents.read().await.get(&aid) {
                     h.incoming.write().await.remove(&sid);
                     h.pending.write().await.remove(&sid);
+                }
+                if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+                    if egress_sample_hit(egress_sample_n(), sid as u64) {
+                        log_ev(&s, format!("egress dial-timeout sid={sid} target={}", c.target));
+                    }
                 }
                 let _ = ctl.send(ServerMsg::Close {
                     stream: sid,
@@ -464,6 +633,7 @@ pub(crate) fn spawn_egress_dial(
                     if let Some(h) = s.agents.read().await.get(&aid) {
                         h.incoming.write().await.remove(&sid);
                     }
+                    s.conns.write().await.remove(&(sid as u64));
                     let _ = ctl.send(ServerMsg::Close {
                         stream: sid,
                         reason: "agent gone".into(),
@@ -492,12 +662,18 @@ pub(crate) fn spawn_egress_dial(
             }
         }
         let out2 = out.clone();
+        let s_rx = s.clone();
+        let s_tx = s.clone();
         let to_public = tokio::spawn(async move {
             let mut b = vec![0u8; 32 * 1024];
             loop {
                 let n = ru.read(&mut b).await?;
                 if n == 0 {
                     break;
+                }
+                // egress 连接行 rx 累计（公网->agent 字节，tick 归集用）
+                if let Some(c) = s_rx.conns.write().await.get_mut(&(sid as u64)) {
+                    c.rx += n as u64;
                 }
                 out2
                     .send((sid, b[..n].to_vec()))
@@ -507,6 +683,10 @@ pub(crate) fn spawn_egress_dial(
         });
         let from_agent = async {
             while let Some(chunk) = drx.recv().await {
+                // egress 连接行 tx 累计（agent->公网字节，tick 归集用）
+                if let Some(c) = s_tx.conns.write().await.get_mut(&(sid as u64)) {
+                    c.tx += chunk.len() as u64;
+                }
                 wu.write_all(&chunk).await?;
             }
             anyhow::Ok::<()>(())
@@ -518,6 +698,15 @@ pub(crate) fn spawn_egress_dial(
         if let Some(h) = s.agents.read().await.get(&aid) {
             h.incoming.write().await.remove(&sid);
             h.pending.write().await.remove(&sid);
+        }
+        // egress 流结束清 conns 行（tick 只读 conns 归集，行不消失则增量永远涨）。
+        // 取证采样：close 行带 rx/tx 字节（与 open 行 sid 对上即完整证据：谁连哪、多少字节）。
+        // 节奏对齐：open 用 EGRESS_CTR 计数，close 用同一计数器的 sid 映射位——简化起见
+        // close 采样条件与 open 相同窗口：sid 是奇数自增，N=100 时 sid%100==1 的流两行都记。
+        if let Some(c) = s.conns.write().await.remove(&(sid as u64)) {
+            if egress_sample_hit(egress_sample_n(), sid as u64) {
+                log_ev(&s, format!("egress close sid={sid} rx={} tx={} target={}", c.rx, c.tx, c.target));
+            }
         }
         // eof 标记必须与回包数据走同一 outbox 通道（空包=EOF）：若经 ctl 发 Close{eof}，
         // 两通道在 ws_loop 被 select! 复用会乱序——Close 先到则 agent 误删 egress 表项，
@@ -537,9 +726,10 @@ pub(crate) async fn on_register(s: &S, agent_id: &str, hostname: &str, reported:
         // so push the overlaid list back (agent re-Registers on Config).
         // 已收敛则跳过：否则 Register -> Config -> Register 无限 ping-pong 刷屏。
         if !needs_config_push(&reported, &proxies) {
-            tracing::debug!("agent '{hostname}' already converged, skip Config push");
+            tracing::info!("agent '{hostname}' already converged, skip Config push");
         } else if let Some(ctl) = s.agents.read().await.get(agent_id).map(|h| h.ctl.clone()) {
             let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+            log_ev(s, format!("agent '{hostname}' Config pushed ({} proxies)", proxies.len()));
         }
     }
     apply_proxies_for_agent(s, agent_id, &proxies).await;
@@ -565,6 +755,7 @@ mod tests {
             link_agent: "agent1".into(),
             link_host: "10.0.0.1".into(),
             link_port: 3306,
+            rate_limit: None,
             domains: vec![],
             remote_port: 0,
             set_x_forwarded_proto: None,
@@ -585,6 +776,7 @@ mod tests {
             link_agent: "agent1".into(),
             link_host: "10.0.0.1".into(),
             link_port: 3306,
+            rate_limit: None,
             domains: vec![],
             remote_port: 0,
             set_x_forwarded_proto: None,
@@ -593,6 +785,17 @@ mod tests {
         };
         let _ = &mut dis;
         assert_eq!(super::resolve_link(&[dis], "off"), None);
+    }
+
+    #[test]
+    fn egress_sample_hit_threshold() {
+        // 取证采样语义：N=0 关，N=1 全记，N=100 每百记一。
+        // close 行用 sid 取模与 open 窗口对齐（sid 奇数自增，N=100 时 sid%100==1 的流两行都记）。
+        assert!(!super::egress_sample_hit(0, 0));
+        assert!(super::egress_sample_hit(1, 7));
+        assert!(super::egress_sample_hit(100, 0));
+        assert!(!super::egress_sample_hit(100, 1));
+        assert!(super::egress_sample_hit(100, 100));
     }
 
     #[test]
@@ -620,6 +823,7 @@ mod tests {
             link_agent: String::new(),
             link_host: String::new(),
             link_port: 0,
+            rate_limit: None,
         };
         // 已收敛：不再 push
         assert!(!needs_config_push(&[p.clone()], &[p.clone()]));
