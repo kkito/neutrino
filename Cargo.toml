@@ -33,6 +33,7 @@ toml = "0.8"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 quinn = { version = "0.11", features = ["rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"
 sha2 = "0.10"
 

@@ -30,6 +30,9 @@ enum Cmd {
         /// pre-shared token (or env NEUTRINO_TOKEN)
         #[arg(long, default_value = "welcome2neutrino")]
         token: String,
+        /// QUIC UDP listen (empty = disabled), e.g. 0.0.0.0:7444
+        #[arg(long, default_value = "")]
+        quic_listen: String,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
         detach: bool,
@@ -149,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             data,
             desired,
             token,
+            quic_listen,
             detach,
             log_file,
             pid_file,
@@ -163,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token, &desired).await
+            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
             let log = if log_file.is_empty() {

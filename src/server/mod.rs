@@ -3,6 +3,7 @@ pub mod api;
 pub mod auth;
 pub mod http_util;
 pub mod ingress;
+pub mod quic;
 pub mod state;
 pub mod tunnel;
 
@@ -15,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::RwLock};
 use std::collections::HashMap;
 
-pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str) -> anyhow::Result<()> {
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
         tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
@@ -133,7 +134,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         // 注意：`/` 不单独注册精确路由，否则带隧道 Host 访问 `/` 会被它抢走；
         // 统一走 fallback 按 Host 分流（WebUI vs 隧道）。
         .fallback(fallback_http_ingress)
-        .with_state((shared, token.clone()));
+        .with_state((shared.clone(), token.clone()));
     let lis = TcpListener::bind(listen).await?;
     tracing::info!("server listening ws+webui+http-ingress on {listen}");
     println!("neutrino-server running:");
@@ -146,6 +147,18 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     }
     // ConnectInfo 让 fallback 能取对端 ip:port（连接列表 peer 列用）
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if !quic_listen.is_empty() {
+        // QUIC 独立 UDP 端口（可选，与 WSS 共存）：自签证书，token 真认证。
+        let qs = shared.clone();
+        let qt = token.clone();
+        let qb = quic_listen.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = quic::run_quic(qs, qt, &qb).await {
+                tracing::warn!("quic listener {qb} exited: {e:#}");
+            }
+        });
+        println!("  quic     : udp://{quic_listen} (agent 用 --server quic://{quic_listen})");
+    }
     axum::serve(lis, svc).await?;
     Ok(())
 }
