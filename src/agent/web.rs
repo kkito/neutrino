@@ -4,7 +4,7 @@
 use super::Upstream;
 use crate::common::proto::ProxyConfig;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -510,6 +510,34 @@ async fn api_reconnect(State(w): State<WebState>, h: HeaderMap) -> impl IntoResp
     Json(serde_json::json!({"ok": true, "note": "正在重连"})).into_response()
 }
 
+/// agent-admin 转手：浏览器→agent→server→agent→浏览器（登录用 agent 本地口令，无二次登录）。
+/// 根因→修法：出差在外管 hk server 不用先 ssh 回家；server 开关关时原样回 403。
+async fn api_srv_passthrough(
+    State(w): State<WebState>,
+    Path(path): Path<String>,
+    uri: axum::http::Uri,
+    h: HeaderMap,
+    method: axum::http::Method,
+    body: String,
+) -> impl IntoResponse {
+    if !auth_ok(&h, &w.secret) {
+        return unauthorized();
+    }
+    if !w.status.read().await.online {
+        return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"ok": false, "reason": "no session"}))).into_response();
+    }
+    let m = method.as_str().to_string();
+    // query 须透传（traffic/live 分页参数在 ? 里，Path 拿不到）。
+    let full = match uri.query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path,
+    };
+    match super::admin::admin_call(&m, &full, &body).await {
+        Ok((st, rb)) => (StatusCode::from_u16(st).unwrap_or(StatusCode::OK), Json(serde_json::from_str::<serde_json::Value>(&rb).unwrap_or(serde_json::Value::String(rb)))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"ok": false, "reason": e.to_string()}))).into_response(),
+    }
+}
+
 pub async fn serve(args: ServeArgs) {
     let app = Router::new()
         .route("/", get(index_page))
@@ -518,6 +546,7 @@ pub async fn serve(args: ServeArgs) {
         .route("/api/upstream", get(api_upstream))
         .route("/api/settings", post(api_settings))
         .route("/api/reconnect", post(api_reconnect))
+        .route("/api/srv/*path", get(api_srv_passthrough).post(api_srv_passthrough))
         .with_state(WebState {
             status: args.status,
             upstream: args.upstream,

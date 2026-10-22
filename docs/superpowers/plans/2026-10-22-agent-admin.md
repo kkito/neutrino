@@ -30,7 +30,7 @@
 - Consumes: 无。
 - Produces: `ClientMsg::AdminReq { req_id: u64, method: String, path: String, body: String }`；`ServerMsg::AdminResp { req_id: u64, status: u16, body: String }`；`Shared.allow_agent_admin`。Task 2/3/4 引用。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 在 `src/common/proto.rs` 的 `mod tests`（若无则新建 `#[cfg(test)] mod tests`）末尾加：
 
@@ -51,12 +51,12 @@ fn admin_req_resp_roundtrip() {
 
 （要求 `ClientMsg`/`ServerMsg` 派生 `PartialEq`——若没有，加 `PartialEq` 到 derive 列表。不加会红，正好是 RED。）
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --bin neutrino common::proto::tests::admin_req_resp 2>&1 | tail -5`
 Expected: FAIL（变体不存在，编译错即红）。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 (a) `src/common/proto.rs`：`ClientMsg` enum 加：
 
@@ -98,7 +98,7 @@ if token.len() < 16 {
 构造处（`load_state` 返回 `Shared{...}` 的位置）加 `allow_agent_admin: false` 默认，
 `run` 里覆盖为传入值（`Shared` 若是直接构造则改构造点；若 load_state 构造则 run 后 `ps.allow_agent_admin = allow_agent_admin`——看实际代码选）。
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --bin neutrino common::proto 2>&1 | grep "test result"`
 Expected: `ok`。
@@ -106,7 +106,7 @@ Expected: `ok`。
 Run: `RUSTFLAGS="-D warnings" cargo build 2>&1 | tail -1`
 Expected: `Finished` 无 warning。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/common/proto.rs src/main.rs src/server/mod.rs src/server/state.rs
@@ -127,7 +127,7 @@ git commit -m "feat(admin): AdminReq/AdminResp 协议 + --allow-agent-admin 开�
 - Consumes: Task 1 的协议变体 + `Shared.allow_agent_admin`；现有 `AgentInfo` 组装逻辑（从 `api_overview` 复制，不重构它）。
 - Produces: `pub(crate) async fn dispatch_admin(s: &S, hostname: &str, method: &str, path: &str, body: &str) -> (u16, String)`。Task 4 agent 转手只管透传，不依赖此签名细节。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 在 `src/server/api.rs` 的 `mod tests` 末尾加：
 
@@ -160,12 +160,12 @@ pub(crate) async fn test_shared() -> Arc<Shared> { ...最小构造... }
 
 `allow_agent_admin` 字段若是 `pub(crate)`，测试同 crate 可直接赋值。
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --bin neutrino server::api::tests::dispatch_admin 2>&1 | tail -5`
 Expected: FAIL（`dispatch_admin` 不存在）。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 (a) `src/server/api.rs` 加：
 
@@ -230,7 +230,7 @@ Ok(ClientMsg::AdminReq { req_id, method, path, body }) => {
 QUIC `src/server/quic.rs` 与 kudus `src/server/kudus.rs`（两处：读循环 + `dispatch_body`）同形复制。
 （变量名按各文件现有 `s/hostname/ctl_tx` 对齐，kudus 用 `&s/&agent_id` 形态——`hostname` 变量在 kudus 读循环存在。）
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --bin neutrino server::api 2>&1 | grep "test result"`
 Expected: `ok`。
@@ -238,7 +238,7 @@ Expected: `ok`。
 Run: `RUSTFLAGS="-D warnings" cargo build 2>&1 | tail -1`
 Expected: `Finished` 无 warning。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/server/api.rs src/server/tunnel.rs src/server/quic.rs src/server/kudus.rs src/server/state.rs
@@ -259,7 +259,7 @@ git commit -m "feat(admin-server): dispatch_admin 内核 + 三传输 server 分�
 - Consumes: Task 1 协议变体。
 - Produces: `pub(crate) async fn admin_call(pending, send_ctrl, method, path, body) -> anyhow::Result<(u16, String)>`（Task 4 的 `/api/srv/*` 调用它）。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `admin_call` 的超时/配对逻辑抽纯部单测。在新建 `src/agent/admin.rs`：
 
@@ -280,12 +280,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --bin neutrino agent::admin 2>&1 | tail -5`
 Expected: FAIL（文件/函数不存在）。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 新建 `src/agent/admin.rs`：
 
@@ -340,7 +340,7 @@ pub(crate) async fn on_admin_resp(pending: &AdminPending, req_id: u64, status: u
   同时把一份存到 `AgentStatus` 或 web 共享结构供 Task 4 用（最小改：`lazy_static` 级别的
   `OnceCell<AdminPending>` 都行，但优先放现有 status/share 结构里——动手看 `web.rs` 共享结构选）。
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --bin neutrino agent::admin 2>&1 | grep "test result"`
 Expected: `ok`。
@@ -348,7 +348,7 @@ Expected: `ok`。
 Run: `RUSTFLAGS="-D warnings" cargo build 2>&1 | tail -1`
 Expected: `Finished` 无 warning。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/agent/admin.rs src/agent/session.rs src/agent/quic_session.rs src/agent/kudus_session.rs src/agent/

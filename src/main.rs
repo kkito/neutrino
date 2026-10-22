@@ -122,6 +122,17 @@ fn detach_spawn(log_file: &str, pid_file: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod main_tests {
     use super::strip_detach;
+    use clap::Parser;
+
+    #[test]
+    fn agent_admin_switch_defaults_off() {
+        // 根因→修法：--allow-agent-admin 默认关，不传即锁死（B 信任模型下默认开等于裸奔）。
+        let cli = super::Cli::try_parse_from(["neutrino", "server"]).unwrap();
+        match cli.cmd {
+            super::Cmd::Server { allow_agent_admin, .. } => assert!(!allow_agent_admin),
+            _ => panic!("want server"),
+        }
+    }
 
     #[test]
     fn detach_flag_stripped() {

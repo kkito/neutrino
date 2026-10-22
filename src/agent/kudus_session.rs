@@ -197,6 +197,7 @@ pub(crate) async fn session(
         });
     }
     *kudus_out.write().await = Some(pkt.clone());
+    super::admin::set_sender(Some(super::admin::AdminSender::Kudus(pkt.clone()))).await;
     let ctx = Arc::new(KCtx {
         proxies: RwLock::new(cfg.proxies.clone()),
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
@@ -353,6 +354,9 @@ pub(crate) async fn session(
                 ServerMsg::Ping { ts } => {
                     let _ = pkt.send_ctrl(&ClientMsg::Pong { ts });
                 }
+                ServerMsg::AdminResp { req_id, status, body } => {
+                    super::admin::on_admin_resp(req_id, status, body).await;
+                }
                 ServerMsg::Close { stream, .. } => {
                     // server eof 语义（与 WSS/QUIC 对齐）：主表删后，link/egress 泵侧推空包
                     // 触发 to_local 退出；纯删表不推包会导致 client 侧 hang 住不断（已现网踩坑）。
@@ -394,6 +398,7 @@ pub(crate) async fn session(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     *kudus_out.write().await = None;
+    super::admin::set_sender(None).await;
     writer.abort();
     reader.abort();
     anyhow::Ok(())

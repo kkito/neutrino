@@ -38,6 +38,7 @@ pub(crate) async fn session(
         }
     });
     *egress_out.write().await = Some(out_tx.clone());
+    super::admin::set_sender(Some(super::admin::AdminSender::Ws(out_tx.clone()))).await;
     let ctx = Arc::new(Ctx {
         proxies: RwLock::new(cfg.proxies.clone()),
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
@@ -158,6 +159,9 @@ pub(crate) async fn session(
                         serde_json::to_string(&ClientMsg::Pong { ts }).unwrap().into(),
                     ));
                 }
+                Ok(ServerMsg::AdminResp { req_id, status, body }) => {
+                    super::admin::on_admin_resp(req_id, status, body).await;
+                }
                 Ok(ServerMsg::Close { stream, .. }) => {
                     ctx.streams.write().await.remove(&stream);
                     super::egress::egress_streams().write().await.remove(&stream);
@@ -219,6 +223,7 @@ pub(crate) async fn session(
     // 主循环退出 = 掉线（调用方负责重连退避）。之前此处静默，agent 掉线只能去 server 侧猜。
     tracing::warn!("ws session ended, will redial");
     *egress_out.write().await = None;
+    super::admin::set_sender(None).await;
     writer.abort();
     anyhow::Ok(())
 }

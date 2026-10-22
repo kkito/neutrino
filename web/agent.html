@@ -27,6 +27,8 @@ th{color:var(--mut);font-weight:600}
 input{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:14px;width:100%}
 label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 .hidden{display:none!important}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center}
+.modal .card{width:420px}
 .topbar{display:flex;gap:12px;align-items:center;margin-bottom:16px}
 .topbar h2{margin:0;flex:1}
 #toast{position:fixed;bottom:24px;right:24px;display:flex;flex-direction:column;gap:8px}
@@ -44,10 +46,63 @@ label{display:block;margin:12px 0 4px;color:var(--mut);font-size:13px}
 <div id="app" class="layout hidden">
 <nav class="side"><h1>agent <span id="ver" style="font-size:12px;color:var(--mut);font-weight:400"></span></h1>
 <button id="nav-ov" class="on" onclick="tab('ov')">状态</button>
+<button id="nav-sov" onclick="tab('sov');srvTab('sov');srvRefresh()">全局总览</button>
+<button id="nav-stn" onclick="tab('stn');srvTab('stn');srvRefresh()">全局隧道</button>
+<button id="nav-str" onclick="tab('str');srvTab('str');srvRefresh()">全局流量</button>
+<button id="nav-scn" onclick="tab('scn');srvTab('scn');srvRefresh()">全局连接</button>
+<button id="nav-slog" onclick="tab('slog');srvTab('slog');srvRefresh()">全局日志</button>
 <button id="nav-tn" onclick="tab('tn')">隧道</button>
 <button id="nav-eg" onclick="tab('eg')">出网代理</button>
 <button id="nav-set" onclick="tab('set')">设置</button></nav>
 <main class="main">
+
+<section id="sec-sov" class="hidden">
+<div class="topbar"><h2>全局 Agents <span id="srv-ver" style="font-size:12px;color:var(--mut);font-weight:400"></span></h2><span id="srv-hint" class="corner"></span><button class="btn ghost" onclick="srvRefresh()">刷新</button></div>
+<div class="card"><table id="srv-agents"></table></div>
+</section>
+<section id="sec-stn" class="hidden">
+<div class="topbar"><h2>全局隧道</h2>
+<select id="srv-hostsel" onchange="srvLoadDesired()"></select>
+<button class="btn" onclick="srvOpenForm()">+ 新增隧道</button></div>
+<div class="card"><table id="srv-tunnels"></table></div>
+</section>
+<section id="sec-str" class="hidden">
+<div class="topbar"><h2>全局流量</h2>
+<select id="srv-trtunnel" onchange="srvLoadTraffic()"></select>
+<div class="seg" id="srv-trseg">
+<button data-g="min" class="on" onclick="srvSetGran('min')">分</button><button data-g="hour" onclick="srvSetGran('hour')">时</button><button data-g="day" onclick="srvSetGran('day')">天</button>
+</div></div>
+<div class="statcards">
+<div class="stat"><div class="k">最近 rx</div><div class="v" id="srv-tr-rx">-</div></div>
+<div class="stat"><div class="k">最近 tx</div><div class="v" id="srv-tr-tx">-</div></div>
+<div class="stat"><div class="k">单桶峰值</div><div class="v" id="srv-tr-peak">-</div></div>
+<div class="stat"><div class="k">总量 rx/tx</div><div class="v" id="srv-tr-sum" style="font-size:15px">-</div></div>
+</div>
+<div class="card" style="margin-bottom:10px"><div style="font-size:12px;color:var(--mut)">实时速率（5s 快照）</div><div id="srv-live" style="font-size:13px;margin-top:4px">-</div></div>
+<div class="legend"><span id="srv-tr-hint"></span></div>
+<canvas class="chart" id="srv-chart" width="960" height="260"></canvas>
+</section>
+<section id="sec-scn" class="hidden">
+<div class="topbar"><h2>全局连接 <span id="srv-cn-count" class="badge b-ok">0</span></h2><button class="btn ghost" onclick="srvLoadConns()">刷新</button></div>
+<div class="card"><table id="srv-conns"></table></div>
+</section>
+<section id="sec-slog" class="hidden">
+<div class="topbar"><h2>全局日志</h2></div>
+<div class="card"><pre id="srv-logs"></pre></div>
+</section>
+<div id="srv-formwrap" class="modal hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center"><div class="card" style="width:420px">
+<h3 id="srv-formtitle">新增隧道</h3>
+<label>名称</label><input id="srv-f-name" placeholder="如 web">
+<label>类型</label><select id="srv-f-type"><option value="http">http</option><option value="tcp">tcp</option><option value="https">https</option><option value="udp">udp</option><option value="link">link</option></select>
+<label>域名（逗号分隔）</label><input id="srv-f-dom" placeholder="a.example.com">
+<label>公网端口 remote_port</label><input id="srv-f-port" type="number" placeholder="如 2222">
+<label>目标 IP</label><input id="srv-f-ip" value="127.0.0.1">
+<label>目标端口</label><input id="srv-f-lport" type="number" placeholder="如 80">
+<label>下行限速</label><input id="srv-f-rate" placeholder="如 0.5m">
+<label><input type="checkbox" id="srv-f-en" checked> 启用</label>
+<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="srvCloseForm()">取消</button>
+<button class="btn" onclick="srvSaveForm()">保存</button></div>
+</div></div>
 <section id="sec-ov">
 <div class="topbar"><h2>上行状态</h2><button class="btn ghost" onclick="reconnect()">立即重连</button><button class="btn ghost" onclick="refresh()">刷新</button></div>
 <div class="card"><dl class="kv" id="stat"></dl></div>
@@ -101,7 +156,7 @@ let auth='';
 function toast(m,err){ const d=document.createElement('div'); d.className='toast'+(err?' err':''); d.textContent=m;
   document.getElementById('toast').appendChild(d); setTimeout(()=>d.remove(),4000); }
 function hdrs(ct){ const h={}; if(auth) h['Authorization']='Bearer '+auth; if(ct) h['Content-Type']='application/json'; return h; }
-function tab(t){ for(const x of ['ov','tn','eg','li','set']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+function tab(t){ for(const x of ['ov','tn','eg','li','set','sov','stn','str','scn','slog']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
   document.getElementById('nav-'+x).classList.toggle('on',x===t); } }
 async function login(){
   const user=document.getElementById('user').value, pass=document.getElementById('pass').value;
@@ -191,4 +246,170 @@ async function reconnect(){
   const r=await fetch('/api/reconnect',{method:'POST',headers:hdrs()});
   toast(r.ok?'已发起重连':'重连失败',!r.ok); if(r.ok) refresh();
 }
+/* ===== agent-admin 全局镜像（经 /api/srv/* 转手 server，复用 index.html 同款逻辑） ===== */
+let srvOn = null; // null=未知，false=开关关（403），true=开
+async function srv(path, method, body){
+  const r = await fetch('/api/srv/'+path, {method: method||'GET', headers: hdrs(!!body), body: body?JSON.stringify(body):undefined});
+  if(r.status===403){ srvOn=false; return {__off:true}; }
+  if(r.status===502||r.status===504){ return {__down:true}; }
+  if(r.status===401){ location.reload(); throw 0; }
+  let j={}; try{ j=await r.json(); }catch(e){}
+  srvOn=true; return j;
+}
+function srvTab(t){
+  for(const x of ['ov','tn','eg','li','set','sov','stn','str','scn','slog']){ document.getElementById('sec-'+x).classList.toggle('hidden',x!==t);
+    document.getElementById('nav-'+x).classList.toggle('on',x===t); }
+}
+async function srvRefresh(){
+  try{
+  const o=await srv('overview');
+  if(o.__down){ document.getElementById('srv-hint').textContent='上行隧道未连接（先连上 server 再管全局）'; return; }
+  if(o.__off){ document.getElementById('srv-hint').textContent='server 未开 --allow-agent-admin（只读本地页可用）'; return; }
+  document.getElementById('srv-hint').textContent='';
+  if(o.version) document.getElementById('srv-ver').textContent='(server '+o.version+')';
+  const sel=document.getElementById('srv-hostsel');
+  const cur=sel.value;
+  sel.innerHTML=o.agents.map(a=>`<option ${a.hostname===cur?'selected':''}>${a.hostname}</option>`).join('')||'<option value="">(无在线 agent)</option>';
+  document.getElementById('srv-agents').innerHTML='<tr><th>hostname</th><th>id</th><th>ver</th><th>RTT(ms)</th><th>在线(s)</th><th>rx/tx</th></tr>'+
+    o.agents.map(a=>`<tr><td>${a.hostname}</td><td>${a.agent_id}</td><td>${a.version}</td><td>${a.rtt_ms}</td><td>${a.online_secs}</td><td>${human(a.rx_bytes)}/${human(a.tx_bytes)}</td></tr>`).join('')||'<tr><td colspan=6>暂无</td></tr>';
+  await srvLoadDesired(false);
+  const t=await srv('tunnels');
+  document.getElementById('srv-tunnels').innerHTML='<tr><th>agent</th><th>name</th><th>type</th><th>domains/ports</th><th>target</th><th>限速</th><th>状态</th><th>操作</th></tr>'+t.tunnels.map(x=>{
+    const isLink=x.type==='link';
+    const where=isLink?'-':`${x.domains&&x.domains.length?x.domains.join(','):''}${x.remote_port?':'+x.remote_port:''}`;
+    const tgt=isLink?`${x.link_agent||'?'}→${x.link_host||'?'}:${x.link_port||'?'}`:x.target;
+    const live=o.agents.some(a=>a.agent_id===x.agent_id||a.hostname===x.agent);
+    const st=!x.enabled?'<span class="badge b-off">已禁用</span>':(live?'<span class="badge b-ok">生效中</span>':'<span class="badge b-warn">待同步</span>');
+    const btn=x.enabled?`<button class="btn ghost" onclick="srvToggle('${x.agent_id}','${x.name}',false)">禁用</button>`:`<button class="btn ghost" onclick="srvToggle('${x.agent_id}','${x.name}',true)">启用</button>`;
+    const ed=`<button class="btn ghost" onclick='srvEditRow(${JSON.stringify(x).replace(/'/g,"&#39;")})'>编辑</button>`;
+    const del=`<button class="btn ghost" onclick="srvDelRow('${x.agent}','${x.name}')">删除</button>`;
+    return `<tr><td>${x.agent}</td><td>${x.name}</td><td>${isLink?'<span class="badge b-ok">link</span>':x.type}</td><td>${where}</td><td>${tgt}</td><td>${x.rate_limit||'-'}</td><td>${st}</td><td>${btn} ${ed} ${del}</td></tr>`;}).join('')||'<tr><td colspan=8>暂无</td></tr>';
+  const l=await srv('logs');
+  document.getElementById('srv-logs').textContent=(l.logs||[]).join('\n');
+  if(!document.getElementById('sec-str').classList.contains('hidden')) srvLoadTraffic();
+  if(!document.getElementById('sec-scn').classList.contains('hidden')) srvLoadConns();
+  }catch(e){}
+}
+function human(n){ if(n==null) return '-'; if(n<1024) return n+'B'; if(n<1048576) return (n/1024).toFixed(1)+'K'; if(n<1073741824) return (n/1048576).toFixed(1)+'M'; return (n/1073741824).toFixed(2)+'G'; }
+let srvTrGran='min';
+function srvSetGran(g){ srvTrGran=g; for(const b of document.querySelectorAll('#srv-trseg button')) b.classList.toggle('on',b.dataset.g===g); srvLoadTraffic(); }
+async function srvLoadLive(){
+  try{
+  const t=await srv('tunnels');
+  const sel=document.getElementById('srv-trtunnel');
+  const tun=sel&&sel.value?sel.value:'all';
+  const j=await srv(`live?tunnel=${encodeURIComponent(tun)}`);
+  const rows=j.live||[];
+  document.getElementById('srv-live').innerHTML=rows.length?rows.map(r=>`${r.tunnel} <b>${human(r.rx_s)}/s</b> / <b>${human(r.tx_s)}/s</b>`).join('&nbsp;&nbsp;·&nbsp;&nbsp;'):'暂无流量（等待下一 5s tick）';
+  }catch(e){}
+}
+async function srvLoadTraffic(){
+  try{
+  const t=await srv('tunnels');
+  const sel=document.getElementById('srv-trtunnel'), cur=sel.value||'all';
+  const keys=[...new Set((t.tunnels||[]).filter(x=>x.enabled).map(x=>`${x.agent}/${x.name}`))];
+  sel.innerHTML='<option value="all">全部汇总</option>'+keys.map(k=>`<option ${k===cur?'selected':''}>${k}</option>`).join('');
+  const tun=sel.value||'all';
+  const n=srvTrGran==='min'?180:(srvTrGran==='hour'?168:31);
+  const j=await srv(`traffic?tunnel=${encodeURIComponent(tun)}&gran=${srvTrGran}&n=${n}`);
+  const pts=j.points||[];
+  const sum=pts.reduce((a,p)=>[a[0]+p[1],a[1]+p[2]],[0,0]);
+  const last=pts.length?pts[pts.length-1]:[0,0,0];
+  const peak=pts.reduce((a,p)=>Math.max(a,p[1]+p[2]),0);
+  const bucket=srvTrGran==='min'?'1分钟':(srvTrGran==='hour'?'1小时':'1天');
+  document.getElementById('srv-tr-rx').textContent=human(last[1]);
+  document.getElementById('srv-tr-tx').textContent=human(last[2]);
+  document.getElementById('srv-tr-peak').textContent=human(peak);
+  document.getElementById('srv-tr-sum').textContent=`${human(sum[0])} / ${human(sum[1])}`;
+  document.getElementById('srv-tr-hint').textContent=pts.length?`共 ${pts.length} 点`:'';
+  srvDrawChart(pts);
+  srvLoadLive();
+  }catch(e){}
+}
+function srvDrawChart(pts){
+  const c=document.getElementById('srv-chart'), ctx=c.getContext('2d');
+  const W=c.width, H=c.height, pad=34;
+  ctx.clearRect(0,0,W,H);
+  const cs=getComputedStyle(document.body);
+  const grid=cs.getPropertyValue('--line').trim()||'#28323d', mut=cs.getPropertyValue('--mut').trim()||'#8fa0b3';
+  ctx.strokeStyle=grid; ctx.fillStyle=mut; ctx.font='11px system-ui'; ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){ const y=pad+(H-2*pad)*i/4; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(W-8,y); ctx.stroke(); }
+  if(!pts.length){ ctx.fillText('暂无数据',W/2-30,H/2); return; }
+  const max=Math.max(1,...pts.map(p=>p[1]+p[2]));
+  const X=i=>pad+(W-pad-8)*(pts.length===1?0:i/(pts.length-1));
+  const Y=v=>(H-pad)-(H-2*pad)*v/max;
+  const step=Math.ceil(pts.length/6);
+  pts.forEach((p,i)=>{ if(i%step!==0&&i!==pts.length-1) return;
+    const d=new Date(p[0]*1000);
+    ctx.fillText(`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`,X(i)-14,H-10); });
+  for(let i=0;i<=4;i++){ const v=max*(4-i)/4; ctx.fillText(human(Math.round(v)),2,pad+(H-2*pad)*i/4+4); }
+  const line=(idx,color)=>{ ctx.strokeStyle=color; ctx.lineWidth=1.6; ctx.beginPath();
+    pts.forEach((p,i)=>{ const x=X(i),y=Y(p[idx]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke(); };
+  line(1,'#4f9cf0'); line(2,'#3fb97f');
+}
+async function srvLoadConns(){
+  try{
+  const j=await srv('conns');
+  const rows=(j.conns||[]).slice().sort((a,b)=>b.since-a.since);
+  document.getElementById('srv-cn-count').textContent=rows.length;
+  const now=Date.now()/1000|0;
+  document.getElementById('srv-conns').innerHTML='<tr><th>外部</th><th>端口</th><th>协议</th><th>隧道/agent</th><th>内网目标</th><th>时长</th><th>rx/tx</th></tr>'+rows.map(c=>
+    `<tr><td>${c.peer}</td><td>${c.public_port}</td><td>${c.proto}</td><td>${c.tunnel||'-'} / ${c.agent}</td><td>${c.target}</td><td>${now-c.since}s</td><td>${human(c.rx)}/${human(c.tx)}</td></tr>`).join('')||'<tr><td colspan=7>当前无连接</td></tr>';
+  }catch(e){}
+}
+let srvDesiredCache=[];
+async function srvLoadDesired(showMsg){
+  const h=document.getElementById('srv-hostsel').value;
+  if(!h) return;
+  const d=await srv('desired_get/'+encodeURIComponent(h));
+  srvDesiredCache=d.proxies||[];
+  if(showMsg!==false) toast(`已加载 ${h} 的 ${srvDesiredCache.length} 条期望配置`);
+}
+function srvOpenForm(){ srvEditing=null; document.getElementById('srv-formtitle').textContent='新增隧道';
+  document.getElementById('srv-formwrap').classList.remove('hidden'); }
+function srvCloseForm(){ document.getElementById('srv-formwrap').classList.add('hidden'); }
+let srvEditing=null;
+function srvEditRow(x){ srvEditing=x.name;
+  document.getElementById('srv-f-name').value=x.name; document.getElementById('srv-f-type').value=x.type||'http';
+  document.getElementById('srv-f-dom').value=(x.domains||[]).join(',');
+  document.getElementById('srv-f-port').value=x.remote_port||'';
+  document.getElementById('srv-f-ip').value=(x.target||'').split(':').slice(0,-1).join(':')||'127.0.0.1';
+  document.getElementById('srv-f-lport').value=(x.target||'').split(':').pop()||'';
+  document.getElementById('srv-f-rate').value=x.rate_limit||'';
+  document.getElementById('srv-f-en').checked=!!x.enabled;
+  document.getElementById('srv-formtitle').textContent='编辑 '+x.name;
+  document.getElementById('srv-formwrap').classList.remove('hidden'); }
+function srvCurProxy(){
+  return {name:document.getElementById('srv-f-name').value.trim(),type:document.getElementById('srv-f-type').value,
+    domains:document.getElementById('srv-f-dom').value.split(',').map(s=>s.trim()).filter(Boolean),
+    remote_port:parseInt(document.getElementById('srv-f-port').value,10)||null,
+    local_ip:document.getElementById('srv-f-ip').value.trim()||'127.0.0.1',
+    local_port:parseInt(document.getElementById('srv-f-lport').value,10)||0,
+    rate_limit:document.getElementById('srv-f-rate').value.trim()||null,
+    enabled:document.getElementById('srv-f-en').checked};
+}
+async function srvSaveForm(){
+  const p=srvCurProxy();
+  if(!p.name){ toast('名称必填',true); return; }
+  const h=document.getElementById('srv-hostsel').value;
+  let list=srvDesiredCache.slice();
+  const i=list.findIndex(x=>x.name===(srvEditing||p.name));
+  if(srvEditing&&i>=0) list[i]=p; else { if(list.some(x=>x.name===p.name)){ toast('同名已存在',true); return; } list.push(p); }
+  const r=await srv('desired_set/'+encodeURIComponent(h),'POST',{proxies:list});
+  if(r.ok!==false&&!r.__off){ toast('已保存并推送'); srvCloseForm(); srvRefresh(); }
+  else toast('保存失败: '+(r.reason||r.status||'server 未开开关'),true);
+}
+async function srvDelRow(agent,name){
+  if(!confirm(`删 ${agent}/${name}？`)) return;
+  const list=srvDesiredCache.filter(x=>x.name!==name);
+  const r=await srv('desired_set/'+encodeURIComponent(agent),'POST',{proxies:list});
+  if(r.ok!==false&&!r.__off){ toast('已删除并推送'); srvRefresh(); }
+  else toast('删除失败',true);
+}
+async function srvToggle(agentId,name,enabled){
+  const r=await srv(`toggle/${encodeURIComponent(agentId)}/${encodeURIComponent(name)}`,'POST',{enabled});
+  if(r.ok!==false&&!r.__off){ srvRefresh(); }
+  else toast('切换失败: '+(r.reason||'server 未开开关'),true);
+}
+
 </script></body></html>

@@ -69,7 +69,7 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
     Ok(body)
 }
 
-fn send_ctrl(out: &mpsc::UnboundedSender<Vec<u8>>, m: &ClientMsg) -> anyhow::Result<()> {
+pub(crate) fn send_ctrl(out: &mpsc::UnboundedSender<Vec<u8>>, m: &ClientMsg) -> anyhow::Result<()> {
     let j = serde_json::to_vec(m)?;
     out.send(encode_frame(&j))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -103,6 +103,7 @@ pub(crate) async fn session(
     let (mut ctl_send, mut ctl_recv) = conn.open_bi().await?;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     *quic_out.write().await = Some(out_tx.clone());
+    super::admin::set_sender(Some(super::admin::AdminSender::Quic(out_tx.clone()))).await;
     let ctx = Arc::new(QCtx {
         proxies: RwLock::new(cfg.proxies.clone()),
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
@@ -200,6 +201,9 @@ pub(crate) async fn session(
                     ServerMsg::Ping { ts } => {
                         let _ = send_ctrl(&out_tx, &ClientMsg::Pong { ts });
                     }
+                    ServerMsg::AdminResp { req_id, status, body } => {
+                        super::admin::on_admin_resp(req_id, status, body).await;
+                    }
                     ServerMsg::Close { stream, .. } => {
                         ctx.streams.write().await.remove(&stream);
                         super::egress::egress_streams().write().await.remove(&stream);
@@ -235,6 +239,7 @@ pub(crate) async fn session(
         }
     }
     *quic_out.write().await = None;
+    super::admin::set_sender(None).await;
     writer.abort();
     anyhow::Ok(())
 }
