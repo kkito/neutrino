@@ -291,7 +291,7 @@ pub(crate) async fn session(
             _ => anyhow::bail!("kudus: no welcome"),
         }
     };
-    tracing::info!("kudus welcomed, heartbeat {interval}s");
+    tracing::info!("kudus welcomed (heartbeat adaptive 15~30s, server interval {interval}s ignored)");
     {
         let mut st = status.write().await;
         st.online = true;
