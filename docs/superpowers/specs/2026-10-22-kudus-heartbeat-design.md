@@ -90,3 +90,5 @@ stateDiagram-v2
 - WSS/QUIC 心跳不动（以后想迁再把 helper 搬过去）。
 - 毫秒 RTT（协议字段不动）。
 - 自适应调参（初版固定 15~30 / 5~8 / 3 连好，跑起来再看数）。
+- 重连错峰（server 重启后多 agent SYN 齐射）：当前 3~5 个 agent 规模无感，实测有问题再加
+  （kudus-local 随机延迟或共享 backoff 加 jitter，届时再定）。
