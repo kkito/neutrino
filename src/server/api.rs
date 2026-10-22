@@ -566,9 +566,13 @@ fn validate_proxy(p: &ProxyConfig) -> Result<(), String> {
         // link 复用 local_port 做入口监听端口（remote_port 不用，恒 0）；
         // 对端/目标合法性由 agent 侧 valid_link + server resolve_link 兜底，此处只拦空名/零监听。
         // rate_limit 故意不校验：非法在运行时 limit_of warn-忽略，不断言拒绝。
-        "link" => {
+        "link" | "link_udp" => {
             if p.local_port == 0 {
                 return Err("link proxy requires local_port".into());
+            }
+            // remote_port 必须为 0：link 语义复用 local_port 做入口，不占 server 端口。
+            if p.remote_port != 0 {
+                return Err("link proxy requires remote_port=0".into());
             }
             Ok(())
         }
@@ -899,7 +903,16 @@ mod tests {
         // rate_limit 非法不断言拒绝（运行时 warn-忽略，见 limit_of）。
         let mut link_p = ok_http.clone();
         link_p.ptype = "link".into();
+        link_p.remote_port = 0;
         assert!(validate_proxy(&link_p).is_ok());
+        let mut udp_p = ok_http.clone();
+        udp_p.ptype = "link_udp".into();
+        udp_p.domains.clear();
+        udp_p.local_port = 51413;
+        udp_p.remote_port = 0;
+        assert!(validate_proxy(&udp_p).is_ok());
+        udp_p.local_port = 0;
+        assert!(validate_proxy(&udp_p).is_err());
         let mut rl = ok_http.clone();
         rl.rate_limit = Some("abc".into());
         assert!(validate_proxy(&rl).is_ok());
