@@ -36,6 +36,9 @@ enum Cmd {
         /// kudus UDP listen (empty = disabled), e.g. 0.0.0.0:7445
         #[arg(long, default_value = "")]
         kudus_listen: String,
+        /// 允许已连 agent 经隧道读写 server 管理 API（默认关；开了 = token 即最高权，见 spec）。
+        #[arg(long, default_value_t = false)]
+        allow_agent_admin: bool,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
         detach: bool,
@@ -157,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
             token,
             quic_listen,
             kudus_listen,
+            allow_agent_admin,
             detach,
             log_file,
             pid_file,
@@ -171,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen).await
+            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
             let log = if log_file.is_empty() {

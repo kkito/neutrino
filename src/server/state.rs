@@ -67,6 +67,9 @@ pub(crate) struct Shared {
     pub(crate) public_port: u16,
     /// 映射级限速窗口：key = traffic_key(hostname, proxy名) -> 共享 limiter（总量语义）。
     pub(crate) rate_limiters: RwLock<HashMap<String, Arc<crate::server::ratelimit::RateLimiter>>>,
+    /// agent-admin 开关：开 = 已连 agent 可经隧道读写 server 管理 API（token 即最高权）。
+    /// 根因→修法：默认关，不传开关即锁死（B 信任模型下默认开等于裸奔）。
+    pub(crate) allow_agent_admin: bool,
 }
 
 /// 30天分钟点上限
@@ -478,6 +481,18 @@ pub(crate) async fn save_state(s: &S) {
 }
 
 // ================= run =================
+
+#[cfg(test)]
+pub(crate) async fn test_shared() -> std::sync::Arc<Shared> {
+    // agent-admin 单测用最小 Shared（allow_agent_admin 默认关）。
+    std::sync::Arc::new(Shared { allow_agent_admin: false, ..Default::default() })
+}
+
+#[cfg(test)]
+pub(crate) async fn test_shared_admin() -> std::sync::Arc<Shared> {
+    // 开关打开版（构造时即开，Arc 内字段不可事后改）。
+    std::sync::Arc::new(Shared { allow_agent_admin: true, ..Default::default() })
+}
 
 #[cfg(test)]
 mod tests {

@@ -176,6 +176,10 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                 on_register(&s, &agent_id, &hostname, proxies).await;
                             }
                             Ok(ClientMsg::Ping { ts }) => { let _ = ctl_tx.send(ServerMsg::Pong { ts }); }
+                            Ok(ClientMsg::AdminReq { req_id, method, path, body }) => {
+                                let (st, rb) = crate::server::api::dispatch_admin(&s, &hostname, &method, &path, &body).await;
+                                let _ = ctl_tx.send(ServerMsg::AdminResp { req_id, status: st, body: rb });
+                            }
                             Ok(ClientMsg::Pong { .. }) => {
                                 if let Some(t0) = *last_ping.read().await {
                                     let ms = t0.elapsed().as_millis() as i64;

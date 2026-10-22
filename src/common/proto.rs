@@ -8,7 +8,7 @@ fn enabled_default() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ClientMsg {
     Hello {
@@ -38,9 +38,15 @@ pub enum ClientMsg {
     ConfigAck {
         ok: bool,
     },
+    AdminReq {
+        req_id: u64,
+        method: String,
+        path: String,
+        body: String,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ServerMsg {
     Welcome { agent_id: String, interval: u64 },
@@ -50,6 +56,7 @@ pub enum ServerMsg {
     Close { stream: u32, reason: String },
     Config { proxies: Vec<ProxyConfig> },
     Error { reason: String },
+    AdminResp { req_id: u64, status: u16, body: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,6 +221,19 @@ mod tests {
         assert_eq!(id, 7);
         assert_eq!(payload, b"GET / HTTP/1.1\r\n");
         assert!(decode_data(&b[..3]).is_none());
+    }
+
+    #[test]
+    fn admin_req_resp_roundtrip() {
+        // 根因→修法：agent-admin 转手需要 req_id 配对的请求/响应帧，三传输共享。
+        let q = super::ClientMsg::AdminReq { req_id: 7, method: "GET".into(), path: "overview".into(), body: "{}".into() };
+        let s = serde_json::to_string(&q).unwrap();
+        let back: super::ClientMsg = serde_json::from_str(&s).unwrap();
+        assert_eq!(q, back);
+        let r = super::ServerMsg::AdminResp { req_id: 7, status: 200, body: "{\"agents\":[]}".into() };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: super::ServerMsg = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
     }
 
     #[test]

@@ -43,7 +43,7 @@ async fn api_access_log(
     resp
 }
 
-pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str) -> anyhow::Result<()> {
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
         tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
@@ -67,8 +67,12 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         desired: RwLock::new(HashMap::new()),
         desired_path: desired.to_string(),
         public_port,
+        allow_agent_admin,
         ..Default::default()
     });
+    if allow_agent_admin && token.len() < 16 {
+        tracing::warn!("agent-admin enabled with weak token (<16 chars): token 即全 server 管理权，请换强 token");
+    }
     // traffic 读回（无文件/坏文件从空开始，load_traffic 内部记日志）
     {
         let p = state::traffic_path(data);

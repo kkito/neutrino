@@ -408,6 +408,10 @@ async fn handle_conn(
                             hh.info.rtt_ms = ms;
                         }
                     }
+                    ClientMsg::AdminReq { req_id, method, path, body } => {
+                        let (st, rb) = crate::server::api::dispatch_admin(&s, &hostname, &method, &path, &body).await;
+                        let _ = ctl_tx.send(ServerMsg::AdminResp { req_id, status: st, body: rb });
+                    }
                     ClientMsg::Close { stream, .. } => {
                         if let Some(hh) = s.agents.read().await.get(&agent_id) {
                             hh.incoming.write().await.remove(&stream);
@@ -476,6 +480,10 @@ async fn dispatch_body(
                 if let Some(hh) = s.agents.write().await.get_mut(agent_id) {
                     hh.info.rtt_ms = ms;
                 }
+            }
+            ClientMsg::AdminReq { req_id, method, path, body } => {
+                let (st, rb) = crate::server::api::dispatch_admin(s, hostname, &method, &path, &body).await;
+                let _ = ctl_tx.send(ServerMsg::AdminResp { req_id, status: st, body: rb });
             }
             ClientMsg::Close { stream, .. } => {
                 if let Some(hh) = s.agents.read().await.get(agent_id) {

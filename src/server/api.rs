@@ -107,6 +107,216 @@ pub(crate) async fn api_logs(
     Json(serde_json::json!({"logs": v})).into_response()
 }
 
+/// agent-admin 内核：供隧道内 AdminReq 调用（与 HTTP 层同数据，不经 axum/auth）。
+/// 根因→修法：agent 页要镜像 server 管理页，但浏览器只连 agent；转手经已认证隧道，
+/// server 按开关放行。path 口径复用 /api/*（不带前缀）。query 拼在 path 里，body 是 JSON 字符串。
+pub(crate) async fn dispatch_admin(s: &S, hostname: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    if !s.allow_agent_admin {
+        return (403, r#"{"ok":false,"reason":"agent admin disabled"}"#.into());
+    }
+    let (base, query) = match path.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (path, ""),
+    };
+    let qmap: HashMap<String, String> = query
+        .split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+    // 写必记：读不记，出事可溯源（B 信任模型下 token 即最高权）。
+    if method == "POST" {
+        log_ev(s, format!("agent '{hostname}' admin {method} {path}"));
+    }
+    match (method, base) {
+        ("GET", "overview") => {
+            let ag = s.agents.read().await;
+            let list: Vec<AgentInfo> = ag
+                .values()
+                .map(|h| {
+                    let mut i = h.info.clone();
+                    i.online_secs = (chrono::Utc::now() - h.connected_at).num_seconds();
+                    i
+                })
+                .collect();
+            (200, serde_json::json!({"agents": list, "version": crate::common::proto::VERSION}).to_string())
+        }
+        ("GET", "tunnels") => {
+            // 与 api_tunnels 同组装（含 ratelimit_stats），复制不重构。
+            let ag = s.agents.read().await;
+            let lims = s.rate_limiters.read().await;
+            let mut out = vec![];
+            for hh in ag.values() {
+                for p in &hh.info.proxies {
+                    let rl = lims
+                        .get(&crate::server::state::traffic_key(&hh.info.hostname, &p.name))
+                        .map(|l| {
+                            let (limit, bytes, sleep_ms) = l.stats();
+                            serde_json::json!({"limit_bps": limit, "throttled_bytes": bytes, "sleep_ms": sleep_ms})
+                        });
+                    out.push(serde_json::json!({
+                        "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
+                        "name": p.name, "enabled": p.enabled,
+                        "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
+                        "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
+                        "rate_limit": p.rate_limit,
+                        "ratelimit_stats": rl,
+                        "target": format!("{}:{}", p.local_ip, p.local_port),
+                        "status": if p.enabled { "online" } else { "disabled" },
+                    }));
+                }
+            }
+            (200, serde_json::json!({"tunnels": out}).to_string())
+        }
+        ("GET", "logs") => {
+            let v = s.events.read().await.clone();
+            (200, serde_json::json!({"logs": v}).to_string())
+        }
+        ("GET", "traffic") => {
+            let gran = match qmap.get("gran").map(|x| x.as_str()) {
+                Some("hour") | Some("day") => qmap["gran"].clone(),
+                _ => "min".to_string(),
+            };
+            let n: usize = qmap.get("n").and_then(|x| x.parse().ok()).unwrap_or(60).clamp(1, 2000);
+            let step: i64 = match gran.as_str() {
+                "hour" => 3600,
+                "day" => 86400,
+                _ => 60,
+            };
+            let tunnel = qmap.get("tunnel").cloned().unwrap_or_default();
+            let tr = s.traffic.read().await;
+            let keys: Vec<String> = if tunnel.is_empty() || tunnel == "all" {
+                tr.keys().cloned().collect()
+            } else {
+                vec![tunnel]
+            };
+            let now = chrono::Local::now().timestamp();
+            let mut buckets: std::collections::BTreeMap<i64, (u64, u64)> = Default::default();
+            for k in &keys {
+                if let Some(v) = tr.get(k) {
+                    let (pts, _) = slice_points(v, &gran, n, now);
+                    for (ts, r, t) in pts {
+                        let b = ts - ((ts % step) + step) % step;
+                        let e = buckets.entry(b).or_insert((0, 0));
+                        e.0 += r;
+                        e.1 += t;
+                    }
+                }
+            }
+            let points: Vec<(i64, u64, u64)> = buckets
+                .into_iter()
+                .rev()
+                .take(n)
+                .rev()
+                .map(|(ts, (r, t))| (ts, r, t))
+                .collect();
+            (200, serde_json::json!({"points": points}).to_string())
+        }
+        ("GET", "live") => {
+            let tunnel = qmap.get("tunnel").cloned().unwrap_or_default();
+            let live = s.live.read().await;
+            let mut rows = vec![];
+            for (k, (r, t)) in live.iter() {
+                if !tunnel.is_empty() && tunnel != "all" && *k != tunnel {
+                    continue;
+                }
+                rows.push(serde_json::json!({"tunnel": k, "rx_5s": r, "tx_5s": t, "rx_s": r / 5, "tx_s": t / 5}));
+            }
+            rows.sort_by(|a, b| a["tunnel"].as_str().cmp(&b["tunnel"].as_str()));
+            (200, serde_json::json!({"live": rows, "interval": 5}).to_string())
+        }
+        ("GET", "conns") => {
+            let v: Vec<ConnInfo> = s.conns.read().await.values().cloned().collect();
+            (200, serde_json::json!({"conns": v}).to_string())
+        }
+        ("GET", p) if p.starts_with("desired_get/") => {
+            let hn = p.trim_start_matches("desired_get/");
+            let proxies = s.desired.read().await.get(hn).cloned().unwrap_or_default();
+            (200, serde_json::json!({"proxies": proxies}).to_string())
+        }
+        ("POST", p) if p.starts_with("desired_set/") => {
+            // body = {"proxies":[...]}：与 api_desired_set 同语义（落盘+推送），复制不重构。
+            let hn = p.trim_start_matches("desired_set/").to_string();
+            let v: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return (400, serde_json::json!({"ok": false, "reason": e.to_string()}).to_string()),
+            };
+            let arr = v.get("proxies").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+            let proxies: Vec<ProxyConfig> = match serde_json::from_value(arr) {
+                Ok(p) => p,
+                Err(e) => return (400, serde_json::json!({"ok": false, "reason": e.to_string()}).to_string()),
+            };
+            for pr in &proxies {
+                if let Err(e) = validate_proxy(pr) {
+                    return (400, serde_json::json!({"ok": false, "reason": e}).to_string());
+                }
+            }
+            {
+                let mut st = crate::common::desired::DesiredStore::load(&s.desired_path);
+                for (hh, pp) in s.desired.read().await.iter() {
+                    if hh != &hn {
+                        st.set(hh.clone(), pp.clone());
+                    }
+                }
+                st.set(hn.clone(), proxies.clone());
+                st.save();
+            }
+            s.desired.write().await.insert(hn.clone(), proxies.clone());
+            let targets: Vec<(String, mpsc::UnboundedSender<ServerMsg>)> = {
+                s.agents
+                    .read()
+                    .await
+                    .values()
+                    .filter(|hh| hh.info.hostname == hn)
+                    .map(|hh| (hh.info.agent_id.clone(), hh.ctl.clone()))
+                    .collect()
+            };
+            let mut pushed = 0;
+            for (aid, ctl) in &targets {
+                let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+                apply_proxies_for_agent(s, aid, &proxies).await;
+                pushed += 1;
+            }
+            (200, serde_json::json!({"ok": true, "pushed": pushed}).to_string())
+        }
+        ("POST", p) if p.starts_with("toggle/") => {
+            // path = "toggle/<agent>/<name>", body = {"enabled":bool}：与 api_toggle 同语义。
+            let rest = p.trim_start_matches("toggle/");
+            let (ag_name, name) = match rest.split_once('/') {
+                Some((a, n)) => (a, n),
+                None => return (400, r#"{"ok":false,"reason":"want toggle/<agent>/<name>"}"#.into()),
+            };
+            let enabled: bool = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+                .unwrap_or(false);
+            let (aid, ctl, proxies) = {
+                let mut ag = s.agents.write().await;
+                let found = ag.values_mut().find(|hh| hh.info.agent_id == ag_name || hh.info.hostname == ag_name);
+                let Some(hh) = found else {
+                    return (404, r#"{"ok":false,"reason":"no such agent"}"#.into());
+                };
+                let mut hit = false;
+                for pr in hh.info.proxies.iter_mut() {
+                    if pr.name == name {
+                        pr.enabled = enabled;
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    return (404, r#"{"ok":false,"reason":"no such proxy"}"#.into());
+                }
+                (hh.info.agent_id.clone(), hh.ctl.clone(), hh.info.proxies.clone())
+            };
+            let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
+            apply_proxies_for_agent(s, &aid, &proxies).await;
+            (200, serde_json::json!({"ok": true}).to_string())
+        }
+        _ => (404, r#"{"ok":false,"reason":"unknown admin path"}"#.into()),
+    }
+}
+
 /// 分钟点切片：按 gran 把分钟点组成块求和，取后 n 块。返回 (块序列, 每块秒数)。
 /// 根因→修法：hour/day 不另存，由分钟点现算（spec §3）。
 /// 点自带 ts（(ts,rx,tx)），返回 (ts,rx,tx) 块序列。
@@ -547,6 +757,23 @@ pub(crate) async fn api_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dispatch_admin_closed_by_default() {
+        // 根因→修法：开关默认关，没开时读写一律 403（读也不给）。
+        let s = crate::server::state::test_shared().await;
+        let (st, _) = super::dispatch_admin(&s, "hbtest", "GET", "overview", "{}").await;
+        assert_eq!(st, 403);
+    }
+
+    #[tokio::test]
+    async fn dispatch_admin_open_serves_overview() {
+        let s = crate::server::state::test_shared_admin().await;
+        let (st, body) = super::dispatch_admin(&s, "hbtest", "GET", "overview", "{}").await;
+        assert_eq!(st, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("agents").is_some() && v.get("version").is_some());
+    }
+
     #[test]
     fn traffic_slice_math() {
         use std::collections::VecDeque;
