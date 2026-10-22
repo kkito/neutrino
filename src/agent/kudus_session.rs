@@ -299,13 +299,16 @@ pub(crate) async fn session(
         st.last_error = None;
     }
     pkt.send_ctrl(&ClientMsg::Register { proxies: cfg.proxies.clone() })?;
-    // ping loop
+    // ping loop：Heartbeat 自适应（慢 15~30s / 快 5~8s）+ 每次随机防对齐。
+    // 根因→修法：固定 30s 多 agent 齐步走惊群；丢包不加密则重传泵独转、
+    // 对端久无确认。lossy = 本端重传缓冲非空（发的包对端还没确认）。
     {
         let p = pkt.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(std::time::Duration::from_secs(interval.max(5)));
+            let mut hb = crate::common::kudus::Heartbeat::new();
             loop {
-                iv.tick().await;
+                let lossy = p.rel.lock().map(|r| r.retx.len() > 0).unwrap_or(false);
+                tokio::time::sleep(hb.next_interval(lossy)).await;
                 let m = ClientMsg::Ping { ts: chrono::Utc::now().timestamp() };
                 if p.send_ctrl(&m).is_err() {
                     break;
@@ -313,10 +316,18 @@ pub(crate) async fn session(
             }
         });
     }
-    // 主分发循环
+    // 主分发循环（看门狗：75s 无 server 任何帧即判死，bail 走外层 backoff 重连。
+    // 根因→修法：旧裸 recv 永等，server OOM 重启后 agent 卡旧会话无感知
+    // （macmini 2026-10-21 现场）。握手完成后的主循环才计时。）
     loop {
-        let Some((h, body)) = dec_rx.recv().await else {
-            break;
+        let (h, body) = match tokio::time::timeout(
+            std::time::Duration::from_secs(crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64),
+            dec_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(v)) => v,
+            _ => anyhow::bail!("kudus heartbeat timeout: no server frame"),
         };
         if h.flags & FLAG_FIN != 0 {
             // server FIN：回 ACK 即关。
@@ -578,3 +589,15 @@ async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyho
 }
 
 use std::time::Duration;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn heartbeat_contract() {
+        // Task 2 依赖 Task 1 的接口形状：改名/改签名即红。
+        let mut hb = crate::common::kudus::Heartbeat::new();
+        let d = hb.next_interval(false);
+        assert!(d >= std::time::Duration::from_secs(15));
+        assert_eq!(crate::common::kudus::KUDUS_IDLE_KICK_SECS, 75);
+    }
+}
