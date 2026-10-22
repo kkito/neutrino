@@ -237,27 +237,6 @@ async fn handle_conn(
         cleanup(&s, &agent_id, &hostname).await;
         return;
     }
-    // server 心跳：每 15s Ping（与 WSS/QUIC 同周期）。
-    let last_ping = Arc::new(RwLock::new(None::<std::time::Instant>));
-    {
-        let ctl = ctl_tx.clone();
-        let lp = last_ping.clone();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(15));
-            loop {
-                iv.tick().await;
-                *lp.write().await = Some(std::time::Instant::now());
-                if ctl
-                    .send(ServerMsg::Ping {
-                        ts: chrono::Utc::now().timestamp(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
     // 收发循环：读包（解密在分发层已做）→ 控制/数据分发；写泵（ctl/outbox→datagram，可靠登记）。
     // 上行（agent→server）seq 从 1 开始，重排缓冲同锚（agent 上行首帧 SYN seq=0 不可靠）。
     let mut rxbuf = crate::common::kudus::ReorderBuf::new(1);
@@ -342,7 +321,27 @@ async fn handle_conn(
     // 读循环
     let read_res = async {
         loop {
-            let (p, h, body) = rx.recv().await.ok_or_else(|| anyhow::anyhow!("gone"))?;
+            // 看门狗：75s 无 agent 任何帧即踢僵尸（任何业务帧都算活，不只 Ping）。
+            // 根因→修法：旧裸 recv 永等，agent 断网即僵尸会话永久占路由。
+            let (p, h, body) = match tokio::time::timeout(
+                Duration::from_secs(crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(v)) => v,
+                Ok(None) => anyhow::bail!("gone"), // channel 关：对端已走，对齐旧语义
+                Err(_) => {
+                    log_ev(&s, format!("kudus agent '{hostname}' heartbeat timeout, kicking stale session {agent_id}"));
+                    fin_acked = true; // 尾巴省 3 包 FIN（下已发 3 次尽力通知）
+                    for _ in 0..3 {
+                        let fh = KudusHdr { ver: 1, flags: FLAG_FIN, seq: 0, ack: 0, sack: [0u8; 32], ts_ms: now_ms() };
+                        tx.send_pkt(&fh, b"bye");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    break;
+                }
+            };
             *peer.write().unwrap() = p;
             if !ts_fresh(h.ts_ms) {
                 tracing::debug!("kudus stale ts seq={} from {p}", h.seq);
@@ -373,7 +372,7 @@ async fn handle_conn(
                     continue;
                 }
                 for ob in ready {
-                    dispatch_body(&s, &agent_id, &hostname, &ctl_tx, &last_ping, &tx, ob).await;
+                    dispatch_body(&s, &agent_id, &hostname, &ctl_tx, &tx, ob).await;
                 }
                 continue;
             }
@@ -401,14 +400,12 @@ async fn handle_conn(
                         on_register(&s, &agent_id, &hostname, proxies).await;
                     }
                     ClientMsg::Ping { ts } => {
+                        // 根因→修法：server 反向 Ping 已砍（唯一作用是量 RTT）；rtt 改由
+                        // agent 上报的 ts 秒级计算，展示够用，省每会话每 15s 一包。
                         let _ = ctl_tx.send(ServerMsg::Pong { ts });
-                    }
-                    ClientMsg::Pong { .. } => {
-                        if let Some(t0) = *last_ping.read().await {
-                            let ms = t0.elapsed().as_millis() as i64;
-                            if let Some(hh) = s.agents.write().await.get_mut(&agent_id) {
-                                hh.info.rtt_ms = ms;
-                            }
+                        let ms = (chrono::Utc::now().timestamp() - ts).max(0) * 1000;
+                        if let Some(hh) = s.agents.write().await.get_mut(&agent_id) {
+                            hh.info.rtt_ms = ms;
                         }
                     }
                     ClientMsg::Close { stream, .. } => {
@@ -465,7 +462,7 @@ async fn handle_conn(
 /// 有序包分发：原读循环内控制/数据分支抽出（重排补齐后逐个调用）。
 async fn dispatch_body(
     s: &S, agent_id: &str, hostname: &str, ctl_tx: &mpsc::UnboundedSender<ServerMsg>,
-    last_ping: &Arc<RwLock<Option<std::time::Instant>>>, tx: &Tx, body: Vec<u8>,
+    tx: &Tx, body: Vec<u8>,
 ) {
     if let Ok(cm) = serde_json::from_slice::<ClientMsg>(&body) {
         match cm {
@@ -473,14 +470,11 @@ async fn dispatch_body(
                 on_register(s, agent_id, hostname, proxies).await;
             }
             ClientMsg::Ping { ts } => {
+                // 同读循环：rtt 由 agent 上报 ts 秒级计算（反向 Ping 已砍）。
                 let _ = ctl_tx.send(ServerMsg::Pong { ts });
-            }
-            ClientMsg::Pong { .. } => {
-                if let Some(t0) = *last_ping.read().await {
-                    let ms = t0.elapsed().as_millis() as i64;
-                    if let Some(hh) = s.agents.write().await.get_mut(agent_id) {
-                        hh.info.rtt_ms = ms;
-                    }
+                let ms = (chrono::Utc::now().timestamp() - ts).max(0) * 1000;
+                if let Some(hh) = s.agents.write().await.get_mut(agent_id) {
+                    hh.info.rtt_ms = ms;
                 }
             }
             ClientMsg::Close { stream, .. } => {
@@ -626,5 +620,12 @@ mod tests {
         assert!(!check_token("", "s3cret"));
         assert!(!check_token("s3cret", ""));
         assert!(check_token("s3cret", "s3cret"));
+    }
+
+    #[test]
+    fn kudus_watchdog_contract() {
+        // Task 3 看门狗与 Task 1 同阈值；server 不再自发 Ping（rtt 由 agent 上报）。
+        assert_eq!(crate::common::kudus::KUDUS_IDLE_KICK_SECS, 75);
+        assert!(crate::common::kudus::kudus_idle_stale(0, 76));
     }
 }
