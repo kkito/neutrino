@@ -368,7 +368,7 @@ git commit -m "feat(admin-agent): AdminResp 回填 + req_id 路由（三传输�
 - Consumes: Task 3 的 `admin_call` + pending 持有者。
 - Produces: 无（最终用户可见功能）。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `main_tests` 风格：开关默认关。加单测（位置按现有 `main_tests`）：
 
@@ -384,12 +384,12 @@ fn agent_admin_switch_defaults_off() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --bin neutrino main_tests::agent_admin 2>&1 | tail -5`
 Expected: FAIL（字段不存在）。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 (a) `src/agent/web.rs` 路由加：
 
@@ -420,7 +420,7 @@ async fn api_srv_passthrough(
 (b) `web/agent.html`：新 tab `srv`，把 `web/index.html` 的 tunnels/desired/logs/traffic/改口令
 整块逻辑复制过来，fetch 前缀 `/api/`→`/api/srv/`。登录态复用本页 `auth`（`hdrs()` 不变）。
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --bin neutrino 2>&1 | grep "test result"`
 Expected: `ok`（全绿，含 main_tests 新单测）。
@@ -428,14 +428,14 @@ Expected: `ok`（全绿，含 main_tests 新单测）。
 Run: `RUSTFLAGS="-D warnings" cargo build 2>&1 | tail -1`
 Expected: `Finished` 无 warning。
 
-- [ ] **Step 5: 真机验证（代替 e2e）**
+- [x] **Step 5: 真机验证（代替 e2e）**
 
 1. 本机起 server（`--allow-agent-admin`）+ kudus agent（`--web 127.0.0.1:18080`）。
 2. 浏览器开 agent 页 → server tab：看到本机 server 的 agents/tunnels；改一条 desired 备注并保存，
    server 日志出现 `agent '<host>' admin POST desired_set`。
 3. 不带开关重启 server，server tab 应显示 403（`agent admin disabled`）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/agent/web.rs web/agent.html src/main.rs
