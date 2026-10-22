@@ -31,6 +31,33 @@ mod udp_tests {
 use super::egress::OutHolder;
 use super::quic_session::QCtx;
 use super::kudus_session::KCtx;
+
+// link 监听泄漏 Guard：session 退出时 abort 全部监听，释放端口给下次重连。
+// 根因→修法：旧 ctx 随 session 丢弃，AbortHandle 跟着丢，监听成孤儿占端口，
+// 重连 bind 必然 Address in use（控制面活、数据面全死）。Guard 持有 ctx 的引用，
+// session 退出路径只要创建过它，drop 即全 abort。
+pub(crate) struct LinkGuard<'a> {
+    tasks: &'a tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+}
+
+impl<'a> LinkGuard<'a> {
+    pub(crate) fn new(
+        tasks: &'a tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    ) -> Self {
+        Self { tasks }
+    }
+}
+
+impl Drop for LinkGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            for (_, h) in tasks.drain() {
+                h.abort();
+            }
+        }
+    }
+}
+
 /// Config 同步 link 监听（kudus 版）：任务表挂在 KCtx 上，出站走 KudusOutHolder（Pkt）。
 pub(crate) async fn sync_link_listeners_kudus(
     ctx: &KCtx,
@@ -568,4 +595,71 @@ async fn handle_link_conn_with(inbound: TcpStream, link_name: String, tx: &Tx) -
     super::egress::egress_streams().write().await.remove(&sid);
     tx.send_close(sid);
     anyhow::Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::proto::ProxyConfig;
+
+    fn test_proxy(name: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            name: name.into(),
+            ptype: "link".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: port,
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+            enabled: true,
+            link_agent: "other".into(),
+            link_host: "127.0.0.1".into(),
+            link_port: 22,
+            rate_limit: None,
+        }
+    }
+
+    /// RED: link 任务表在 session 退出时必须被清空释放，否则重连 bind 必然 Address in use。
+    /// 现场 12:28:47 welcomed 后 9 条全 bind failed：控制面活、数据面全死。
+    #[tokio::test]
+    async fn link_guard_abort_releases_tasks_on_session_exit() {
+        let holder: super::super::egress::KudusOutHolder =
+            std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let proxies = vec![test_proxy("git", port)];
+        let ctx = super::super::kudus_session::KCtx {
+            proxies: tokio::sync::RwLock::new(vec![]),
+            link_tasks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            streams: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            pending: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        };
+        // 第一个 session 建监听
+        sync_link_listeners_kudus(&ctx, &proxies, "workmac", &holder).await;
+        assert_eq!(ctx.link_tasks.lock().await.len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok());
+        // session 退出路径：Guard drop 必须 abort 监听释放端口
+        {
+            let _guard = LinkGuard::new(&ctx.link_tasks);
+            // guard 存活时任务还在
+            assert_eq!(ctx.link_tasks.lock().await.len(), 1);
+        } // guard drop
+        assert_eq!(ctx.link_tasks.lock().await.len(), 0);
+        // 给 OS 一点时间回收端口，然后重连能重新 bind
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sync_link_listeners_kudus(&ctx, &proxies, "workmac", &holder).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(ctx.link_tasks.lock().await.len(), 1);
+        assert!(
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok(),
+            "reconnect must re-bind the link port"
+        );
+    }
 }

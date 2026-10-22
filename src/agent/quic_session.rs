@@ -113,6 +113,8 @@ pub(crate) async fn session(
     });
     let quic_link_holder = quic_out.clone();
     super::link::sync_link_listeners_quic(&ctx, &cfg.proxies, &up.hostname, &quic_link_holder).await;
+    // 根因→修法：同 kudus，link 监听与 session 同命，重连前全 abort 防端口泄漏。
+    let _link_guard = super::link::LinkGuard::new(&ctx.link_tasks);
     // 写泵：control 帧串行写（JSON len 帧 + 复用二进制帧都经此通道保序）。
     let writer = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {

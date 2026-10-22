@@ -47,6 +47,7 @@ pub(crate) async fn session(
         out: out_tx.clone(),
     });
     // link 入口监听与 session 同命：Config 热更新时 sync，session 结束 abort 全部。
+    let _link_guard = super::link::LinkGuard::new(&ctx.link_tasks);
     super::link::sync_link_listeners(
         &ctx,
         &cfg.proxies,

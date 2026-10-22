@@ -229,6 +229,10 @@ pub(crate) async fn session(
     });
     let kudus_link_holder = kudus_out.clone();
     super::link::sync_link_listeners_kudus(&ctx, &cfg.proxies, &up.hostname, &kudus_link_holder).await;
+    // 根因→修法：link 监听与 session 同命。旧 ctx 随 session 丢弃时 AbortHandle
+    // 跟着丢，监听成孤儿占端口，重连 bind 必然 Address in use（控制面活、数据面全死）。
+    // Guard 借 ctx.link_tasks，session 任一退出路径 drop 即全 abort。
+    let _link_guard = super::link::LinkGuard::new(&ctx.link_tasks);
     // 写泵：datagram 串行 send_to（保序，SYN 重传也经此）。
     let wsock = sock.clone();
     let writer = tokio::spawn(async move {
