@@ -518,7 +518,23 @@ pub(crate) async fn api_config(
 /// Parse desired file text into (hostname -> valid proxies, skipped count).
 /// 根因→修法：load 只在启动时调一次，手改文件无感知；重载接口与启动加载共用此纯函数，
 /// 坏 TOML 整单拒绝（内存不动），坏条逐条跳过、好条生效。
-fn parse_desired_text(text: &str) -> Result<(HashMap<String, Vec<ProxyConfig>>, usize), String> {
+fn parse_desired_text(
+    text: &str,
+) -> Result<(HashMap<String, Vec<ProxyConfig>>, usize, HashMap<String, String>), String> {
+    let v: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let agents = v.get("agents").ok_or_else(|| "missing [agents] table".to_string())?;
+    if !agents.is_table() {
+        return Err("agents is not a table".to_string());
+    }
+    // [egress_exit] 顶层表（可选）：发起 agent -> 出口 agent。值非 string 即跳过该 key。
+    let mut exit: HashMap<String, String> = HashMap::new();
+    if let Some(tbl) = v.get("egress_exit").and_then(|t| t.as_table()) {
+        for (k, val) in tbl {
+            if let Some(s) = val.as_str() {
+                exit.insert(k.clone(), s.to_string());
+            }
+        }
+    }
     let v: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
     let agents = v.get("agents").ok_or_else(|| "missing [agents] table".to_string())?;
     if !agents.is_table() {
@@ -542,7 +558,7 @@ fn parse_desired_text(text: &str) -> Result<(HashMap<String, Vec<ProxyConfig>>, 
         }
         fresh.insert(hostname.clone(), good);
     }
-    Ok((fresh, skipped))
+    Ok((fresh, skipped, exit))
 }
 
 /// Validate one proxy entry from the desired-CRUD form.
@@ -670,7 +686,7 @@ pub(crate) async fn api_desired_reload(
                 .into_response();
         }
     };
-    let (fresh, skipped) = match parse_desired_text(&text) {
+    let (fresh, skipped, exit) = match parse_desired_text(&text) {
         Ok(v) => v,
         Err(e) => {
             log_ev_err(&s, format!("desired reload failed: {e}"));
@@ -683,6 +699,7 @@ pub(crate) async fn api_desired_reload(
     };
     let reloaded: usize = fresh.values().map(|v| v.len()).sum();
     *s.desired.write().await = fresh.clone();
+    *s.egress_exit.write().await = exit;
     // 对在线 agent 按 hostname 推送（复用 api_desired_set 后半段语义，不落盘）
     let mut pushed = 0;
     for (hostname, proxies) in &fresh {
@@ -939,10 +956,15 @@ mod tests {
     #[test]
     fn reload_desired_skips_invalid_entries() {
         let text = "[[agents.e2e]]\nname = \"good\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = 80\nremote_port = 2222\nenabled = true\n\n[[agents.e2e]]\nname = \"bad\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = 80\nremote_port = 0\nenabled = true\n";
-        let (fresh, skipped) = parse_desired_text(text).unwrap();
+        let (fresh, skipped, exit) = parse_desired_text(text).unwrap();
         assert_eq!(skipped, 1);
         assert_eq!(fresh["e2e"].len(), 1);
         assert_eq!(fresh["e2e"][0].name, "good");
+        assert!(exit.is_empty()); // 无表即空
+        // [egress_exit] 顶层表随文件进内存
+        let t2 = "[egress_exit]\nminipc7s = \"kr\"\n\n[[agents.e2e]]\nname = \"good\"\ntype = \"tcp\"\nlocal_ip = \"127.0.0.1\"\nlocal_port = 80\nremote_port = 2222\nenabled = true\n";
+        let (_, _, exit2) = parse_desired_text(t2).unwrap();
+        assert_eq!(exit2.get("minipc7s").map(|s| s.as_str()), Some("kr"));
     }
 
     #[test]

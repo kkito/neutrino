@@ -49,6 +49,9 @@ pub(crate) struct Shared {
     pub(crate) data_dir: String,
     pub(crate) desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,
     pub(crate) desired_path: String,
+    /// egress 出口路由表：发起 agent hostname -> 出口 agent hostname。
+    /// [egress_exit] 顶层表，未列出/空值/自指 → 回退 server 本机拨号（fail-open）。
+    pub(crate) egress_exit: RwLock<HashMap<String, String>>,
     /// 分钟流量点：key = "hostname/proxy名" -> VecDeque<(ts, rx增量, tx增量)>，cap 43200（30天）
     /// 根因→修法：点必须带落盘时的 wall clock ts，否则 api 用 now-len*60 反推，
     /// 重启/断流后旧点画到错误时间（18:12 高峰实为 17 点旧账错位）。

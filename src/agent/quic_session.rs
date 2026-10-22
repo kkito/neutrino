@@ -278,6 +278,24 @@ async fn open_stream(ctx: Arc<QCtx>, sid: u32, kind: String, host: String, port:
         tracing::debug!("quic link_udp egress stream {sid} -> {host}:{port}");
         return open_udp_stream_sock(ctx, sid, sock).await;
     }
+    if kind == "egress_dial" {
+        // QUIC 版反向拨号：与 pump_tcp 同泵（dial 目标=server 下发真实目标）。
+        let local = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+                let _ = send_ctrl(&ctx.out, &e);
+                return Ok(());
+            }
+        };
+        tracing::debug!("quic egress_dial stream {sid} -> {host}:{port}");
+        return pump_tcp(ctx, sid, local, false).await;
+    }
     if kind == "link" {
         let local = TcpStream::connect((host.as_str(), port)).await?;
         return pump_tcp(ctx, sid, local, false).await;

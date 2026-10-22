@@ -1984,19 +1984,31 @@ async fn desired_reload_from_file() {
 /// agent1 纯出口（无 link），agent2 带 link 条目（入口监听）。
 struct Env2 {
     web_base: String,
+    eport2: u16,
     _srv: tokio::process::Child,
     _ag1: tokio::process::Child,
     _ag2: tokio::process::Child,
 }
 
+/// 双 agent 启动（带 egress 版）：直接复用 boot_two_agents（agent2 自带 egress 监听）。
+/// eport2 = agent2 的 egress.http 监听端口（发起端）。
+async fn boot_two_agents_egress(desired_toml: &str) -> Env2 {
+    boot_two_agents(desired_toml).await
+}
+
 async fn boot_two_agents(desired_toml: &str) -> Env2 {
     let ws_port = free_port();
+    let eport2 = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let cfg1 = dir.join("a1.toml");
     let cfg2 = dir.join("a2.toml");
     tokio::fs::write(&cfg1, "hostname = \"agent1\"\ntoken = \"s3cret\"\n").await.unwrap();
-    tokio::fs::write(&cfg2, "hostname = \"agent2\"\ntoken = \"s3cret\"\n").await.unwrap();
+    // agent2 带本地 egress 监听（发起端）：CONNECT 到此即 Open{egress} 上行。
+    tokio::fs::write(
+        &cfg2,
+        format!("hostname = \"agent2\"\ntoken = \"s3cret\"\n[egress.http]\nlisten_ip = \"127.0.0.1\"\nlisten_port = {eport2}\nenabled = true\n"),
+    ).await.unwrap();
     let data = dir.join("data");
     tokio::fs::create_dir_all(&data).await.unwrap();
     let desired_path = dir.join("desired.toml");
@@ -2041,6 +2053,7 @@ async fn boot_two_agents(desired_toml: &str) -> Env2 {
     tokio::time::sleep(Duration::from_secs(2)).await;
     Env2 {
         web_base: format!("http://127.0.0.1:{ws_port}"),
+        eport2,
         _srv: srv,
         _ag1: ag1,
         _ag2: ag2,
@@ -2048,7 +2061,67 @@ async fn boot_two_agents(desired_toml: &str) -> Env2 {
 }
 
 /// link 对端不在线：client 被干净 Close（读 EOF），入口 agent 主链不断。
-/// link e2e 回归：旧代码无 Open{link} 分支/入口监听时，此测试挂（连上无回声）。
+/// egress_exit e2e：发起 agent → server 查表 → 出口 agent 反向 dial → 回包原路。
+/// 旧代码无 egress_dial 分支时挂（出口收 Open 无响应，client 读超时）。
+/// 断言抓：经 agent2 本地 egress CONNECT 到后端，回包含 EGRESS-OK（证明走了 agent1 出口拨回）。
+#[tokio::test]
+async fn egress_exit_roundtrip() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 后端 echo：HTTP 响应 EGRESS-OK。
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else { break };
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let n = s.read(&mut b).await.unwrap_or(0);
+                let body = format!("EGRESS-OK got={n}");
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(), body
+                    ).as_bytes(),
+                ).await;
+            });
+        }
+    });
+    // desired：agent2 发起的 egress 由 agent1 出口拨号。
+    let desired = "[egress_exit]\nagent2 = \"agent1\"\n";
+    let env = boot_two_agents_egress(&desired).await;
+    // agent2 的本地 egress 监听端口（boot_two_agents_egress 约定 eport2）。
+    let eport = env.eport2;
+    let mut ok = false;
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "egress proxy never came up");
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{eport}")).await.unwrap();
+    c.write_all(format!("CONNECT 127.0.0.1:{bport} HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\n\r\n").as_bytes())
+        .await.unwrap();
+    let mut raw = vec![];
+    let mut tmp = vec![0u8; 4096];
+    loop {
+        let n = c.read(&mut tmp).await.unwrap();
+        assert!(n > 0, "CONNECT closed before established");
+        raw.extend_from_slice(&tmp[..n]);
+        if raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+    }
+    let hs = String::from_utf8_lossy(&raw).into_owned();
+    assert!(hs.contains("200"), "CONNECT not established: {hs}");
+    let hlen = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let mut out = raw[hlen..].to_vec();
+    c.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+    c.read_to_end(&mut out).await.unwrap();
+    let body = String::from_utf8_lossy(&out).into_owned();
+    assert!(body.contains("EGRESS-OK"), "egress_exit roundtrip failed: {body}");
+    let _ = &env._srv;
+}
+
 /// 断言抓：client → agent2 监听 → server → agent1 → echo 回声；
 /// 且 /api/conns 有 tunnel==dblink 的行，client 关后行消失（Drop-guard）。
 #[tokio::test]

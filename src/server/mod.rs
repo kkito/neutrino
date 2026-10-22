@@ -66,6 +66,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         data_dir: data.to_string(),
         desired: RwLock::new(HashMap::new()),
         desired_path: desired.to_string(),
+        egress_exit: RwLock::new(crate::common::desired::DesiredStore::load_egress_exit(desired)),
         public_port,
         allow_agent_admin,
         ..Default::default()

@@ -505,6 +505,24 @@ async fn open_stream(
         tracing::debug!("kudus link_udp egress stream {sid} -> {host}:{port}");
         return open_udp_stream_to(ctx, pkt, sid, local).await;
     }
+    if kind == "egress_dial" {
+        // kudus 版反向拨号：dial 真实目标 + pump_tcp（与 open_tcp_stream 出口段同构）。
+        let local = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                let c = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+                let _ = pkt.send_ctrl(&c);
+                return Ok(());
+            }
+        };
+        tracing::debug!("kudus egress_dial stream {sid} -> {host}:{port}");
+        return pump_tcp(ctx, pkt, sid, local, false).await;
+    }
     if kind == "link" {
         // 出口 dial：server 侧 resolve_link 已把 host/port 换成真实目标
         // （link 出口 agent 无需查表，直接拨）。失败即回 Close{link denied}。

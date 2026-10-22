@@ -800,7 +800,201 @@ pub(crate) async fn insert_egress_conn(s: &S, sid: u32, hostname: &str, host: &s
     );
 }
 
+/// egress 出口路由查表：发起 agent → 出口 agent；未命中/空值/自指 → None（回退本机拨号）。
+/// 纯函数：单测 egress_exit_route_lookup 覆盖。
+pub(crate) fn egress_exit_for(
+    tbl: &std::collections::HashMap<String, String>,
+    from: &str,
+) -> Option<String> {
+    let e = tbl.get(from)?;
+    if e.is_empty() || e == from {
+        None
+    } else {
+        Some(e.clone())
+    }
+}
+
+/// server 侧 egress 出口反向拨号：发起方 Open{egress} → 查表命中 → 出口 Open{egress_dial} → 双泵。
+/// 结构照抄 spawn_link_relay（占位/drain/记账/双关）；失败（出口离线/发送失败）→ 调用方回退本机拨号。
+/// 返回 Ok(true)=已接管，Ok(false)=需回退本机拨号。
+pub(crate) async fn try_egress_exit_relay(
+    s: &S,
+    entry_agent_id: &str,
+    entry_hostname: &str,
+    sid_entry: u32,
+    host: String,
+    port: u16,
+    ctl_entry: mpsc::UnboundedSender<ServerMsg>,
+) -> bool {
+    // 1. 查表（server 存的 desired 顶层 [egress_exit]，由 Shared.egress_exit 持有）。
+    let exit_host = {
+        let tbl = s.egress_exit.read().await;
+        match egress_exit_for(&tbl, entry_hostname) {
+            Some(e) => e,
+            None => return false,
+        }
+    };
+    // 2. 找出口 agent + 出向通道；离线 → 回退本机（fail-open，不断链）。
+    let (exit_aid, exit_ctl, exit_out) = {
+        let ag = s.agents.read().await;
+        match ag.iter().find(|(_, h)| h.info.hostname == exit_host) {
+            Some((id, h)) => (id.clone(), h.ctl.clone(), s.outbox.read().await.get(id).cloned()),
+            None => {
+                tracing::warn!("egress_exit '{entry_hostname}' -> '{exit_host}' offline, fallback local dial");
+                return false;
+            }
+        }
+    };
+    let Some(exit_out) = exit_out else {
+        tracing::warn!("egress_exit '{exit_host}' gone, fallback local dial");
+        return false;
+    };
+    // 3. 出口 sid（server 偶数号）+ 双端占位 + 早到 drain（照抄 link relay）。
+    let sid_exit = super::ingress::next_sid_pub();
+    let (dtx_exit, mut drx_exit) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (dtx_entry, mut drx_entry) = mpsc::unbounded_channel::<Vec<u8>>();
+    if let Some(h) = s.agents.read().await.get(&exit_aid) {
+        h.incoming.write().await.insert(sid_exit, dtx_exit.clone());
+    }
+    if let Some(h) = s.agents.read().await.get(entry_agent_id) {
+        h.incoming.write().await.insert(sid_entry, dtx_entry.clone());
+    }
+    async fn drain_early(
+        s: &S,
+        aid: &str,
+        sid: u32,
+        tx: &mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        let pe = s.agents.read().await.get(aid).map(|h| h.pending.clone());
+        if let Some(pe) = pe {
+            if let Some(chunks) = pe.write().await.remove(&sid) {
+                for chunk in chunks {
+                    let _ = tx.send(chunk);
+                }
+            }
+        }
+    }
+    drain_early(s, entry_agent_id, sid_entry, &dtx_entry).await;
+    drain_early(s, &exit_aid, sid_exit, &dtx_exit).await;
+    // 4. 向出口发 Open{egress_dial}（真实目标，出口直接 dial）。
+    if exit_ctl
+        .send(ServerMsg::Open {
+            stream: sid_exit,
+            kind: "egress_dial".into(),
+            host: host.clone(),
+            port,
+        })
+        .is_err()
+    {
+        tracing::warn!("egress_exit '{exit_host}' send failed, fallback local dial");
+        return false;
+    }
+    // 5. conns 记账（proto=egress，target=出口->目标，复用 egress 口径）。
+    let entry_aid = entry_agent_id.to_string();
+    let entry_host = entry_hostname.to_string();
+    let cid = (sid_entry as u64) | ((sid_exit as u64) << 32)
+        | ((entry_aid.len() as u64) << 56);
+    s.conns.write().await.insert(
+        cid,
+        super::state::ConnInfo {
+            id: cid,
+            proto: "egress".into(),
+            peer: entry_host.clone(),
+            public_port: 0,
+            agent: entry_host.clone(),
+            tunnel: "egress".into(),
+            remote_port: port,
+            target: format!("{exit_host}->{host}:{port}"),
+            since: chrono::Utc::now().timestamp(),
+            rx: 0,
+            tx: 0,
+        },
+    );
+    let s2 = s.clone();
+    let s3 = s.clone();
+    let entry_aid2 = entry_aid.clone();
+    let mut a2e = tokio::spawn(async move {
+        while let Some(chunk) = drx_entry.recv().await {
+            if let Some(c) = s2.conns.write().await.get_mut(&cid) {
+                c.rx += chunk.len() as u64;
+            }
+            if exit_out.send((sid_exit, chunk)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut e2a = tokio::spawn(async move {
+        while let Some(chunk) = drx_exit.recv().await {
+            if let Some(c) = s3.conns.write().await.get_mut(&cid) {
+                c.tx += chunk.len() as u64;
+            }
+            let out = s3.outbox.read().await.get(&entry_aid2).cloned();
+            match out {
+                Some(o) => {
+                    if o.send((sid_entry, chunk)).is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+    drop(dtx_exit);
+    drop(dtx_entry);
+    tokio::select! {
+        _ = &mut a2e => { e2a.abort(); let _ = (&mut e2a).await; }
+        _ = &mut e2a => { a2e.abort(); let _ = (&mut a2e).await; }
+    }
+    s.conns.write().await.remove(&cid);
+    if let Some(h) = s.agents.read().await.get(&entry_aid) {
+        h.incoming.write().await.remove(&sid_entry);
+    }
+    if let Some(h) = s.agents.read().await.get(&exit_aid) {
+        h.incoming.write().await.remove(&sid_exit);
+    }
+    let _ = ctl_entry.send(ServerMsg::Close {
+        stream: sid_entry,
+        reason: "eof".into(),
+    });
+    if let Some(h) = s.agents.read().await.get(&exit_aid) {
+        let _ = h.ctl.send(ServerMsg::Close {
+            stream: sid_exit,
+            reason: "eof".into(),
+        });
+    }
+    log_ev(s, format!("egress_exit '{entry_host}' via '{exit_host}' closed"));
+    true
+}
+
+/// server 侧 egress 入口：查 egress_exit 表 → 命中且出口在线即反向 dial 中继；
+/// 否则回退本机拨号（现状，不变）。
 pub(crate) fn spawn_egress_dial(
+    s: &S,
+    agent_id: &str,
+    sid: u32,
+    host: String,
+    port: u16,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+) {
+    let s2 = s.clone();
+    let (aid, h, p, c) = (agent_id.to_string(), host.clone(), port, ctl.clone());
+    tokio::spawn(async move {
+        // 查表：发起方 hostname → 出口 hostname。
+        let entry_hostname = s2
+            .agents
+            .read()
+            .await
+            .get(&aid)
+            .map(|x| x.info.hostname.clone())
+            .unwrap_or_default();
+        if try_egress_exit_relay(&s2, &aid, &entry_hostname, sid, h, p, c).await {
+            return; // 出口 agent 已接管，本机不再拨号。
+        }
+        spawn_egress_dial_local(&s2, &aid, sid, host, port, ctl);
+    });
+}
+
+fn spawn_egress_dial_local(
     s: &S,
     agent_id: &str,
     sid: u32,
@@ -995,6 +1189,23 @@ pub(crate) async fn on_register(s: &S, agent_id: &str, hostname: &str, reported:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_exit_route_lookup() {
+        // 纯函数语义：发起 agent → 出口 agent；未命中/空表/自指/空值 → None（回退本机）。
+        use std::collections::HashMap;
+        let tbl: HashMap<String, String> = Default::default();
+        assert_eq!(super::egress_exit_for(&tbl, "minipc7s"), None); // 空表回退
+        let mut tbl = tbl;
+        tbl.insert("minipc7s".into(), "kr".into());
+        assert_eq!(super::egress_exit_for(&tbl, "minipc7s"), Some("kr".into())); // 命中
+        assert_eq!(super::egress_exit_for(&tbl, "macmini"), None); // 未列出回退
+        tbl.insert("loop".into(), "loop".into());
+        assert_eq!(super::egress_exit_for(&tbl, "loop"), None); // 自指回退
+        tbl.insert("empty".into(), String::new());
+        assert_eq!(super::egress_exit_for(&tbl, "empty"), None); // 空值回退
+    }
+
     #[test]
     fn resolve_link_uses_server_table() {
         // server 存为准：入口传什么 host 都不信，只认 desired 表。
