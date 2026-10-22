@@ -91,8 +91,14 @@ impl Pkt {
         }
     }
     pub(crate) fn send_ctrl(&self, m: &ClientMsg) -> anyhow::Result<()> {
+        // 根因→修法：Register/Config 一消息一帧，代理多时 3320B 级 JSON 超
+        // KUDUS_MAX_UDP 被整包丢。现按 KUDUS_CTRL_CHUNK 切片，每片独立 DATA 帧
+        // 独立 seq（走可靠重传+重排），对端 CtrlReasm 重组后整条解析。
         let j = serde_json::to_vec(m)?;
-        self.send(FLAG_DATA, 0, [0u8; 32], &j)
+        for frag in crate::common::kudus::split_ctrl_frame(&j) {
+            self.send(FLAG_DATA, 0, [0u8; 32], &frag)?;
+        }
+        Ok(())
     }
     /// 字节流发送（TCP/HTTP/egress/link）：按 [`KUDUS_DATA_CHUNK`] 切片，
     /// 每片独立 DATA 帧独立 seq（接收侧重排缓冲保序，跨机乱序/丢包可恢复）。
@@ -320,6 +326,8 @@ pub(crate) async fn session(
     // 主分发循环（看门狗：75s 无 server 任何帧即判死，bail 走外层 backoff 重连。
     // 根因→修法：旧裸 recv 永等，server OOM 重启后 agent 卡旧会话无感知
     // （macmini 2026-10-21 现场）。握手完成后的主循环才计时。）
+    // 控制分片重组槽（Config 分片跨包累计，可靠重排已保序）。
+    let mut ctrl_reasm = crate::common::kudus::CtrlReasm::new();
     loop {
         let (h, body) = match tokio::time::timeout(
             std::time::Duration::from_secs(crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64),
@@ -335,6 +343,16 @@ pub(crate) async fn session(
             let _ = pkt.send(FLAG_ACK, h.seq, [0u8; 32], b"bye");
             break;
         }
+        // 控制分片先重组（与 server 侧对称）：sid==CTRL_SID 即分片，攒齐前不解析。
+        let body = match decode_data(&body) {
+            Some((id, payload)) if id == KUDUS_CTRL_SID => {
+                match ctrl_reasm.feed(payload) {
+                    Some(full) => full,
+                    None => continue,
+                }
+            }
+            _ => body,
+        };
         if let Ok(sm) = serde_json::from_slice::<ServerMsg>(&body) {
             match sm {
                 ServerMsg::Pong { ts } => {

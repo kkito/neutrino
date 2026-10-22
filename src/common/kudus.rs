@@ -163,6 +163,102 @@ pub const KUDUS_MAX_UDP: usize = 1232;
 /// SACK bitmap 位数（乱序窗口）。
 pub const KUDUS_SACK_BITS: usize = 256;
 
+/// 控制面分片专用流 id：decode_data 首 4B 命中即走 CtrlReasm，不进数据投递。
+/// 取 u32::MAX——server 偶数 sid / agent 奇数 sid 永远撞不上。
+/// 根因→修法：Config/Register 一消息一帧，代理多时 3320B 级 JSON 超
+/// KUDUS_MAX_UDP 被 send_pkt 整包丢（warn 后 break，写泵直接退出）。
+/// 现控制 JSON 按 KUDUS_CTRL_CHUNK 切片，每片独立 DATA 帧独立 seq（走可靠重传），
+/// 接收侧按 (total,offset) 重组后整条解析。分片头 8B：[total u32 BE][offset u32 BE]。
+pub const KUDUS_CTRL_SID: u32 = u32::MAX;
+/// 控制分片载荷上限：50(hdr)+4(sid)+8(分片头)+1000=1062B plain，
+/// 线上 4+24+1062+16=1106B < 1232 上限（与 KUDUS_DATA_CHUNK=1000 对齐）。
+pub const KUDUS_CTRL_CHUNK: usize = 1000;
+/// 控制分片头长度：[total 4B][offset 4B]。
+pub const KUDUS_CTRL_FRAG_HDR: usize = 8;
+
+/// 控制 JSON 切片：每片 = encode_data(CTRL_SID, [total][offset][bytes])。
+/// 小消息也走此道（单片 total==len），收发对称、免双路径。
+pub fn split_ctrl_frame(json: &[u8]) -> Vec<Vec<u8>> {
+    let total = json.len() as u32;
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    loop {
+        let end = (off + KUDUS_CTRL_CHUNK).min(json.len());
+        let mut frag = Vec::with_capacity(KUDUS_CTRL_FRAG_HDR + (end - off));
+        frag.extend_from_slice(&total.to_be_bytes());
+        frag.extend_from_slice(&(off as u32).to_be_bytes());
+        frag.extend_from_slice(&json[off..end]);
+        out.push(crate::common::proto::encode_data(KUDUS_CTRL_SID, &frag));
+        if end >= json.len() {
+            break;
+        }
+        off = end;
+    }
+    out
+}
+
+/// 控制分片重组器（单消息槽）：发送侧一消息各片连续 seq 发出，
+/// 可靠重排后按序到达；乱序/重发靠 offset 去重，total 变化即旧槽作废。
+pub struct CtrlReasm {
+    total: Option<u32>,
+    parts: HashMap<u32, Vec<u8>>,
+    len: usize,
+}
+
+impl CtrlReasm {
+    pub fn new() -> Self {
+        Self { total: None, parts: HashMap::new(), len: 0 }
+    }
+    /// 喂一片 decode_data 拆出的负载（已确认为 CTRL_SID）：
+    /// 集齐即返回整条 JSON，否则 None。坏片（<8B/越界）忽略。
+    pub fn feed(&mut self, frag: &[u8]) -> Option<Vec<u8>> {
+        if frag.len() < KUDUS_CTRL_FRAG_HDR {
+            return None;
+        }
+        let total = u32::from_be_bytes([frag[0], frag[1], frag[2], frag[3]]);
+        let off = u32::from_be_bytes([frag[4], frag[5], frag[6], frag[7]]);
+        let data = &frag[KUDUS_CTRL_FRAG_HDR..];
+        if off.checked_add(data.len() as u32).unwrap_or(u32::MAX) > total {
+            return None;
+        }
+        if self.total != Some(total) {
+            self.total = Some(total);
+            self.parts.clear();
+            self.len = 0;
+        }
+        if total == 0 {
+            self.total = None;
+            return Some(Vec::new());
+        }
+        if self.parts.contains_key(&off) {
+            if self.len >= total as usize {
+                return Some(self.assemble(total));
+            }
+            return None; // 重发片：已记过，不重复计
+        }
+        self.len += data.len();
+        self.parts.insert(off, data.to_vec());
+        if self.len >= total as usize {
+            let msg = self.assemble(total);
+            self.total = None;
+            self.parts.clear();
+            self.len = 0;
+            return Some(msg);
+        }
+        None
+    }
+    fn assemble(&self, total: u32) -> Vec<u8> {
+        let mut offs: Vec<u32> = self.parts.keys().cloned().collect();
+        offs.sort_unstable();
+        let mut msg = Vec::with_capacity(total as usize);
+        for o in offs {
+            msg.extend_from_slice(&self.parts[&o]);
+        }
+        msg.truncate(total as usize);
+        msg
+    }
+}
+
 pub const FLAG_SYN: u8 = 0x01;
 pub const FLAG_ACK: u8 = 0x02;
 pub const FLAG_FIN: u8 = 0x04;
@@ -429,5 +525,40 @@ mod tests {
             parse_server_url("ws://127.0.0.1:7440/ws"),
             Transport::Ws(_)
         ));
+    }
+
+    /// RED:控制帧分片——3320B 级 Config/Register 必须切成装得进 datagram 的小片，
+    /// 乱序/重发到达也能重组回原文。旧代码一消息一帧，超 KUDUS_MAX_UDP 整包丢。
+    #[test]
+    fn kudus_ctrl_frag_roundtrip_large() {
+        // 3320B 现场包：50B hdr + body 超 1138B 预算即被 send_pkt 整包丢。
+        let big = vec![b'x'; 3320];
+        let pieces = super::split_ctrl_frame(&big);
+        assert!(pieces.len() > 1);
+        for p in &pieces {
+            assert!(
+                4 + 24 + super::HDR_LEN + p.len() + 16 <= super::KUDUS_MAX_UDP,
+                "frag still oversize: {}B",
+                p.len()
+            );
+        }
+        // 乱序投递（每片经 decode_data 拆出 sid=0 负载后喂重组器）。
+        let mut reasm = super::CtrlReasm::new();
+        let mut got = None;
+        for p in pieces.iter().rev() {
+            let (id, payload) = crate::common::proto::decode_data(p).unwrap();
+            assert_eq!(id, super::KUDUS_CTRL_SID);
+            if let Some(m) = reasm.feed(payload) {
+                got = Some(m);
+            }
+        }
+        assert_eq!(got.unwrap(), big);
+        // 小消息不分片：单片即原文（offset 0 + total == len）。
+        let small = b"{\"t\":\"ping\"}".to_vec();
+        let one = super::split_ctrl_frame(&small);
+        assert_eq!(one.len(), 1);
+        let mut r2 = super::CtrlReasm::new();
+        let (_, pl) = crate::common::proto::decode_data(&one[0]).unwrap();
+        assert_eq!(r2.feed(pl).unwrap(), small);
     }
 }

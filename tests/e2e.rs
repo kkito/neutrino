@@ -1079,6 +1079,96 @@ async fn kudus_http_udp_and_hot_config() {
         .is_err());
 }
 
+/// RED 回归：kudus 控制帧分片——40 个 http 代理的 Register/Config（≈5KB JSON）
+/// 必须走通收敛。旧代码一消息一帧，超 KUDUS_MAX_UDP（1232B）被 send_pkt 整包丢
+/// （warn `kudus oversize frame dropped (3320B)` 后写泵 break），http 永远不通。
+/// 断言抓：40 代理下 http 透传在 15s 内收敛（轮询，上限 75×200ms）。
+#[tokio::test]
+async fn kudus_many_proxies_ctrl_frag_converges() {
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 8192];
+                let _ = s.read(&mut b).await;
+                let body = "many-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    // 注意：隧道以 server desired.toml 为准，agent.toml 里 [[proxies]] 会被忽略
+    // （run() warn 后丢弃）。40 代理必须写 desired，boot_kudus 只管 agent 文件。
+    let mut desired = String::new();
+    for i in 0..40 {
+        desired.push_str(&format!(
+            "[[agents.e2e]]\nname=\"web{i:02}\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"w{i:02}.e2e.test\"]\n"
+        ));
+    }
+    // boot_kudus 写死 agent 文件、无 desired 参数：desired 文件按 boot_kudus 的
+    // 命名规则（nt-e2e-kudus-*）预写空文件占位行不通（server 启动即读）。
+    // 最小改法：本用例自建 server+agent（复用 boot_kudus 体，desired 预写）。
+    use std::fmt::Write as _;
+    let ws_port = free_port();
+    let kudus_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-kudus-many-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(&cfg_path, "hostname = \"e2e\"\ntoken = \"s3cret\"\n").await.unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    tokio::fs::write(&desired_path, &desired).await.unwrap();
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server", "--listen", &format!("127.0.0.1:{ws_port}"),
+            "--kudus-listen", &format!("127.0.0.1:{kudus_port}"),
+            "--data", data.to_str().unwrap(),
+            "--desired", desired_path.to_str().unwrap(),
+            "--token", "s3cret",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent", "--server", &format!("kudus://127.0.0.1:{kudus_port}"),
+            "--config", cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let env = Env {
+        http_port: ws_port,
+        web_base: format!("http://127.0.0.1:{ws_port}"),
+        data_dir: data,
+        _srv: srv,
+        _ag: ag,
+    };
+    let mut ok = false;
+    for _ in 0..75 {
+        if http_get_via(&env, "w39.e2e.test").await.contains("many-ok") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "kudus 40-proxy Register/Config never converged (ctrl frag?)");
+}
+
 /// kudus 单 flight：同 hostname 第二个 agent 上线踢掉旧会话（与 ws_loop 同语义）。
 /// 前置 bug：kudus 注册无踢人，旧会话僵尸残留（rtt=-1），overview 越堆越多、抢 link 路由。
 #[tokio::test]

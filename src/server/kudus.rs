@@ -102,6 +102,10 @@ async fn handle_conn(
     let key = derive_key(&token);
     let peer = Arc::new(std::sync::RwLock::new(peer0));
     let tx = Tx { sock: sock.clone(), peer: peer.clone(), key, session };
+    // 握手期 Register 分片重组槽（首个大数据 Register 在 SYN-ACK 循环里即到达）。
+    let hs_reasm = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::common::kudus::CtrlReasm::new(),
+    ));
     // 握手：首包必须是 SYN + Hello（15s 超时）。
     // 注意：超时/错 token 一律静默返回（黑洞，无回包无事件，见 design §2）；
     // 仅 debug 留痕（默认 info 不可见），方便 RUST_LOG=debug 排错。
@@ -219,13 +223,24 @@ async fn handle_conn(
             Ok(Some((p, h2, body))) => {
                 *peer.write().unwrap() = p;
                 // 对端 ACK：Register（进入数据态）；重复 SYN：重发 SYN-ACK（下轮循环）。
-                if serde_json::from_slice::<ClientMsg>(&body)
+                // 根因→修法：Register 已分片（CTRL_SID），首片半包 JSON 解析必失败，
+                // 此处必须先喂重组器，攒齐整条再判定/重放，否则大 Register 永远等不到 acked。
+                let full = match decode_data(&body) {
+                    Some((id, payload)) if id == KUDUS_CTRL_SID => {
+                        match hs_reasm.lock().unwrap().feed(payload) {
+                            Some(f) => f,
+                            None => continue,
+                        }
+                    }
+                    _ => body,
+                };
+                if serde_json::from_slice::<ClientMsg>(&full)
                     .map(|m| matches!(m, ClientMsg::Register { .. }))
                     .unwrap_or(false)
                 {
                     let _ = h2;
                     // Register 走正常分发（见下读循环重放）：先入队处理
-                    on_register_from_body(&s, &agent_id, &hostname, &body).await;
+                    on_register_from_body(&s, &agent_id, &hostname, &full).await;
                     acked = true;
                     break;
                 }
@@ -239,6 +254,10 @@ async fn handle_conn(
     }
     // 收发循环：读包（解密在分发层已做）→ 控制/数据分发；写泵（ctl/outbox→datagram，可靠登记）。
     // 上行（agent→server）seq 从 1 开始，重排缓冲同锚（agent 上行首帧 SYN seq=0 不可靠）。
+    // 控制分片重组槽：跨包累计（可靠重排已保序，槽内只做 offset 去重+集齐组装）。
+    let ctrl_reasm = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::common::kudus::CtrlReasm::new(),
+    ));
     let mut rxbuf = crate::common::kudus::ReorderBuf::new(1);
     let rel = Arc::new(std::sync::Mutex::new(ServerRel::new()));
     let mut fin_acked = false;
@@ -253,8 +272,14 @@ async fn handle_conn(
         loop {
             tokio::select! {
                 Some(m) = ctl_rx.recv() => {
+                    // 根因→修法：Config 一消息一帧，代理多时 3320B 级 JSON 超
+                    // KUDUS_MAX_UDP 被整包丢（且 break 退出写泵，后续下行全断）。
+                    // 现按 KUDUS_CTRL_CHUNK 切片逐片发（与 agent send_ctrl 对称）；
+                    // 单片超限（send_pkt false）只跳过本片，不退出写泵。
                     let t = serde_json::to_string(&m).unwrap();
-                    if !rel_emit(&txw, &relw, FLAG_DATA, t.as_bytes()) { break; }
+                    for frag in crate::common::kudus::split_ctrl_frame(t.as_bytes()) {
+                        if !rel_emit(&txw, &relw, FLAG_DATA, &frag) { break; }
+                    }
                 }
                 Some((id, payload)) = out_rx.recv() => {
                     // outbox 数据：先按流切片（单 datagram 装不下会整包丢→静默断流），
@@ -372,6 +397,17 @@ async fn handle_conn(
                     continue;
                 }
                 for ob in ready {
+                    // 控制分片先重组：sid==CTRL_SID 即分片，攒齐前不进 JSON 解析
+                    // （半条 JSON parse 必失败，旧代码会把它当数据帧误投 deliver）。
+                    let ob = match decode_data(&ob) {
+                        Some((id, payload)) if id == KUDUS_CTRL_SID => {
+                            match ctrl_reasm.lock().unwrap().feed(payload) {
+                                Some(full) => full,
+                                None => continue,
+                            }
+                        }
+                        _ => ob,
+                    };
                     dispatch_body(&s, &agent_id, &hostname, &ctl_tx, &tx, ob).await;
                 }
                 continue;
@@ -464,6 +500,9 @@ async fn handle_conn(
 }
 
 /// 有序包分发：原读循环内控制/数据分支抽出（重排补齐后逐个调用）。
+/// 注意：控制分片已在调用方重组为整条（CTRL_SID 不会落到这里）；
+/// 分片半包若漏进来，JSON 解析失败即落到 decode_data 分支，而 CTRL_SID
+/// ≠任何真实流 id，deliver 查不到表只进 pending，不污染数据流。
 async fn dispatch_body(
     s: &S, agent_id: &str, hostname: &str, ctl_tx: &mpsc::UnboundedSender<ServerMsg>,
     tx: &Tx, body: Vec<u8>,
