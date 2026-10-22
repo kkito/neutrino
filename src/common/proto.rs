@@ -123,7 +123,7 @@ pub fn parse_rate_limit(s: &str) -> Option<u64> {
 /// link 条目校验（纯函数）：对端/目标/监听缺一不可，且禁止自环。
 /// 根因→修法：link 配错（空对端/自环）要在配置层拦掉，别等建流时再炸。
 pub fn valid_link(p: &ProxyConfig, self_hostname: &str) -> bool {
-    if p.ptype != "link" || !p.enabled {
+    if !(p.ptype == "link" || p.ptype == "link_udp") || !p.enabled {
         return false;
     }
     if p.link_agent.trim().is_empty() || p.link_agent == self_hostname {
@@ -212,6 +212,31 @@ mod tests {
         let mut r = q.clone();
         r.ptype = "tcp".into();
         assert!(!super::valid_link(&r, "agent2"));
+    }
+
+    #[test]
+    fn valid_link_udp_ok_and_bad() {
+        let mut p = ProxyConfig {
+            name: "u".into(),
+            ptype: "link_udp".into(),
+            local_ip: "0.0.0.0".into(),
+            local_port: 51413,
+            domains: vec![],
+            remote_port: 0,
+            enabled: true,
+            link_agent: "exit".into(),
+            link_host: "10.0.0.1".into(),
+            link_port: 51413,
+            rate_limit: None,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+        };
+        assert!(super::valid_link(&p, "entry"));
+        p.link_agent = "entry".into();
+        assert!(!super::valid_link(&p, "entry")); // 自环拒绝
+        p.link_agent = "exit".into();
+        p.link_port = 0;
+        assert!(!super::valid_link(&p, "entry")); // 零目标端口拒绝
     }
 
     #[test]
