@@ -10,6 +10,53 @@ pub const KUDUS_RTO: Duration = Duration::from_millis(200);
 /// 重排/重传缓冲上限：防对端疯发撑爆内存（超了丢新包，等重传补）。
 pub const KUDUS_WINDOW: usize = 512;
 
+/// kudus 看门狗阈值：75s 无任何帧即判死（server/agent 双端共用）。
+/// 根因→修法：WSS 的 45s 按"3×15s server Ping"算；kudus agent 上行最坏 30s 一包，
+/// 45s 只容忍丢 1 包，75s 容忍连丢 2 包不误踢。WSS 的 IDLE_KICK_SECS 不动。
+pub const KUDUS_IDLE_KICK_SECS: i64 = 75;
+
+/// 心跳间隔状态机：慢档 15~30s 随机（防多 agent 对齐惊群 + NAT 保活），
+/// 丢包进快档 5~8s 随机，回慢档需连续 3 周期无丢包（迟滞防翻转）。
+/// 纯计算 + 计数器，可单测；`lossy` 由调用方传 `retx 非空`。
+pub struct Heartbeat {
+    fast: bool,
+    calm_hit: u8,
+}
+
+impl Heartbeat {
+    pub fn new() -> Self {
+        Self { fast: false, calm_hit: 0 }
+    }
+    pub fn is_fast(&self) -> bool {
+        self.fast
+    }
+    pub fn next_interval(&mut self, lossy: bool) -> Duration {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        if lossy {
+            self.fast = true;
+            self.calm_hit = 0;
+            Duration::from_secs(rng.gen_range(5..=8))
+        } else if self.fast {
+            self.calm_hit += 1;
+            if self.calm_hit >= 3 {
+                self.fast = false;
+                self.calm_hit = 0;
+                Duration::from_secs(rng.gen_range(15..=30))
+            } else {
+                Duration::from_secs(rng.gen_range(5..=8))
+            }
+        } else {
+            Duration::from_secs(rng.gen_range(15..=30))
+        }
+    }
+}
+
+/// 纯判定：now-last_seen 超 75s 即僵尸（kudus 版；WSS 用 state::is_idle_stale 45s，不动）。
+pub fn kudus_idle_stale(last_seen_unix: i64, now_unix: i64) -> bool {
+    now_unix - last_seen_unix > KUDUS_IDLE_KICK_SECS
+}
+
 /// 接收重排缓冲：按 seq 有序投递，洞后包缓存等待补洞。
 /// 根因→修法：v1 到包即投，跨机丢包即永久少一块（avatar/blob 截断），必须缓存等补齐。
 pub struct ReorderBuf {
@@ -253,6 +300,35 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_slow_fast_hysteresis() {
+        // 根因→修法：固定 30s 心跳多 agent 对齐惊群；丢包无加密。慢档 15~30s 随机，
+        // 丢包进快档 5~8s，回慢档需 3 连好（防翻转）。
+        let mut hb = super::Heartbeat::new();
+        assert!(!hb.is_fast());
+        for _ in 0..20 {
+            let d = hb.next_interval(false);
+            assert!(d >= std::time::Duration::from_secs(15) && d <= std::time::Duration::from_secs(30));
+            assert!(!hb.is_fast());
+        }
+        let d = hb.next_interval(true); // 丢 1 包即进快档
+        assert!(hb.is_fast());
+        assert!(d >= std::time::Duration::from_secs(5) && d <= std::time::Duration::from_secs(8));
+        hb.next_interval(false);
+        hb.next_interval(false);
+        assert!(hb.is_fast()); // 2 连好仍在快档
+        hb.next_interval(false);
+        assert!(!hb.is_fast()); // 3 连好回慢档
+    }
+
+    #[test]
+    fn kudus_idle_kick_threshold() {
+        // 看门狗 75s：容忍连丢 2 包（最坏 30s 间隔 + 1 次丢包不误踢）。
+        assert!(super::kudus_idle_stale(0, 76));
+        assert!(!super::kudus_idle_stale(0, 75));
+        assert!(!super::kudus_idle_stale(100, 105));
+    }
 
     #[test]
     fn seal_open_roundtrip() {
