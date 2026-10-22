@@ -5,7 +5,7 @@ use crate::common::kudus::*;
 use crate::common::proto::*;
 use crate::common::quic::{decode_dgram, encode_dgram};
 use crate::server::state::{log_ev, save_state, AgentHandle, AgentInfo, Shared};
-use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay};
+use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay, spawn_link_udp_relay};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -507,6 +507,11 @@ async fn handle_conn(
                     ClientMsg::Open { stream, kind, host, port } if kind == "egress" => {
                         spawn_egress_dial(&s, &agent_id, stream, host, port, ctl_tx.clone());
                     }
+                    ClientMsg::Open { stream, kind, host, .. } if kind == "link_udp" => {
+                        let (name, peer) = host.split_once('|').map(|(a, b)| (a.to_string(), b.to_string()))
+                            .unwrap_or((host.clone(), String::new()));
+                        spawn_link_udp_relay(&s, &agent_id, &hostname, stream, peer, name, ctl_tx.clone());
+                    }
                     ClientMsg::Open { stream, kind, host, .. } if kind == "link" => {
                         spawn_link_relay(&s, &agent_id, &hostname, stream, host, ctl_tx.clone());
                     }
@@ -582,6 +587,11 @@ async fn dispatch_body(
             }
             ClientMsg::Open { stream, kind, host, port } if kind == "egress" => {
                 spawn_egress_dial(s, agent_id, stream, host, port, ctl_tx.clone());
+            }
+            ClientMsg::Open { stream, kind, host, .. } if kind == "link_udp" => {
+                let (name, peer) = host.split_once('|').map(|(a, b)| (a.to_string(), b.to_string()))
+                    .unwrap_or((host.clone(), String::new()));
+                spawn_link_udp_relay(s, agent_id, hostname, stream, peer, name, ctl_tx.clone());
             }
             ClientMsg::Open { stream, kind, host, .. } if kind == "link" => {
                 spawn_link_relay(s, agent_id, hostname, stream, host, ctl_tx.clone());

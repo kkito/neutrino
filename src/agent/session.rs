@@ -47,6 +47,7 @@ pub(crate) async fn session(
         out: out_tx.clone(),
     });
     // link 入口监听与 session 同命：Config 热更新时 sync，session 结束 abort 全部。
+    let _link_guard = super::link::LinkGuard::new(&ctx.link_tasks);
     super::link::sync_link_listeners(
         &ctx,
         &cfg.proxies,
@@ -238,8 +239,22 @@ async fn open_stream(
     if kind == "udp" {
         return open_udp_stream(ctx, sid, port).await;
     }
+    if kind == "link_udp" {
+        // UDP 出口：server 下发真实目标，直接 connect + 双泵（与 open_udp_stream 同泵）。
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        if sock.connect((host.as_str(), port)).await.is_err() {
+            let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+            return Ok(());
+        }
+        tracing::debug!("link_udp egress stream {sid} -> {host}:{port}");
+        return open_udp_stream_sock(ctx, sid, sock).await;
+    }
+    if kind == "egress_dial" {
+        return open_egress_dial(ctx, sid, host, port).await;
+    }
     if kind == "link" {
-        // link 出口：server 下发的 host/port 即真实目标（以 server 存为准），
+        // link 出口：server 侧下发的 host/port 即真实目标（以 server 存为准），
         // 直接 dial，不查本地 proxies。泵与 tcp 同（EOF 即收尾）。
         let local = TcpStream::connect((host.as_str(), port)).await?;
         let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -386,8 +401,71 @@ async fn open_udp_stream(ctx: Arc<Ctx>, sid: u32, port: u16) -> anyhow::Result<(
     };
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((p.local_ip.as_str(), p.local_port)).await?;
-    let sock = Arc::new(sock);
     tracing::debug!("udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
+    open_udp_stream_sock(ctx, sid, sock).await
+}
+
+/// UDP 双泵（已 connect 的 socket 版）：出口 link_udp 与普通 udp 共用。
+/// egress 出口反向拨号（WSS 版）：server 下发 Open{egress_dial, 真实目标} → 本机 dial → 双泵。
+/// 与 open_tcp_stream 出口段同构；失败回 Close{link denied}（复用原因串，server 清行）。
+async fn open_egress_dial(ctx: Arc<Ctx>, sid: u32, host: String, port: u16) -> anyhow::Result<()> {
+    let local = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => {
+            let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+            return Ok(());
+        }
+    };
+    tracing::debug!("egress_dial stream {sid} -> {host}:{port}");
+    let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
+    for chunk in early {
+        let _ = dtx.send(chunk);
+    }
+    ctx.streams.write().await.insert(sid, dtx);
+    let (mut lr, mut lw) = local.into_split();
+    let ctx3 = ctx.clone();
+    let ctx2 = ctx.clone();
+    let mut ws_to_local = tokio::spawn(async move {
+        while let Some(chunk) = drx.recv().await {
+            if lw.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut local_to_ws = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut b = vec![0u8; 32 * 1024];
+        loop {
+            match lr.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ctx3.out.send(Message::Binary(encode_data(sid, &b[..n]).into())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut ws_to_local => { local_to_ws.abort(); }
+        _ = &mut local_to_ws => { ws_to_local.abort(); }
+    }
+    ctx.streams.write().await.remove(&sid);
+    let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
+    let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+    let _ = &ctx2;
+    anyhow::Ok(())
+}
+
+async fn open_udp_stream_sock(ctx: Arc<Ctx>, sid: u32, sock: tokio::net::UdpSocket) -> anyhow::Result<()> {
+    let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {

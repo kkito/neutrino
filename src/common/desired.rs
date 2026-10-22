@@ -12,6 +12,8 @@ pub struct DesiredStore {
 struct File {
     #[serde(default)]
     agents: HashMap<String, Vec<ProxyConfig>>,
+    #[serde(default)]
+    egress_exit: HashMap<String, String>,
 }
 
 impl DesiredStore {
@@ -30,9 +32,21 @@ impl DesiredStore {
             data,
         }
     }
+    /// [egress_exit] 顶层表：load 时顺带读（save 不碰该表，手改文件+reload 生效）。
+    pub fn load_egress_exit(path: &str) -> HashMap<String, String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str::<File>(&s).ok())
+            .map(|f| f.egress_exit)
+            .unwrap_or_default()
+    }
     pub fn save(&self) {
+        // save 只管 agents 表：egress_exit 是手改 desired.toml 的顶层表，
+        // save 重写时故意不带（Default 空表会吞掉手改——读侧 load_egress_exit 另读文件）。
+        // TODO: save 时合并保留文件里的 egress_exit（当前调用方只有测试）。
         let f = File {
             agents: self.data.clone(),
+            egress_exit: Default::default(),
         };
         if let Ok(s) = toml::to_string_pretty(&f) {
             let _ = std::fs::write(&self.path, s);

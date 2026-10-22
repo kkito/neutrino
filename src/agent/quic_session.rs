@@ -113,6 +113,8 @@ pub(crate) async fn session(
     });
     let quic_link_holder = quic_out.clone();
     super::link::sync_link_listeners_quic(&ctx, &cfg.proxies, &up.hostname, &quic_link_holder).await;
+    // 根因→修法：同 kudus，link 监听与 session 同命，重连前全 abort 防端口泄漏。
+    let _link_guard = super::link::LinkGuard::new(&ctx.link_tasks);
     // 写泵：control 帧串行写（JSON len 帧 + 复用二进制帧都经此通道保序）。
     let writer = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {
@@ -268,6 +270,34 @@ async fn open_stream(ctx: Arc<QCtx>, sid: u32, kind: String, host: String, port:
     if kind == "udp" {
         return open_udp_stream(ctx, sid, port).await;
     }
+    if kind == "link_udp" {
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        if sock.connect((host.as_str(), port)).await.is_err() {
+            let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = send_ctrl(&ctx.out, &e);
+            return Ok(());
+        }
+        tracing::debug!("quic link_udp egress stream {sid} -> {host}:{port}");
+        return open_udp_stream_sock(ctx, sid, sock).await;
+    }
+    if kind == "egress_dial" {
+        // QUIC 版反向拨号：与 pump_tcp 同泵（dial 目标=server 下发真实目标）。
+        let local = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+                let _ = send_ctrl(&ctx.out, &e);
+                return Ok(());
+            }
+        };
+        tracing::debug!("quic egress_dial stream {sid} -> {host}:{port}");
+        return pump_tcp(ctx, sid, local, false).await;
+    }
     if kind == "link" {
         let local = TcpStream::connect((host.as_str(), port)).await?;
         return pump_tcp(ctx, sid, local, false).await;
@@ -359,8 +389,12 @@ async fn open_udp_stream(ctx: Arc<QCtx>, sid: u32, port: u16) -> anyhow::Result<
     };
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((p.local_ip.as_str(), p.local_port)).await?;
-    let sock = Arc::new(sock);
     tracing::debug!("quic udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
+    open_udp_stream_sock(ctx, sid, sock).await
+}
+
+async fn open_udp_stream_sock(ctx: Arc<QCtx>, sid: u32, sock: tokio::net::UdpSocket) -> anyhow::Result<()> {
+    let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {
