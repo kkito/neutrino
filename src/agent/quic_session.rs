@@ -268,6 +268,16 @@ async fn open_stream(ctx: Arc<QCtx>, sid: u32, kind: String, host: String, port:
     if kind == "udp" {
         return open_udp_stream(ctx, sid, port).await;
     }
+    if kind == "link_udp" {
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        if sock.connect((host.as_str(), port)).await.is_err() {
+            let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = send_ctrl(&ctx.out, &e);
+            return Ok(());
+        }
+        tracing::debug!("quic link_udp egress stream {sid} -> {host}:{port}");
+        return open_udp_stream_sock(ctx, sid, sock).await;
+    }
     if kind == "link" {
         let local = TcpStream::connect((host.as_str(), port)).await?;
         return pump_tcp(ctx, sid, local, false).await;
@@ -359,8 +369,12 @@ async fn open_udp_stream(ctx: Arc<QCtx>, sid: u32, port: u16) -> anyhow::Result<
     };
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((p.local_ip.as_str(), p.local_port)).await?;
-    let sock = Arc::new(sock);
     tracing::debug!("quic udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
+    open_udp_stream_sock(ctx, sid, sock).await
+}
+
+async fn open_udp_stream_sock(ctx: Arc<QCtx>, sid: u32, sock: tokio::net::UdpSocket) -> anyhow::Result<()> {
+    let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {

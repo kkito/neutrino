@@ -5,7 +5,7 @@
 use crate::common::proto::*;
 use crate::common::quic::{decode_dgram, encode_dgram, encode_frame, CONTROL_MAX};
 use super::state::{log_ev, save_state, AgentHandle, AgentInfo, Shared};
-use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay};
+use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay, spawn_link_udp_relay};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -190,6 +190,20 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                     drain_stream_into_incoming(&s, &agent_id, sid, dr, ds).await;
                     return;
                 }
+                if kind == "link_udp" {
+                    let hostname = s
+                        .agents
+                        .read()
+                        .await
+                        .get(&agent_id)
+                        .map(|h| h.info.hostname.clone())
+                        .unwrap_or_default();
+                    let (name, peer) = host.split_once('|').map(|(a, b)| (a.to_string(), b.to_string()))
+                        .unwrap_or((host.clone(), String::new()));
+                    spawn_link_udp_relay(&s, &agent_id, &hostname, sid, peer, name, ctl_tx);
+                    drain_stream_into_incoming(&s, &agent_id, sid, dr, ds).await;
+                    return;
+                }
                 if kind == "link" {
                     let hostname = s
                         .agents
@@ -272,6 +286,11 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                     }
                     ClientMsg::Open { stream, kind, host, .. } if kind == "link" => {
                         spawn_link_relay(&s, &agent_id, &hostname, stream, host, ctl_tx.clone());
+                    }
+                    ClientMsg::Open { stream, kind, host, .. } if kind == "link_udp" => {
+                        let (name, peer) = host.split_once('|').map(|(a, b)| (a.to_string(), b.to_string()))
+                            .unwrap_or((host.clone(), String::new()));
+                        spawn_link_udp_relay(&s, &agent_id, &hostname, stream, peer, name, ctl_tx.clone());
                     }
                     _ => {}
                 }

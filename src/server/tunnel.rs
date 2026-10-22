@@ -202,6 +202,12 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                                 // host=link名（port 忽略）；目标以 server 存的 desired 为准。
                                 spawn_link_relay(&s, &agent_id, &hostname, stream, host, ctl_tx.clone());
                             }
+                            Ok(ClientMsg::Open { stream, kind, host, .. }) if kind == "link_udp" => {
+                                // host="link名|peer地址"（入口 agent 拼）；目标以 server 存为准。
+                                let (name, peer) = host.split_once('|').map(|(a, b)| (a.to_string(), b.to_string()))
+                                    .unwrap_or((host.clone(), String::new()));
+                                spawn_link_udp_relay(&s, &agent_id, &hostname, stream, peer, name, ctl_tx.clone());
+                            }
                             Ok(_) => {}
                             Err(e) => tracing::warn!("bad client frame: {e}"),
                         }
@@ -277,7 +283,9 @@ pub(crate) fn resolve_link(
 ) -> Option<(String, String, u16)> {
     proxies
         .iter()
-        .find(|p| p.enabled && p.ptype == "link" && p.name == link_name)
+        .find(|p| {
+            p.enabled && (p.ptype == "link" || p.ptype == "link_udp") && p.name == link_name
+        })
         .map(|p| (p.link_agent.clone(), p.link_host.clone(), p.link_port))
 }
 
@@ -285,6 +293,10 @@ pub(crate) fn resolve_link(
 /// Open{link, host/port=真实目标} → 双 channel 对接泵。任一方向结束即双关+清
 /// conns 行（Drop-guard 语义，防 HttpConnGuard 修过的同类僵尸行）。
 /// 根因→修法：link 双端都是 WSS 流（无本地 socket），泵两端都经 incoming/outbox。
+/// UDP 跨机中转：入口 agent Open{link_udp, host="link名|peer地址"} → 查表 →
+/// 出口 Open{link_udp, host/port=真实目标} → 双泵。UDP 无连接语义：同 peer 后续包
+/// 复用 session（key=entry_aid/peer/link名），60s 无包由后台 sweep 清（见
+/// sweep_link_udp_sessions）；ICMP 不可达不等，靠超时自然清。
 pub(crate) fn spawn_link_relay(
     s: &S,
     entry_agent_id: &str,
@@ -495,6 +507,241 @@ pub(crate) fn spawn_link_relay(
         }
         log_ev(&s, format!("link '{link_name}' closed"));
     });
+}
+
+/// link_udp session 表：key=entry_aid + peer地址 + link名 → (出口sid, 最后活跃)。
+/// UDP 无连接：首包建 session（走 spawn_link_udp_relay），同 peer 后续包复用；
+/// 60s 无包由后台 sweep 清（照抄 ensure_udp_listener 的 expired 模式）。
+type LinkUdpSessions = Arc<std::sync::RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>>;
+
+fn link_udp_sessions() -> LinkUdpSessions {
+    static T: std::sync::LazyLock<LinkUdpSessions> =
+        std::sync::LazyLock::new(|| Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())));
+    T.clone()
+}
+
+/// server 侧 UDP 跨机中继：入口 Open{link_udp, host="link名|peer"} → resolve_link 查表 →
+/// 出口 Open{link_udp, host/port=真实目标} → 双泵。结构照抄 spawn_link_relay（占位/
+/// drain/记账/限速/双关），差异：session 复用（同 peer 不重建）+ proto="link_udp"。
+pub(crate) fn spawn_link_udp_relay(
+    s: &S,
+    entry_agent_id: &str,
+    entry_hostname: &str,
+    sid_entry: u32,
+    peer_addr: String,
+    link_name: String,
+    ctl_entry: mpsc::UnboundedSender<ServerMsg>,
+) {
+    let s = s.clone();
+    let (entry_aid, entry_host) = (entry_agent_id.to_string(), entry_hostname.to_string());
+    tokio::spawn(async move {
+        // 1. 查表（server 存为准）
+        let (exit_host, tgt_host, tgt_port) = {
+            let ag = s.agents.read().await;
+            let proxies = ag.get(&entry_aid).map(|h| h.info.proxies.clone()).unwrap_or_default();
+            match resolve_link(&proxies, &link_name) {
+                Some(t) if !t.0.is_empty() && !t.1.is_empty() && t.2 != 0 => t,
+                _ => {
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: no such link".into(),
+                    });
+                    return;
+                }
+            }
+        };
+        // 2. session 复用：同 peer 已有 session 直接复用出口 sid（UDP 后续包不再重建）。
+        let sess_key = format!("{entry_aid}/{peer_addr}/{link_name}");
+        let now = std::time::Instant::now();
+        // 3. 找出口 agent + 出向通道
+        let (exit_aid, exit_ctl, exit_out) = {
+            let ag = s.agents.read().await;
+            let found = ag.iter().find(|(_, h)| h.info.hostname == exit_host);
+            match found {
+                Some((id, h)) => (id.clone(), h.ctl.clone(), s.outbox.read().await.get(id).cloned()),
+                None => {
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: exit agent offline".into(),
+                    });
+                    log_ev(&s, format!("link_udp '{link_name}' exit '{exit_host}' offline"));
+                    return;
+                }
+            }
+        };
+        let Some(exit_out) = exit_out else {
+            let _ = ctl_entry.send(ServerMsg::Close {
+                stream: sid_entry,
+                reason: "link denied: exit gone".into(),
+            });
+            return;
+        };
+        // 4. 出口 sid：复用 session 或新分配（server 偶数号）
+        let sid_exit = link_udp_sessions()
+            .read()
+            .map(|t| t.get(&sess_key).map(|(sid, _)| *sid))
+            .unwrap_or(None)
+            .unwrap_or_else(super::ingress::next_sid_pub);
+        link_udp_sessions().write().map(|mut t| {
+            t.insert(sess_key.clone(), (sid_exit, now))
+        }).ok();
+        // 5. 双端占位 incoming + 早到 drain（照抄 relay 3/3.5 步，防首包丢失）
+        let (dtx_exit, mut drx_exit) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (dtx_entry, mut drx_entry) = mpsc::unbounded_channel::<Vec<u8>>();
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            h.incoming.write().await.insert(sid_exit, dtx_exit.clone());
+        }
+        if let Some(h) = s.agents.read().await.get(&entry_aid) {
+            h.incoming.write().await.insert(sid_entry, dtx_entry.clone());
+        }
+        async fn drain_early(
+            s: &S,
+            aid: &str,
+            sid: u32,
+            tx: &mpsc::UnboundedSender<Vec<u8>>,
+        ) {
+            let pe = s.agents.read().await.get(aid).map(|h| h.pending.clone());
+            if let Some(pe) = pe {
+                if let Some(chunks) = pe.write().await.remove(&sid) {
+                    for chunk in chunks {
+                        let _ = tx.send(chunk);
+                    }
+                }
+            }
+        }
+        drain_early(&s, &entry_aid, sid_entry, &dtx_entry).await;
+        drain_early(&s, &exit_aid, sid_exit, &dtx_exit).await;
+        // 6. 向出口发 Open{link_udp}（真实目标，出口直接 dial）
+        if exit_ctl
+            .send(ServerMsg::Open {
+                stream: sid_exit,
+                kind: "link_udp".into(),
+                host: tgt_host.clone(),
+                port: tgt_port,
+            })
+            .is_err()
+        {
+            let _ = ctl_entry.send(ServerMsg::Close {
+                stream: sid_entry,
+                reason: "link denied: exit send failed".into(),
+            });
+            return;
+        }
+        // 7. conns 记账 + 限速（复用 TCP link 口径，proto=link_udp）
+        let cid = (sid_entry as u64) | ((sid_exit as u64) << 32);
+        s.conns.write().await.insert(
+            cid,
+            super::state::ConnInfo {
+                id: cid,
+                proto: "link_udp".into(),
+                peer: entry_host.clone(),
+                public_port: 0,
+                agent: entry_host.clone(),
+                tunnel: link_name.clone(),
+                remote_port: 0,
+                target: format!("{exit_host}->{tgt_host}:{tgt_port}"),
+                since: chrono::Utc::now().timestamp(),
+                rx: 0,
+                tx: 0,
+            },
+        );
+        let link_limiter = {
+            let ag = s.agents.read().await;
+            let bps = ag
+                .get(&entry_aid)
+                .and_then(|h| {
+                    h.info
+                        .proxies
+                        .iter()
+                        .find(|p| p.enabled && (p.ptype == "link" || p.ptype == "link_udp") && p.name == link_name)
+                        .and_then(|p| crate::server::ratelimit::limit_of(p.rate_limit.as_deref()))
+                })
+                .map(|b| b * 2 / 2); // 占位：与 TCP link 同口径（总量 limiter），防误读为单向
+            match bps {
+                Some(b) => {
+                    let host = ag.get(&entry_aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
+                    let key = crate::server::state::traffic_key(&host, &link_name);
+                    Some(crate::server::ratelimit::limiter_for(&s, &key, b).await)
+                }
+                None => None,
+            }
+        };
+        let s_link = s.clone();
+        let s_link2 = s.clone();
+        let entry_aid2 = entry_aid.clone();
+        let ll1 = link_limiter.clone();
+        let ll2 = link_limiter.clone();
+        let mut a2e = tokio::spawn(async move {
+            while let Some(chunk) = drx_entry.recv().await {
+                if let Some(l) = &ll1 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+                if let Some(c) = s_link.conns.write().await.get_mut(&cid) {
+                    c.rx += chunk.len() as u64;
+                }
+                if exit_out.send((sid_exit, chunk)).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut e2a = tokio::spawn(async move {
+            while let Some(chunk) = drx_exit.recv().await {
+                if let Some(l) = &ll2 {
+                    let d = l.take(chunk.len()).await;
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+                if let Some(c) = s_link2.conns.write().await.get_mut(&cid) {
+                    c.tx += chunk.len() as u64;
+                }
+                if entry_out_send(&s_link2, &entry_aid2, sid_entry, chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        drop(dtx_exit);
+        drop(dtx_entry);
+        tokio::select! {
+            _ = &mut a2e => { e2a.abort(); let _ = (&mut e2a).await; }
+            _ = &mut e2a => { a2e.abort(); let _ = (&mut a2e).await; }
+        }
+        s.conns.write().await.remove(&cid);
+        if let Some(h) = s.agents.read().await.get(&entry_aid) {
+            h.incoming.write().await.remove(&sid_entry);
+        }
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            h.incoming.write().await.remove(&sid_exit);
+        }
+        let _ = ctl_entry.send(ServerMsg::Close {
+            stream: sid_entry,
+            reason: "eof".into(),
+        });
+        if let Some(h) = s.agents.read().await.get(&exit_aid) {
+            let _ = h.ctl.send(ServerMsg::Close {
+                stream: sid_exit,
+                reason: "eof".into(),
+            });
+        }
+        log_ev(&s, format!("link_udp '{link_name}' closed"));
+    });
+}
+
+/// link_udp e2a 泵的入口出向发送（outbox 按 entry_aid 实时取，防 relay 早期快照过期）。
+async fn entry_out_send(
+    s: &S,
+    entry_aid: &str,
+    sid_entry: u32,
+    chunk: Vec<u8>,
+) -> Result<(), ()> {
+    let out = s.outbox.read().await.get(entry_aid).cloned();
+    match out {
+        Some(o) => o.send((sid_entry, chunk)).map_err(|_| ()),
+        None => Err(()),
+    }
 }
 
 /// server 侧 egress 拨号：agent Open{egress} -> TcpStream::connect(30s 超时) -> 接现有泵。
@@ -771,6 +1018,28 @@ mod tests {
             Some(("agent1".into(), "10.0.0.1".into(), 3306))
         );
         assert_eq!(super::resolve_link(&[], "dblink"), None);
+        // link_udp 同表可查（跨机 UDP 与 TCP link 共用 server 路由表）
+        let mut u = ProxyConfig {
+            name: "u".into(),
+            ptype: "link_udp".into(),
+            local_ip: "0.0.0.0".into(),
+            local_port: 51413,
+            link_agent: "exit".into(),
+            link_host: "10.0.0.1".into(),
+            link_port: 51413,
+            rate_limit: Some("1m".into()),
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+            enabled: true,
+        };
+        assert_eq!(
+            super::resolve_link(&[u.clone()], "u"),
+            Some(("exit".into(), "10.0.0.1".into(), 51413))
+        );
+        u.enabled = false;
+        assert_eq!(super::resolve_link(&[u], "u"), None);
         // 禁用的 link 不命中
         let mut dis = ProxyConfig {
             name: "off".into(),

@@ -238,6 +238,17 @@ async fn open_stream(
     if kind == "udp" {
         return open_udp_stream(ctx, sid, port).await;
     }
+    if kind == "link_udp" {
+        // UDP 出口：server 下发真实目标，直接 connect + 双泵（与 open_udp_stream 同泵）。
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        if sock.connect((host.as_str(), port)).await.is_err() {
+            let e = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));
+            return Ok(());
+        }
+        tracing::debug!("link_udp egress stream {sid} -> {host}:{port}");
+        return open_udp_stream_sock(ctx, sid, sock).await;
+    }
     if kind == "link" {
         // link 出口：server 下发的 host/port 即真实目标（以 server 存为准），
         // 直接 dial，不查本地 proxies。泵与 tcp 同（EOF 即收尾）。
@@ -386,8 +397,13 @@ async fn open_udp_stream(ctx: Arc<Ctx>, sid: u32, port: u16) -> anyhow::Result<(
     };
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((p.local_ip.as_str(), p.local_port)).await?;
-    let sock = Arc::new(sock);
     tracing::debug!("udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
+    open_udp_stream_sock(ctx, sid, sock).await
+}
+
+/// UDP 双泵（已 connect 的 socket 版）：出口 link_udp 与普通 udp 共用。
+async fn open_udp_stream_sock(ctx: Arc<Ctx>, sid: u32, sock: tokio::net::UdpSocket) -> anyhow::Result<()> {
+    let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {

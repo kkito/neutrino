@@ -1,8 +1,32 @@
 //! agent link 入口监听：本地 accept -> WSS Open{link} -> 双向泵。照抄 egress 模式。
+//! link_udp：同语义的 UDP 版（UdpSocket 收包 → Open{link_udp, host="名|peer"} + Data）。
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
+
+/// link_udp Open host 拼装："link名|peer地址"（server 侧 split_once('|') 拆，见 plan Task 4）。
+pub(crate) fn udp_open_host(link_name: &str, peer: &str) -> String {
+    format!("{link_name}|{peer}")
+}
+
+#[cfg(test)]
+mod udp_tests {
+    #[test]
+    fn link_udp_entry_binds_and_forwards() {
+        // 纯函数拼装：首包 Open host 格式 "名|peer"，server 侧可拆。
+        assert_eq!(
+            super::udp_open_host("bt-udp", "1.2.3.4:5678"),
+            "bt-udp|1.2.3.4:5678"
+        );
+        let (name, peer) = super::udp_open_host("bt-udp", "1.2.3.4:5678")
+            .split_once('|')
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .unwrap();
+        assert_eq!(name, "bt-udp");
+        assert_eq!(peer, "1.2.3.4:5678");
+    }
+}
 
 use super::egress::OutHolder;
 use super::quic_session::QCtx;
@@ -29,8 +53,77 @@ pub(crate) async fn sync_link_listeners_kudus(
     for p in proxies.iter().filter(|p| valid_link(p, self_hostname)) {
         if tasks.contains_key(&p.name) { continue; }
         let bind = format!("{}:{}", p.local_ip, p.local_port);
-        let h = tokio::spawn(serve_link_kudus(p.name.clone(), bind, holder.clone()));
+        // link_udp 走 UDP 入口（UdpSocket），link 走 TCP 入口（TcpListener）。
+        let h = if p.ptype == "link_udp" {
+            tokio::spawn(serve_link_udp_kudus(p.name.clone(), bind, holder.clone()))
+        } else {
+            tokio::spawn(serve_link_kudus(p.name.clone(), bind, holder.clone()))
+        };
         tasks.insert(p.name.clone(), h.abort_handle());
+    }
+}
+
+/// link_udp 收包入口（kudus 版）：UdpSocket 收包 → Open{link_udp} + Data。
+/// UDP 无连接语义：同 peer 首包建 session（server 侧会话表复用），
+/// 后续包经 egress_streams 查表直投。照抄 serve_link_kudus 结构。
+async fn serve_link_udp_kudus(
+    link_name: String,
+    bind: String,
+    holder: super::egress::KudusOutHolder,
+) {
+    let sock = match UdpSocket::bind(&bind).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!("link_udp '{link_name}' bind {bind} failed: {e:#}");
+            return;
+        }
+    };
+    tracing::info!("link_udp '{link_name}' listen on {bind} (udp)");
+    // peer → sid（同 peer 复用 session，UDP 无连接靠表维持有状态）
+    let peers: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        let peer_s = peer.to_string();
+        let mut pm = peers.lock().await;
+        let sid = match pm.get(&peer_s) {
+            Some(s) => *s,
+            None => {
+                let sid = CTR_KUDUS.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1;
+                let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                super::egress::egress_streams().write().await.insert(sid, dtx);
+                // host="link名|peer地址"：server 侧查表用 link名，回包路由用 peer。
+                // holder 是 Option<Pkt>：读快照后重建 Tx（照抄 serve_link_kudus 的 hout 模式）。
+                if let Some(p) = holder.read().await.clone() {
+                    let tx = Tx::Kudus(p);
+                    tx.send_open_udp(sid, &udp_open_host(&link_name, &peer_s))
+                        .unwrap_or(());
+                }
+                let sock2 = sock.clone();
+                tokio::spawn(async move {
+                    while let Some(chunk) = drx.recv().await {
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        if sock2.send_to(&chunk, peer).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                pm.insert(peer_s.clone(), sid);
+                tracing::info!("link_udp '{link_name}' session {peer_s} -> sid {sid}");
+                sid
+            }
+        };
+        drop(pm);
+        // wss down 时丢包（UDP 语义本就可以丢，照抄 ensure_udp_listener：无通道即跳过）。
+        if let Some(p) = holder.read().await.clone() {
+            p.wait_window().await;
+            p.send_data_stream(sid, &buf[..n]);
+        }
     }
 }
 
@@ -96,7 +189,12 @@ pub(crate) async fn sync_link_listeners(
             continue;
         }
         let bind = format!("{}:{}", p.local_ip, p.local_port);
-        let h = tokio::spawn(serve_link(p.name.clone(), bind, out.clone(), status.clone()));
+        // link_udp 走 UDP 入口，link 走 TCP 入口。
+        let h = if p.ptype == "link_udp" {
+            tokio::spawn(serve_link_udp(p.name.clone(), bind, out.clone(), status.clone()))
+        } else {
+            tokio::spawn(serve_link(p.name.clone(), bind, out.clone(), status.clone()))
+        };
         tasks.insert(p.name.clone(), h.abort_handle());
     }
 }
@@ -131,6 +229,63 @@ pub(crate) async fn serve_link(
     }
 }
 
+/// link_udp 入口（WSS 版）：UdpSocket 收包 → Open{link_udp, host="名|peer"} + Data。
+/// UDP 无连接语义：同 peer 首包建 session（server 侧会话表复用），后续包直投。
+pub(crate) async fn serve_link_udp(
+    link_name: String,
+    bind: String,
+    out: OutHolder,
+    status: Arc<RwLock<AgentStatus>>,
+) {
+    let sock = match UdpSocket::bind(&bind).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!("link_udp '{link_name}' bind {bind} failed: {e:#}");
+            status.write().await.link_err = Some(format!("{link_name} bind failed: {e:#}"));
+            return;
+        }
+    };
+    tracing::info!("link_udp '{link_name}' listen on {bind} (udp)");
+    let peers: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        let peer_s = peer.to_string();
+        let mut pm = peers.lock().await;
+        let sid = match pm.get(&peer_s) {
+            Some(s) => *s,
+            None => {
+                let sid = CTR.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1;
+                let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                super::egress::egress_streams().write().await.insert(sid, dtx);
+                if let Some(tx) = out.read().await.clone() {
+                    let t = Tx::Ws(tx);
+                    t.send_open_udp(sid, &udp_open_host(&link_name, &peer_s)).unwrap_or(());
+                }
+                let sock2 = sock.clone();
+                tokio::spawn(async move {
+                    while let Some(chunk) = drx.recv().await {
+                        if chunk.is_empty() { break; }
+                        if sock2.send_to(&chunk, peer).await.is_err() { break; }
+                    }
+                });
+                pm.insert(peer_s.clone(), sid);
+                tracing::info!("link_udp '{link_name}' session {peer_s} -> sid {sid}");
+                sid
+            }
+        };
+        drop(pm);
+        if let Some(tx) = out.read().await.clone() {
+            let _ = tx.send(tokio_tungstenite::tungstenite::Message::Binary(
+                encode_data(sid, &buf[..n]).into(),
+            ));
+        }
+    }
+}
+
 async fn handle_link_conn(
     inbound: TcpStream,
     link_name: String,
@@ -152,10 +307,19 @@ enum Tx {
 
 impl Tx {
     fn send_open(&self, sid: u32, link_name: &str) -> anyhow::Result<()> {
+        self.send_open_kind(sid, "link", link_name)
+    }
+
+    /// link_udp 版 Open：kind=link_udp，host 已拼好 "名|peer"。
+    fn send_open_udp(&self, sid: u32, host: &str) -> anyhow::Result<()> {
+        self.send_open_kind(sid, "link_udp", host)
+    }
+
+    fn send_open_kind(&self, sid: u32, kind: &str, host: &str) -> anyhow::Result<()> {
         let open = ClientMsg::Open {
             stream: sid,
-            kind: "link".into(),
-            host: link_name.to_string(),
+            kind: kind.to_string(),
+            host: host.to_string(),
             port: 0,
         };
         let j = serde_json::to_string(&open)?;
@@ -169,8 +333,8 @@ impl Tx {
             Tx::Kudus(p) => {
                 p.send_ctrl(&ClientMsg::Open {
                     stream: sid,
-                    kind: "link".into(),
-                    host: link_name.to_string(),
+                    kind: kind.to_string(),
+                    host: host.to_string(),
                     port: 0,
                 })?;
             }
@@ -228,8 +392,64 @@ pub(crate) async fn sync_link_listeners_quic(
             continue;
         }
         let bind = format!("{}:{}", p.local_ip, p.local_port);
-        let h = tokio::spawn(serve_link_quic(p.name.clone(), bind, holder.clone()));
+        let h = if p.ptype == "link_udp" {
+            tokio::spawn(serve_link_udp_quic(p.name.clone(), bind, holder.clone()))
+        } else {
+            tokio::spawn(serve_link_quic(p.name.clone(), bind, holder.clone()))
+        };
         tasks.insert(p.name.clone(), h.abort_handle());
+    }
+}
+
+/// link_udp 入口（QUIC 版）：UdpSocket 收包 → Open{link_udp} + control 复用帧。
+async fn serve_link_udp_quic(
+    link_name: String,
+    bind: String,
+    holder: super::egress::QuicOutHolder,
+) {
+    let sock = match UdpSocket::bind(&bind).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!("link_udp '{link_name}' bind {bind} failed: {e:#}");
+            return;
+        }
+    };
+    tracing::info!("link_udp '{link_name}' listen on {bind} (udp)");
+    let peers: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        let peer_s = peer.to_string();
+        let mut pm = peers.lock().await;
+        let sid = match pm.get(&peer_s) {
+            Some(s) => *s,
+            None => {
+                let sid = CTR.fetch_add(2, std::sync::atomic::Ordering::Relaxed) | 1;
+                let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                super::egress::egress_streams().write().await.insert(sid, dtx);
+                if let Some(tx) = holder.read().await.clone() {
+                    let t = Tx::Quic(tx);
+                    t.send_open_udp(sid, &udp_open_host(&link_name, &peer_s)).unwrap_or(());
+                }
+                let sock2 = sock.clone();
+                tokio::spawn(async move {
+                    while let Some(chunk) = drx.recv().await {
+                        if chunk.is_empty() { break; }
+                        if sock2.send_to(&chunk, peer).await.is_err() { break; }
+                    }
+                });
+                pm.insert(peer_s.clone(), sid);
+                tracing::info!("link_udp '{link_name}' session {peer_s} -> sid {sid}");
+                sid
+            }
+        };
+        drop(pm);
+        if let Some(tx) = holder.read().await.clone() {
+            let _ = tx.send(encode_frame(&encode_data(sid, &buf[..n])));
+        }
     }
 }
 

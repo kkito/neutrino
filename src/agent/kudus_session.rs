@@ -484,6 +484,27 @@ async fn open_stream(
     if kind == "udp" {
         return open_udp_stream(ctx, pkt, sid, port).await;
     }
+    if kind == "link_udp" {
+        // UDP 出口 dial：UdpSocket::bind(0) → "connect" 到真实目标 → 双泵。
+        // UDP 无连接：server 侧会话表按 peer 复用 session，出口每 Open 即一条出向流。
+        let local = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("kudus link_udp egress bind failed: {e:#}");
+                let c = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+                let _ = pkt.send_ctrl(&c);
+                return Ok(());
+            }
+        };
+        if local.connect((host.as_str(), port)).await.is_err() {
+            tracing::warn!("kudus link_udp egress connect {host}:{port} failed");
+            let c = ClientMsg::Close { stream: sid, reason: "link denied".into() };
+            let _ = pkt.send_ctrl(&c);
+            return Ok(());
+        }
+        tracing::debug!("kudus link_udp egress stream {sid} -> {host}:{port}");
+        return open_udp_stream_to(ctx, pkt, sid, local).await;
+    }
     if kind == "link" {
         // 出口 dial：server 侧 resolve_link 已把 host/port 换成真实目标
         // （link 出口 agent 无需查表，直接拨）。失败即回 Close{link denied}。
@@ -582,21 +603,13 @@ async fn pump_tcp(
     Ok(())
 }
 
-async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyhow::Result<()> {
-    let proxies = ctx.proxies.read().await.clone();
-    let target = proxies
-        .iter()
-        .find(|p| p.enabled && p.ptype == "udp" && p.remote_port == port)
-        .or_else(|| proxies.iter().find(|p| p.enabled && p.ptype == "udp"));
-    let Some(p) = target else {
-        let e = ClientMsg::Close { stream: sid, reason: "no route".into() };
-        let _ = pkt.send_ctrl(&e);
-        return Ok(());
-    };
-    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    sock.connect((p.local_ip.as_str(), p.local_port)).await?;
+async fn open_udp_stream_to(
+    ctx: Arc<KCtx>,
+    pkt: Pkt,
+    sid: u32,
+    sock: tokio::net::UdpSocket,
+) -> anyhow::Result<()> {
     let sock = Arc::new(sock);
-    tracing::debug!("kudus udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
     for chunk in early {
@@ -606,9 +619,6 @@ async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyho
     let w = sock.clone();
     let ws_to_udp = tokio::spawn(async move {
         loop {
-            // server 下行已在读循环拆掉 dgram 帧：此处是裸 datagram，直接发。
-            // （与 quic 版不同：quic 下行裸帧靠泵内 decode_dgram 兜底；
-            // kudus 下行统一套帧，读循环已拆，泵内不再二次拆。）
             match tokio::time::timeout(std::time::Duration::from_secs(120), drx.recv()).await {
                 Ok(Some(dg)) => {
                     if w.send(&dg).await.is_err() {
@@ -635,6 +645,23 @@ async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyho
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = pkt.send_ctrl(&e);
     Ok(())
+}
+
+async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyhow::Result<()> {
+    let proxies = ctx.proxies.read().await.clone();
+    let target = proxies
+        .iter()
+        .find(|p| p.enabled && p.ptype == "udp" && p.remote_port == port)
+        .or_else(|| proxies.iter().find(|p| p.enabled && p.ptype == "udp"));
+    let Some(p) = target else {
+        let e = ClientMsg::Close { stream: sid, reason: "no route".into() };
+        let _ = pkt.send_ctrl(&e);
+        return Ok(());
+    };
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    sock.connect((p.local_ip.as_str(), p.local_port)).await?;
+    tracing::debug!("kudus udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
+    open_udp_stream_to(ctx, pkt, sid, sock).await
 }
 
 use std::time::Duration;

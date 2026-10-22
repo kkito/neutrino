@@ -2197,6 +2197,55 @@ async fn link_echo_ok(port: u16, payload: &[u8]) -> bool {
     }
 }
 
+/// UDP 回声探针：入口 UDP 发包 → 出口 echo 回包（UDP 无连接，一收一发即 roundtrip）。
+async fn link_udp_echo_ok(port: u16, payload: &[u8]) -> bool {
+    let s = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if s.send_to(payload, format!("127.0.0.1:{port}")).await.is_err() {
+        return false;
+    }
+    let mut b = vec![0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(5), s.recv(&mut b)).await {
+        Ok(Ok(n)) => &b[..n] == payload,
+        _ => false,
+    }
+}
+
+/// link_udp e2e：client --UDP--> agent2 入口 --> server 中继 --> agent1
+/// 出口 --UDP--> echo，后原路返回。
+/// 旧代码无 link_udp 分支时挂（入口不监听/中继查不到表）：连上无回声。
+#[tokio::test]
+async fn udp_link_roundtrip() {
+    use tokio::io::AsyncWriteExt;
+    // 后端 UDP echo（agent1 可达）：收啥回啥。
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, peer)) = echo.recv_from(&mut b).await else { break };
+            if echo.send_to(&b[..n], peer).await.is_err() { break };
+        }
+    });
+    let link_port = free_port();
+    let desired = format!(
+        "[[agents.agent2]]\nname=\"udblink\"\ntype=\"link_udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={link_port}\nlink_agent=\"agent1\"\nlink_host=\"127.0.0.1\"\nlink_port={echo_port}\nenabled=true\n"
+    );
+    let env = boot_two_agents(&desired).await;
+    let mut ok = false;
+    for _ in 0..40 {
+        if link_udp_echo_ok(link_port, b"hello-udp").await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "udp link roundtrip never came up");
+    let _ = &env._srv;
+}
+
 /// link 热更新：删 desired 条目后监听端口释放（连接被拒）。
 #[tokio::test]
 async fn link_hot_update() {
