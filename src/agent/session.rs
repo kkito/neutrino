@@ -256,9 +256,6 @@ async fn open_stream(
         // link 出口：server 侧下发的 host/port 即真实目标（以 server 存为准），
         // 直接 dial，不查本地 proxies。泵与 tcp 同（EOF 即收尾）。
         let local = TcpStream::connect((host.as_str(), port)).await?;
-        // link 出口：server 下发的 host/port 即真实目标（以 server 存为准），
-        // 直接 dial，不查本地 proxies。泵与 tcp 同（EOF 即收尾）。
-        let local = TcpStream::connect((host.as_str(), port)).await?;
         let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
         let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
         for chunk in early {
