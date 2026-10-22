@@ -1079,6 +1079,40 @@ async fn kudus_http_udp_and_hot_config() {
         .is_err());
 }
 
+/// RED 回归：kudus UDP 大包分片——公网 1500B UDP 包经 kudus 隧道必须整包往返。
+/// 旧代码两处丢语义：上行 send_udp 超 1132B 直接 warn 丢；下行 outbox 按 TCP
+/// 字节流 1000B 切片逐片 deliver，内网收到 2 个残包（无声 corrupt）。
+/// 断言抓：1500B echo 与源逐字节相等（只收一片即长度 mismatch 而红）。
+#[tokio::test]
+async fn kudus_udp_large_dgram_frag_roundtrip() {
+    let uback = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ubport = uback.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 9000];
+        loop {
+            let Ok((n, p)) = uback.recv_from(&mut b).await else { break; };
+            let _ = uback.send_to(&b[..n], p).await;
+        }
+    });
+    let rport = free_port();
+    let env = boot_kudus(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={ubport}\nremote_port={rport}\n"
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    cli.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    let payload: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+    cli.send(&payload).await.unwrap();
+    let mut b = vec![0u8; 9000];
+    let n = tokio::time::timeout(Duration::from_secs(10), cli.recv(&mut b))
+        .await
+        .expect("kudus udp large dgram never echoed")
+        .unwrap();
+    assert_eq!(&b[..n], &payload[..], "udp boundary broken: got {n}B want 1500B");
+    let _ = env;
+}
+
 /// RED 回归：kudus 控制帧分片——40 个 http 代理的 Register/Config（≈5KB JSON）
 /// 必须走通收敛。旧代码一消息一帧，超 KUDUS_MAX_UDP（1232B）被 send_pkt 整包丢
 /// （warn `kudus oversize frame dropped (3320B)` 后写泵 break），http 永远不通。
@@ -1114,7 +1148,6 @@ async fn kudus_many_proxies_ctrl_frag_converges() {
     // boot_kudus 写死 agent 文件、无 desired 参数：desired 文件按 boot_kudus 的
     // 命名规则（nt-e2e-kudus-*）预写空文件占位行不通（server 启动即读）。
     // 最小改法：本用例自建 server+agent（复用 boot_kudus 体，desired 预写）。
-    use std::fmt::Write as _;
     let ws_port = free_port();
     let kudus_port = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-kudus-many-{}", uuid::Uuid::new_v4()));

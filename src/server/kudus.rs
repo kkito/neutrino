@@ -160,6 +160,7 @@ async fn handle_conn(
             }
             s.agents.write().await.remove(&old);
             s.outbox.write().await.remove(&old);
+            s.udp_outbox.write().await.remove(&old);
             for v in s.domains.write().await.values_mut() {
                 v.retain(|a| *a != old);
             }
@@ -173,6 +174,8 @@ async fn handle_conn(
     let agent_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+    // UDP 下行独立通道（见 state::udp_outbox 注释）：整包语义，与 TCP outbox 分开。
+    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     let incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     let pending: Arc<RwLock<HashMap<u32, Vec<Vec<u8>>>>> =
@@ -199,6 +202,7 @@ async fn handle_conn(
             },
         );
         s.outbox.write().await.insert(agent_id.clone(), out_tx.clone());
+        s.udp_outbox.write().await.insert(agent_id.clone(), udp_tx.clone());
     }
     log_ev(&s, format!("kudus agent '{hostname}' connected id={agent_id}"));
     // SYN-ACK（Welcome，200/400/800ms ×5 重传，纯尽力）
@@ -258,6 +262,10 @@ async fn handle_conn(
     let ctrl_reasm = std::sync::Arc::new(std::sync::Mutex::new(
         crate::common::kudus::CtrlReasm::new(),
     ));
+    // 上行 UDP 分片重组槽（agent send_udp 大包分片的上行方向；与下行 udp_outbox 对称）。
+    let udp_reasm = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::common::kudus::UdpReasm::new(),
+    ));
     let mut rxbuf = crate::common::kudus::ReorderBuf::new(1);
     let rel = Arc::new(std::sync::Mutex::new(ServerRel::new()));
     let mut fin_acked = false;
@@ -281,12 +289,47 @@ async fn handle_conn(
                         if !rel_emit(&txw, &relw, FLAG_DATA, &frag) { break; }
                     }
                 }
+                Some((id, dg)) = udp_rx.recv() => {
+                    // UDP 下行整包：≤1132B 整包一帧；>1132B 分片逐片发（agent 侧
+                    // UdpReasm 攒齐后整包交付，包边界不变）；>8KB 丢 + warn。
+                    // 与上行 send_udp 对称。背压与 TCP 分支同阈值（256 未确认）。
+                    for _ in 0..3000 {
+                        let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
+                        if n < 256 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if dg.len() <= crate::common::kudus::KUDUS_UDP_MAX {
+                        let inner = encode_dgram(&dg);
+                        let b = encode_data(id, &inner);
+                        if !rel_emit(&txw, &relw, FLAG_DATA, &b) {
+                            tracing::warn!("kudus udp downlink drop sid={id} ({}B)", dg.len());
+                        }
+                    } else if dg.len() <= crate::common::kudus::KUDUS_UDP_FRAG_MAX {
+                        for frag in crate::common::kudus::split_udp_dgram(id, &dg) {
+                            if !rel_emit(&txw, &relw, FLAG_DATA, &frag) { break; }
+                        }
+                    } else {
+                        tracing::warn!("kudus udp downlink too large ({}B), dropped", dg.len());
+                    }
+                    if let Some(hh) = sw.agents.write().await.get_mut(&aidw) {
+                        hh.info.tx_bytes += dg.len() as u64;
+                    }
+                }
                 Some((id, payload)) = out_rx.recv() => {
-                    // outbox 数据：先按流切片（单 datagram 装不下会整包丢→静默断流），
+                    // outbox 数据：TCP 字节流按片切（单 datagram 装不下会整包丢→静默断流），
                     // 每片独立 DATA 帧独立 datagram（UDP 访客下行先套 dgram 帧；与 quic.rs::udp_out 同语）。
                     // 空载荷（EOF 标记）不能丢：chunks 为空时补一帧空包。
                     // 背压：retx 未确认超 256 包时等 ACK 再发（与 agent 侧 send_data 对称）——
                     // 旧无界发送，2MB 切 2000 帧瞬间灌满对端重排窗，丢包雪崩后双双 100% 空转。
+                    // 根因→修法：旧分支不分 TCP/UDP，公网 1500B UDP 包被按 1000B 切片
+                    // 逐片 deliver——内网收到 2 个残包，无声 corrupt。现 UDP 整包走
+                    // split_udp_dgram 分片 + agent 侧 UdpReasm 重组后整包交付（包边界不变）；
+                    // UDP 整包上限 8KB，超了丢 + warn（防 64KB 包 64 片的重传放大）。
+                    // 注意：outbox (sid,payload) 无 kind 位，上游 ingress/egress/link
+                    // 全是裸字节 TCP——UDP 下行不走这里（见下 udp_rx 分支，由上游
+                    // 显式标记）。此处只剩 TCP 字节流，切片逐片交付语义正确。
                     for _ in 0..3000 {
                         let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
                         if n < 256 {
@@ -399,10 +442,17 @@ async fn handle_conn(
                 for ob in ready {
                     // 控制分片先重组：sid==CTRL_SID 即分片，攒齐前不进 JSON 解析
                     // （半条 JSON parse 必失败，旧代码会把它当数据帧误投 deliver）。
+                    // UDP 分片同理：sid==UDP_SID 即分片，攒齐后整包交付（包边界不变）。
                     let ob = match decode_data(&ob) {
                         Some((id, payload)) if id == KUDUS_CTRL_SID => {
                             match ctrl_reasm.lock().unwrap().feed(payload) {
                                 Some(full) => full,
+                                None => continue,
+                            }
+                        }
+                        Some((id, payload)) if id == crate::common::kudus::KUDUS_UDP_SID => {
+                            match udp_reasm.lock().unwrap().feed(payload) {
+                                Some((sid, dg)) => encode_data(sid, &encode_dgram(&dg)),
                                 None => continue,
                             }
                         }
@@ -589,6 +639,7 @@ async fn cleanup(s: &S, agent_id: &str, hostname: &str) {
             s.totals.write().await.insert(hostname.to_string(), (h.info.rx_bytes, h.info.tx_bytes));
         }
         s.outbox.write().await.remove(agent_id);
+        s.udp_outbox.write().await.remove(agent_id);
         for v in s.domains.write().await.values_mut() {
             v.retain(|a| *a != agent_id);
         }

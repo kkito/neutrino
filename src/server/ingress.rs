@@ -771,10 +771,13 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         }
         tracing::info!("udp ingress on 0.0.0.0:{port}");
         log_ev(&s2, format!("udp listening :{port}"));
-        // peer -> (stream_id, last_seen, outbox sender 缓存, 下行 limiter 缓存)。
-        // 根因→修法：包循环零 agents 锁 + 零 rate_limiters 锁——outbox sender 与
-        // limiter 都在建 session 时缓存（单次 agents.read 快照 + limiter_for 一次），
+        // peer -> (stream_id, last_seen, 下行 sender 缓存, 下行 limiter 缓存)。
+        // 根因→修法：包循环零 agents 锁 + 零 rate_limiters 锁——sender 与 limiter
+        // 都在建 session 时缓存（单次 agents.read 快照 + limiter_for 一次），
         // 每包只 take（Mutex 临界区极短）+ 发包，不再全表扫描/拿写锁。
+        // 注意：sender 按传输选——kudus agent 走 udp_outbox（整包分片语义，
+        // 包边界不变），WSS/QUIC 沿用 outbox（整帧直达）。判定一次缓存在 session 里，
+        // 包循环零分支：UDP 整包直达 outbox 会被 kudus 写泵按 TCP 切片拆碎。
         use crate::server::ratelimit::RateLimiter;
         let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>)> = HashMap::new();
         let mut buf = vec![0u8; 65535];
@@ -805,11 +808,17 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     };
                     let id = next_sid();
                     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    // kudus agent 的 UDP 下行走独立 udp_outbox（整包分片+重组，
+                    // 包边界不变）；WSS/QUIC agent 无 udp_outbox 行，沿用 outbox。
+                    // 根因→修法：旧代码一律走 outbox，kudus 写泵按 TCP 字节流
+                    // 切片逐片 deliver，1500B 包变 2 个残包（无声 corrupt）。
                     let (ctl, out) = {
                         let ag = s2.agents.read().await;
                         let ob = s2.outbox.read().await;
-                        match (ag.get(&aid), ob.get(&aid)) {
-                            (Some(h), Some(o)) => (h.ctl.clone(), o.clone()),
+                        let uob = s2.udp_outbox.read().await;
+                        match (ag.get(&aid), uob.get(&aid), ob.get(&aid)) {
+                            (Some(h), Some(u), _) => (h.ctl.clone(), u.clone()),
+                            (Some(h), None, Some(o)) => (h.ctl.clone(), o.clone()),
                             _ => continue,
                         }
                     };

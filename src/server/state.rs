@@ -40,6 +40,11 @@ pub(crate) struct Shared {
     pub(crate) password_hash: RwLock<String>,
     pub(crate) jwt_secret: String,
     pub(crate) outbox: RwLock<HashMap<String, mpsc::UnboundedSender<(u32, Vec<u8>)>>>,
+    /// kudus UDP 下行专用：(sid, 整包 datagram)。TCP 与 UDP 在 outbox (sid,payload)
+    /// 里都是裸字节无法区分——UDP 下行走此独立通道，写泵按整包分片+重组语义发
+    /// （包边界不变）；WSS/QUIC 不用此表（整帧直达）。kudus 建连时注册、断开时清。
+    /// 根因→修法：旧共用 outbox 被按 1000B 切片逐片 deliver，1500B 包变 2 个残包。
+    pub(crate) udp_outbox: RwLock<HashMap<String, mpsc::UnboundedSender<(u32, Vec<u8>)>>>,
     pub(crate) totals: RwLock<HashMap<String, (u64, u64)>>, // hostname -> (rx,tx) persisted
     pub(crate) data_dir: String,
     pub(crate) desired: RwLock<HashMap<String, Vec<ProxyConfig>>>,

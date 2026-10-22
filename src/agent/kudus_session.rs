@@ -132,15 +132,32 @@ impl Pkt {
             }
         }
     }
-    /// 单个 UDP 数据报发送：必须装进一个 datagram（保边界不可切），超限丢包 + warn。
-    /// 与 QUIC `encode_dgram_checked` 超限语义对齐：典型 UDP（DNS/语音/游戏包 <1200B）无影响。
+    /// 单个 UDP 数据报发送：上限内整包直发（保边界不可切）；超限则分片+重组。
+    /// 根因→修法：旧代码超 1132B 直接 warn 丢包——公网 1500B UDP 上行永远到不了内网。
+    /// 现 ≤1132B 整包一帧（与旧语义一致）；>1132B 按 KUDUS_UDP_CHUNK 切片
+    /// （split_udp_dgram），对端 UdpReasm 攒齐后整包交付，包边界不变。
+    /// 上限 8KB 封顶：更大包切 8+ 片，任丢一片即整包重传，放大太狠不如丢 +
+    /// warn（典型 UDP 包 <1200B 无影响；与 QUIC DGRAM_MAX=65527 不同，kudus 按
+    /// datagram 预算收敛，超大包走 TCP 隧道）。
     pub(crate) fn send_udp(&self, sid: u32, dg: &[u8]) {
-        let inner = encode_dgram(dg);
-        if 4 + 24 + HDR_LEN + inner.len() + 16 > KUDUS_MAX_UDP {
+        if dg.len() <= crate::common::kudus::KUDUS_UDP_MAX {
+            let inner = encode_dgram(dg);
+            if 4 + 24 + HDR_LEN + inner.len() + 16 > KUDUS_MAX_UDP {
+                tracing::warn!("kudus udp datagram too large ({}B), dropped", dg.len());
+                return;
+            }
+            let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &inner));
+            return;
+        }
+        if dg.len() > 8192 {
             tracing::warn!("kudus udp datagram too large ({}B), dropped", dg.len());
             return;
         }
-        let _ = self.send(FLAG_DATA, 0, [0u8; 32], &encode_data(sid, &inner));
+        for frag in crate::common::kudus::split_udp_dgram(sid, dg) {
+            if self.send(FLAG_DATA, 0, [0u8; 32], &frag).is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -328,6 +345,8 @@ pub(crate) async fn session(
     // （macmini 2026-10-21 现场）。握手完成后的主循环才计时。）
     // 控制分片重组槽（Config 分片跨包累计，可靠重排已保序）。
     let mut ctrl_reasm = crate::common::kudus::CtrlReasm::new();
+    // 下行 UDP 分片重组槽（server udp_outbox 大包分片，攒齐后整包交付）。
+    let mut udp_reasm = crate::common::kudus::UdpReasm::new();
     loop {
         let (h, body) = match tokio::time::timeout(
             std::time::Duration::from_secs(crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64),
@@ -344,10 +363,17 @@ pub(crate) async fn session(
             break;
         }
         // 控制分片先重组（与 server 侧对称）：sid==CTRL_SID 即分片，攒齐前不解析。
+        // UDP 分片同理：sid==UDP_SID 即分片，攒齐后拼回 (sid, dgram帧) 走正常交付。
         let body = match decode_data(&body) {
             Some((id, payload)) if id == KUDUS_CTRL_SID => {
                 match ctrl_reasm.feed(payload) {
                     Some(full) => full,
+                    None => continue,
+                }
+            }
+            Some((id, payload)) if id == crate::common::kudus::KUDUS_UDP_SID => {
+                match udp_reasm.feed(payload) {
+                    Some((sid, dg)) => encode_data(sid, &encode_dgram(&dg)),
                     None => continue,
                 }
             }

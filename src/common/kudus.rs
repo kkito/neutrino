@@ -264,6 +264,77 @@ pub const FLAG_ACK: u8 = 0x02;
 pub const FLAG_FIN: u8 = 0x04;
 pub const FLAG_DATA: u8 = 0x08;
 
+/// UDP 下行包边界标记 sid：与 KUDUS_CTRL_SID 同理，取 u32::MAX-1，
+/// server 偶数 / agent 奇数 sid 永远撞不上。
+/// 根因→修法：outbox (sid,payload) 不分 TCP/UDP，写泵一律按 1000B 切片逐片
+/// deliver——公网 1 个 1500B UDP 包到内网变 2 个包，无声 corrupt。
+/// UDP 整包走分片+重组（见 split_udp_dgram / UdpReasm）：传输层切、交付层拼，
+/// 攒齐才向上交付一次，包边界不变。
+pub const KUDUS_UDP_SID: u32 = u32::MAX - 1;
+/// UDP 分片载荷上限：与 KUDUS_CTRL_CHUNK 对齐（wire 1106B < 1232）。
+pub const KUDUS_UDP_CHUNK: usize = 1000;
+/// UDP 分片头长度：[total 4B][offset 4B]，与控制分片同形。
+pub const KUDUS_UDP_FRAG_HDR: usize = 8;
+/// UDP 整包直发上限：wire 预算内最大整包（50 hdr + 4 sid + 2 dgram 头 + 1132）。
+/// ≤此值一律整包一帧（与旧 send_udp 语义一致）；超了走分片（见 send_udp/
+/// server 写泵），8KB 以上才丢 + warn（防 64KB 包切 64 片的重传放大）。
+pub const KUDUS_UDP_MAX: usize = 1132;
+/// UDP 分片总长上限：8KB（8 片）。
+pub const KUDUS_UDP_FRAG_MAX: usize = 8192;
+
+/// UDP 整包切片：每片 = encode_data(UDP_SID, [sid 4B][total 4B][offset 4B][bytes])。
+/// 流 id 必须跟片走（outbox 只给 (sid,payload)，写泵侧无他处可放 sid）。
+pub fn split_udp_dgram(sid: u32, dg: &[u8]) -> Vec<Vec<u8>> {
+    let total = dg.len() as u32;
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    loop {
+        let end = (off + KUDUS_UDP_CHUNK).min(dg.len());
+        let mut frag = Vec::with_capacity(4 + KUDUS_UDP_FRAG_HDR + (end - off));
+        frag.extend_from_slice(&sid.to_be_bytes());
+        frag.extend_from_slice(&total.to_be_bytes());
+        frag.extend_from_slice(&(off as u32).to_be_bytes());
+        frag.extend_from_slice(&dg[off..end]);
+        out.push(crate::common::proto::encode_data(KUDUS_UDP_SID, &frag));
+        if end >= dg.len() {
+            break;
+        }
+        off = end;
+    }
+    out
+}
+
+/// UDP 分片重组器：按 sid 分槽（同流背靠背包互不踩，弥补 CtrlReasm 单槽短板）。
+pub struct UdpReasm {
+    slots: HashMap<u32, CtrlReasm>,
+}
+
+impl UdpReasm {
+    pub fn new() -> Self {
+        Self { slots: HashMap::new() }
+    }
+    /// 喂一片 UDP_SID 负载（已 strip 外层 sid）：返回 (流sid, 整包)（集齐时）。
+    /// 坏片（<12B/越界/空 total/超 8KB）忽略。槽上限 1024，超了清最旧一批防内存涨。
+    pub fn feed(&mut self, frag: &[u8]) -> Option<(u32, Vec<u8>)> {
+        if frag.len() >= 8 {
+            let total = u32::from_be_bytes([frag[4], frag[5], frag[6], frag[7]]);
+            if total > KUDUS_UDP_FRAG_MAX as u32 {
+                return None;
+            }
+        }
+        if frag.len() < 4 + KUDUS_UDP_FRAG_HDR {
+            return None;
+        }
+        let sid = u32::from_be_bytes([frag[0], frag[1], frag[2], frag[3]]);
+        if self.slots.len() >= 1024 && !self.slots.contains_key(&sid) {
+            self.slots.clear();
+        }
+        let msg = self.slots.entry(sid).or_insert_with(CtrlReasm::new).feed(&frag[4..])?;
+        self.slots.remove(&sid);
+        Some((sid, msg))
+    }
+}
+
 /// 定长包头（密文内）：1+1+4+4+32+8 = 50B。
 pub const HDR_LEN: usize = 50;
 
@@ -525,6 +596,59 @@ mod tests {
             parse_server_url("ws://127.0.0.1:7440/ws"),
             Transport::Ws(_)
         ));
+    }
+
+    /// RED:UDP 下行分片——1500B 公网包切 2 片，乱序到达拼回整包且 sid 不变。
+    /// 旧代码按 TCP 字节流逐片 deliver，内网收到 2 个残包（无声 corrupt）。
+    #[test]
+    fn kudus_udp_frag_roundtrip_large() {
+        // 现场：公网 1500B UDP 包，旧写泵 chunks(1000) 切 2 片逐片交，边界碎。
+        let dg: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let pieces = super::split_udp_dgram(77, &dg);
+        assert!(pieces.len() == 2);
+        for p in &pieces {
+            assert!(
+                4 + 24 + super::HDR_LEN + p.len() + 16 <= super::KUDUS_MAX_UDP,
+                "frag still oversize: {}B",
+                p.len()
+            );
+        }
+        // 乱序投递：每片 strip 外层 sid 后喂按 sid 分槽的重组器。
+        let mut reasm = super::UdpReasm::new();
+        let mut got = None;
+        for p in pieces.iter().rev() {
+            let (id, payload) = crate::common::proto::decode_data(p).unwrap();
+            assert_eq!(id, super::KUDUS_UDP_SID);
+            if let Some((sid, msg)) = reasm.feed(payload) {
+                got = Some((sid, msg));
+            }
+        }
+        let (sid, msg) = got.expect("reasm never completed");
+        assert_eq!(sid, 77);
+        assert_eq!(msg, dg);
+        // 背靠背两包同流：分槽互不踩。
+        let a: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..1300u32).map(|i| ((i + 7) % 251) as u8).collect();
+        let pa = super::split_udp_dgram(9, &a);
+        let pb = super::split_udp_dgram(9, &b);
+        assert_eq!(pa.len(), 2);
+        assert_eq!(pb.len(), 2);
+        // 背靠背顺序投递：a0,a1,b0,b1——a 先集齐交一次，b 再集齐交一次。
+        // （可靠重排保序，同 sid 各包天然顺序到达；真交错时 total 变化旧槽作废，
+        // 丢的片由重传补齐后按序重到——与 CtrlReasm 同语义，不另加 msg_id。）
+        let mut r2 = super::UdpReasm::new();
+        let mut hits = Vec::new();
+        for p in pa.iter().chain(pb.iter()) {
+            let (_, payload) = crate::common::proto::decode_data(p).unwrap();
+            if let Some((s, m)) = r2.feed(payload) {
+                hits.push((s, m));
+            }
+        }
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 9);
+        assert_eq!(hits[0].1, a);
+        assert_eq!(hits[1].0, 9);
+        assert_eq!(hits[1].1, b);
     }
 
     /// RED:控制帧分片——3320B 级 Config/Register 必须切成装得进 datagram 的小片，
