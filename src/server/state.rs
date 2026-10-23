@@ -129,6 +129,34 @@ pub(crate) fn traffic_key(hostname: &str, name: &str) -> String {
     format!("{hostname}/{name}")
 }
 
+/// 黑洞 key：kudus_drop/{reason}/{subnet}。v4 取 /24，v6 取 /64，防随机源 IP 打爆表。
+pub(crate) fn drop_key(reason: &str, peer: &str) -> String {
+    // 先按 SocketAddr 解析（"1.2.3.4:5678" / "[2001:db8::1]:443" 都能过）；
+    // 失败回退裸 IP / unknown（热路径外，60s tick 才调一次可忽略，但分发循环每包调——保持无分配以外的零开销）。
+    if let Ok(sa) = peer.parse::<std::net::SocketAddr>() {
+        return match sa.ip() {
+            std::net::IpAddr::V4(v) => {
+                let o = v.octets();
+                format!("kudus_drop/{reason}/{}.{}.{}.0/24", o[0], o[1], o[2])
+            }
+            std::net::IpAddr::V6(v) => {
+                let s = v.segments();
+                format!("kudus_drop/{reason}/{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        };
+    }
+    if let Ok(std::net::IpAddr::V4(v)) = peer.parse::<std::net::IpAddr>() {
+        let o = v.octets();
+        return format!("kudus_drop/{reason}/{}.{}.{}.0/24", o[0], o[1], o[2]);
+    }
+    format!("kudus_drop/{reason}/unknown")
+}
+
+/// 采样限流：同 key 60s 最多 1 条 warn。
+pub(crate) fn warn_throttled(last_warn: i64, now: i64) -> bool {
+    now - last_warn >= 60
+}
+
 /// 增量（饱和减，防累计回绕/重置）
 pub(crate) fn minute_delta(prev: (u64, u64), cur: (u64, u64)) -> (u64, u64) {
     (cur.0.saturating_sub(prev.0), cur.1.saturating_sub(prev.1))
@@ -508,6 +536,20 @@ mod tests {
     use chrono::TimeZone;
     fn seen_for_test() -> std::collections::HashSet<String> { Default::default() }
     fn seen_with(keys: &[&str]) -> std::collections::HashSet<String> { keys.iter().map(|k| k.to_string()).collect() }
+    #[test]
+    fn drop_key_buckets_subnet() {
+        assert_eq!(drop_key("short", "1.2.3.4:5678"), "kudus_drop/short/1.2.3.0/24");
+        assert_eq!(drop_key("undecryptable", "[2001:db8::1]:443"), "kudus_drop/undecryptable/2001:db8:0:0::/64");
+        assert_eq!(drop_key("bad_hdr", "garbage"), "kudus_drop/bad_hdr/unknown");
+    }
+
+    #[test]
+    fn warn_throttle_60s() {
+        assert!(warn_throttled(0, 61));
+        assert!(!warn_throttled(10, 69));
+        assert!(warn_throttled(10, 70));
+    }
+
     #[test]
     fn state_serde_compat() {
         let p: Persisted = serde_json::from_str(r#"{"totals":{"h":[1,2]}}"#).unwrap();
