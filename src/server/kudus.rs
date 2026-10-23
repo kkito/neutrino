@@ -660,6 +660,27 @@ async fn cleanup(s: &S, agent_id: &str, hostname: &str) {
     save_state(s).await;
 }
 
+/// 同 key 60s 最多 1 条 warn（首包详情 + 计数在 tick 里看总量）。纯内存不落盘。
+fn maybe_warn_drop(s: &S, key: String, peer: &str, bytes: usize) {
+    let now = chrono::Local::now().timestamp();
+    let hit = s
+        .drop_warn
+        .lock()
+        .map(|mut m| {
+            let last = m.get(&key).cloned().unwrap_or(0);
+            if crate::server::state::warn_throttled(last, now) {
+                m.insert(key.clone(), now);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if hit {
+        tracing::warn!("kudus drop {key} from {peer} ({bytes}B, sampled 1/60s)");
+    }
+}
+
 /// 绑 UDP + 分发循环：按 session_id 建 task，未知 session 非 SYN 直接丢。
 pub(crate) async fn run_kudus(s: S, token: Arc<String>, bind: &str) -> anyhow::Result<()> {
     let sock = Arc::new(UdpSocket::bind(bind).await?);
@@ -671,15 +692,25 @@ pub(crate) async fn run_kudus(s: S, token: Arc<String>, bind: &str) -> anyhow::R
     let mut buf = vec![0u8; 2048];
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await?;
+        let peer_s = peer.to_string();
         let Some((session, nonce, ct)) = decode_packet(&buf[..n]) else {
+            let k = crate::server::state::drop_key("short", &peer_s);
+            crate::server::state::record_drop(&s, k.clone(), n as u64);
+            maybe_warn_drop(&s, k, &peer_s, n);
             tracing::debug!("kudus short packet ({}B) from {peer}", n);
             continue; // 短包：丢
         };
         let Some(plain) = open(&key, nonce, ct) else {
+            let k = crate::server::state::drop_key("undecryptable", &peer_s);
+            crate::server::state::record_drop(&s, k.clone(), n as u64);
+            maybe_warn_drop(&s, k, &peer_s, n);
             tracing::debug!("kudus undecryptable packet session={session:08x} from {peer}");
             continue; // 黑洞：解密失败零回包
         };
         let Some((h, body)) = decode_hdr(&plain) else {
+            let k = crate::server::state::drop_key("bad_hdr", &peer_s);
+            crate::server::state::record_drop(&s, k.clone(), plain.len() as u64);
+            maybe_warn_drop(&s, k, &peer_s, plain.len());
             tracing::debug!("kudus bad inner hdr session={session:08x} from {peer}");
             continue;
         };
@@ -690,6 +721,9 @@ pub(crate) async fn run_kudus(s: S, token: Arc<String>, bind: &str) -> anyhow::R
         }
         // 未知 session：只有 SYN 建连，否则丢。
         if h.flags & FLAG_SYN == 0 {
+            let k = crate::server::state::drop_key("unknown_session", &peer_s);
+            crate::server::state::record_drop(&s, k.clone(), n as u64);
+            maybe_warn_drop(&s, k, &peer_s, n);
             continue;
         }
         let (txc, rxc) = mpsc::unbounded_channel();
