@@ -168,6 +168,33 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                         let mut hits = s.drop_hits.lock().map(|mut m| std::mem::take(&mut *m)).unwrap_or_default();
                         state::tick_drops(&mut tr, &mut hits, chrono::Local::now().timestamp());
                     }
+                    // egress cap：超量 key 并入 {agent}/egress/other（近 5 点求和排序）。
+                    {
+                        let snap: HashMap<String, u64> = tr
+                            .iter()
+                            .map(|(k, q)| (k.clone(), q.iter().rev().take(5).map(|(_, r, t)| r + t).sum()))
+                            .collect();
+                        let over = state::egress_over_cap(&snap, state::EGRESS_KEYS_PER_AGENT);
+                        if !over.is_empty() {
+                            let now = chrono::Local::now().timestamp();
+                            let mut other_sum: HashMap<String, (u64, u64)> = HashMap::new();
+                            for k in over {
+                                if let Some((agent, _)) = k.split_once("/egress/") {
+                                    if let Some(q) = tr.remove(&k) {
+                                        let (sr, st) = q.iter().fold((0, 0), |(a, b), (_, r, t)| (a + r, b + t));
+                                        let e = other_sum.entry(agent.to_string()).or_insert((0, 0));
+                                        e.0 += sr;
+                                        e.1 += st;
+                                    }
+                                }
+                            }
+                            for (agent, (sr, st)) in other_sum {
+                                let q = tr.entry(format!("{agent}/egress/other")).or_default();
+                                q.push_back((now, sr, st));
+                                state::trim_traffic(q);
+                            }
+                        }
+                    }
                     (conns.len(), tr.len())
                 };
                 let p = state::traffic_path(&data);

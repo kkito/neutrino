@@ -162,6 +162,36 @@ pub(crate) fn warn_throttled(last_warn: i64, now: i64) -> bool {
     now - last_warn >= 60
 }
 
+/// 单 agent egress key 上限（防恶意 agent 刷 key 膨胀 traffic 表）
+pub(crate) const EGRESS_KEYS_PER_AGENT: usize = 500;
+
+/// egress tunnel 命名：egress/{host}:{port}，按目标细分。
+pub(crate) fn egress_tunnel(host: &str, port: u16) -> String {
+    format!("egress/{host}:{port}")
+}
+
+/// egress cap 纯函数：输入全表快照（key -> 近N点总量），返回要合并进 other 的 key 列表。
+/// 调用方负责 drain + 累加。pure 便于单测。
+pub(crate) fn egress_over_cap(totals: &HashMap<String, u64>, cap: usize) -> Vec<String> {
+    use std::collections::HashMap as M;
+    let mut by_agent: M<String, Vec<(String, u64)>> = M::new();
+    for (k, v) in totals {
+        if let Some((agent, rest)) = k.split_once("/egress/") {
+            if rest != "other" {
+                by_agent.entry(agent.to_string()).or_default().push((k.clone(), *v));
+            }
+        }
+    }
+    let mut out = vec![];
+    for (_, mut v) in by_agent {
+        if v.len() > cap {
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            out.extend(v[cap..].iter().map(|(k, _)| k.clone()));
+        }
+    }
+    out
+}
+
 /// 热路径记录：只做 Mutex + entry +1，不打日志不拿 await 锁。
 pub(crate) fn record_drop(s: &Shared, key: String, bytes: u64) {
     if let Ok(mut m) = s.drop_hits.lock() {
@@ -567,6 +597,30 @@ mod tests {
     use chrono::TimeZone;
     fn seen_for_test() -> std::collections::HashSet<String> { Default::default() }
     fn seen_with(keys: &[&str]) -> std::collections::HashSet<String> { keys.iter().map(|k| k.to_string()).collect() }
+    #[test]
+    fn egress_tunnel_namespaced() {
+        assert_eq!(egress_tunnel("tracker.example.com", 443), "egress/tracker.example.com:443");
+    }
+
+    #[test]
+    fn egress_cap_overflow() {
+        // 600 个 key → 超 cap，溢出 100 个；量最小的被挤掉，量最大的保留
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for i in 0..600 {
+            totals.insert(format!("minipc7s/egress/10.0.0.1:{i}"), i as u64);
+        }
+        let over = egress_over_cap(&totals, EGRESS_KEYS_PER_AGENT);
+        assert_eq!(over.len(), 100);
+        assert!(over.contains(&"minipc7s/egress/10.0.0.1:0".to_string()));
+        assert!(!over.contains(&"minipc7s/egress/10.0.0.1:599".to_string()));
+        // 非 egress key 不参与
+        totals.insert("minipc7s/trans-bt".into(), 999999);
+        assert_eq!(egress_over_cap(&totals, EGRESS_KEYS_PER_AGENT).len(), 100);
+        // egress/other 本身不计入 cap
+        totals.insert("minipc7s/egress/other".into(), 1);
+        assert_eq!(egress_over_cap(&totals, EGRESS_KEYS_PER_AGENT).len(), 100);
+    }
+
     #[test]
     fn tick_drops_push_and_drain() {
         let mut tr: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();

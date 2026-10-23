@@ -790,7 +790,7 @@ pub(crate) async fn insert_egress_conn(s: &S, sid: u32, hostname: &str, host: &s
             peer: hostname.into(),
             public_port: 0,
             agent: hostname.into(),
-            tunnel: "egress".into(),
+            tunnel: super::state::egress_tunnel(host, port),
             remote_port: 0,
             target: format!("{host}:{port}"),
             since: chrono::Local::now().timestamp(),
