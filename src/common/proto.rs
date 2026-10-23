@@ -120,13 +120,20 @@ pub fn parse_rate_limit(s: &str) -> Option<u64> {
     Some(bps)
 }
 
+/// link_agent 保留字：server 自己 dial 目标，不走任何 agent（spec 2026-10-24）。
+pub const LINK_EXIT_SERVER_LOCAL: &str = "server-local";
+
 /// link 条目校验（纯函数）：对端/目标/监听缺一不可，且禁止自环。
 /// 根因→修法：link 配错（空对端/自环）要在配置层拦掉，别等建流时再炸。
 pub fn valid_link(p: &ProxyConfig, self_hostname: &str) -> bool {
     if !(p.ptype == "link" || p.ptype == "link_udp") || !p.enabled {
         return false;
     }
-    if p.link_agent.trim().is_empty() || p.link_agent == self_hostname {
+    if p.link_agent.trim().is_empty() {
+        return false;
+    }
+    // 保留字永不判自环（server 侧分支优先，真有 agent 撞名则改名）。
+    if p.link_agent == self_hostname && p.link_agent != LINK_EXIT_SERVER_LOCAL {
         return false;
     }
     if p.link_host.trim().is_empty() || p.link_port == 0 || p.local_port == 0 {
@@ -234,6 +241,9 @@ mod tests {
         assert!(super::valid_link(&p, "entry"));
         p.link_agent = "entry".into();
         assert!(!super::valid_link(&p, "entry")); // 自环拒绝
+        // 保留字：即使与 self 同名也不判自环（server 侧分支优先）
+        p.link_agent = super::LINK_EXIT_SERVER_LOCAL.into();
+        assert!(super::valid_link(&p, super::LINK_EXIT_SERVER_LOCAL));
         p.link_agent = "exit".into();
         p.link_port = 0;
         assert!(!super::valid_link(&p, "entry")); // 零目标端口拒绝
