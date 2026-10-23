@@ -69,6 +69,11 @@ pub(crate) struct Shared {
     /// 已见 tunnel：随 traffic.json 落盘，重启后读回，已知 key 首轮只建基线不 push
     ///（不断崖、不吞量）。key 同 traffic。
     pub(crate) seen_tunnels: RwLock<std::collections::HashSet<String>>,
+    /// 黑洞原子计数：热路径每包 +1（包数, 字节），60s tick 归集进 traffic 后清零。
+    /// std Mutex（临界区只有 entry+1，纳秒级），不另引依赖。纯内存不落盘。
+    pub(crate) drop_hits: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+    /// warn 限流表：key -> 上次 warn 的 unix ts，纯内存不落盘。
+    pub(crate) drop_warn: std::sync::Mutex<HashMap<String, i64>>,
     /// 当前连接快照：key = conn id
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
     /// --listen 解析出的公网端口（HTTP fallback 连接行用）
@@ -155,6 +160,32 @@ pub(crate) fn drop_key(reason: &str, peer: &str) -> String {
 /// 采样限流：同 key 60s 最多 1 条 warn。
 pub(crate) fn warn_throttled(last_warn: i64, now: i64) -> bool {
     now - last_warn >= 60
+}
+
+/// 热路径记录：只做 Mutex + entry +1，不打日志不拿 await 锁。
+pub(crate) fn record_drop(s: &Shared, key: String, bytes: u64) {
+    if let Ok(mut m) = s.drop_hits.lock() {
+        let e = m.entry(key).or_insert((0, 0));
+        e.0 = e.0.saturating_add(1);
+        e.1 = e.1.saturating_add(bytes);
+    }
+}
+
+/// 60s tick 把 drop_hits draining 进 traffic：与 tick_from_conns 同节奏 push (ts,包数,字节)。
+/// drop 点天然带 ts、无基线问题，不走 seen/last_total，直接 push。
+pub(crate) fn tick_drops(
+    traffic: &mut HashMap<String, VecDeque<(i64, u64, u64)>>,
+    hits: &mut HashMap<String, (u64, u64)>,
+    now: i64,
+) {
+    for (k, (pkts, bytes)) in hits.drain() {
+        if pkts == 0 {
+            continue;
+        }
+        let q = traffic.entry(k).or_default();
+        q.push_back((now, pkts, bytes));
+        trim_traffic(q);
+    }
 }
 
 /// 增量（饱和减，防累计回绕/重置）
@@ -536,6 +567,18 @@ mod tests {
     use chrono::TimeZone;
     fn seen_for_test() -> std::collections::HashSet<String> { Default::default() }
     fn seen_with(keys: &[&str]) -> std::collections::HashSet<String> { keys.iter().map(|k| k.to_string()).collect() }
+    #[test]
+    fn tick_drops_push_and_drain() {
+        let mut tr: HashMap<String, VecDeque<(i64, u64, u64)>> = HashMap::new();
+        let mut hits = HashMap::new();
+        hits.insert("kudus_drop/short/1.2.3.0/24".into(), (10u64, 500u64));
+        tick_drops(&mut tr, &mut hits, 1700);
+        assert!(hits.is_empty());
+        let q = &tr["kudus_drop/short/1.2.3.0/24"];
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0], (1700, 10, 500));
+    }
+
     #[test]
     fn drop_key_buckets_subnet() {
         assert_eq!(drop_key("short", "1.2.3.4:5678"), "kudus_drop/short/1.2.3.0/24");

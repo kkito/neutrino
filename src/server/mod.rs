@@ -163,6 +163,11 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                     let mut lt = s.last_total.write().await;
                     let mut seen = s.seen_tunnels.write().await;
                     state::tick_from_conns(&mut tr, &mut lt, &mut seen, &conns);
+                    // 黑洞归集：drop_hits drain 进 traffic（drop 点天然带 ts，不走 seen/last_total）。
+                    {
+                        let mut hits = s.drop_hits.lock().map(|mut m| std::mem::take(&mut *m)).unwrap_or_default();
+                        state::tick_drops(&mut tr, &mut hits, chrono::Local::now().timestamp());
+                    }
                     (conns.len(), tr.len())
                 };
                 let p = state::traffic_path(&data);
