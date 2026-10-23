@@ -443,6 +443,102 @@ pub(crate) fn spawn_link_relay(
         let s_link2 = s.clone();
         let ll1 = link_limiter.clone();
         let ll2 = link_limiter.clone();
+        // 5.5 server-local：server 自己 dial，不走出口 agent（spec 2026-10-24）。
+        // 入口占位/drain/conns 行/entry_out/link_limiter 全复用；dial 成功则走
+        // socket 双泵后 return，跳过下面的 channel 双泵。
+        if exit_host == LINK_EXIT_SERVER_LOCAL {
+            let up = match tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::net::TcpStream::connect((tgt_host.as_str(), tgt_port)),
+            )
+            .await
+            {
+                Ok(Ok(u)) => u,
+                Ok(Err(e)) => {
+                    if let Some(h) = s.agents.read().await.get(&entry_aid) {
+                        h.incoming.write().await.remove(&sid_entry);
+                        h.pending.write().await.remove(&sid_entry);
+                    }
+                    s.conns.write().await.remove(&cid);
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: server-local dial failed".into(),
+                    });
+                    log_ev(&s, format!("link '{link_name}' server-local dial {tgt_host}:{tgt_port} refused: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    if let Some(h) = s.agents.read().await.get(&entry_aid) {
+                        h.incoming.write().await.remove(&sid_entry);
+                        h.pending.write().await.remove(&sid_entry);
+                    }
+                    s.conns.write().await.remove(&cid);
+                    let _ = ctl_entry.send(ServerMsg::Close {
+                        stream: sid_entry,
+                        reason: "link denied: server-local dial failed".into(),
+                    });
+                    log_ev(&s, format!("link '{link_name}' server-local dial {tgt_host}:{tgt_port} timeout"));
+                    return;
+                }
+            };
+            let s_sl = s.clone();
+            let s_sl2 = s.clone();
+            let (mut ru, mut wu) = up.into_split();
+            let mut a2e = tokio::spawn(async move {
+                while let Some(chunk) = drx_entry.recv().await {
+                    if let Some(l) = &ll1 {
+                        let d = l.take(chunk.len()).await;
+                        if !d.is_zero() {
+                            tokio::time::sleep(d).await;
+                        }
+                    }
+                    if let Some(c) = s_sl.conns.write().await.get_mut(&cid) {
+                        c.rx += chunk.len() as u64;
+                    }
+                    if wu.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut e2a = tokio::spawn(async move {
+                let mut b = vec![0u8; 32 * 1024];
+                loop {
+                    match ru.read(&mut b).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Some(l) = &ll2 {
+                                let d = l.take(n).await;
+                                if !d.is_zero() {
+                                    tokio::time::sleep(d).await;
+                                }
+                            }
+                            if let Some(c) = s_sl2.conns.write().await.get_mut(&cid) {
+                                c.tx += n as u64;
+                            }
+                            if entry_out.send((sid_entry, b[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            drop(dtx_exit);
+            drop(dtx_entry);
+            tokio::select! {
+                _ = &mut a2e => { e2a.abort(); let _ = (&mut e2a).await; }
+                _ = &mut e2a => { a2e.abort(); let _ = (&mut a2e).await; }
+            }
+            s.conns.write().await.remove(&cid);
+            if let Some(h) = s.agents.read().await.get(&entry_aid) {
+                h.incoming.write().await.remove(&sid_entry);
+            }
+            let _ = ctl_entry.send(ServerMsg::Close {
+                stream: sid_entry,
+                reason: "eof".into(),
+            });
+            log_ev(&s, format!("link '{link_name}' closed"));
+            return;
+        }
         let mut a2e = tokio::spawn(async move {
             while let Some(chunk) = drx_entry.recv().await {
                 if let Some(l) = &ll1 {
@@ -1269,6 +1365,41 @@ mod tests {
         };
         let _ = &mut dis;
         assert_eq!(super::resolve_link(&[dis], "off"), None);
+    }
+
+    #[test]
+    fn resolve_link_passthrough_server_local() {
+        // 保留字透出：server-local 原样返回，spawn_link_relay 分支认它做本机 dial。
+        let sl = ProxyConfig {
+            name: "s-hk".into(),
+            ptype: "link".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 10123,
+            link_agent: super::LINK_EXIT_SERVER_LOCAL.into(),
+            link_host: "127.0.0.1".into(),
+            link_port: 22,
+            rate_limit: None,
+            domains: vec![],
+            remote_port: 0,
+            set_x_forwarded_proto: None,
+            basic_auth: None,
+            enabled: true,
+        };
+        assert_eq!(
+            super::resolve_link(&[sl], "s-hk"),
+            Some((super::LINK_EXIT_SERVER_LOCAL.into(), "127.0.0.1".into(), 22))
+        );
+    }
+
+    #[tokio::test]
+    async fn server_local_dial_refused_is_closed() {
+        // 关端口必拒：server-local fail-closed 语义锚点。
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect("127.0.0.1:1"),
+        )
+        .await;
+        assert!(matches!(r, Ok(Err(_))), "closed port must refuse, got {r:?}");
     }
 
     #[test]
