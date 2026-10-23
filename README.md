@@ -25,7 +25,7 @@ QUIC 为第二传输（可选快车道，WSS 仍是默认隐身通道）；kudus
 | http Host 路由（与 ws/WebUI 同端口） | 同一 `--listen` 端口：`/`+无点 Host→WebUI，隧道域名 Host→agent 轮询；`set_x_forwarded_proto` 改写请求头（owncloud 用）。`--http-in` 已废弃（传入 warn 忽略） |
 | https 透传 | `type=https` + `remote_port`：server TCP listen，agent 按 `remote_port` 匹配本地 TLS 端口透传（不解密） |
 | tcp 透传 | 同上 `type=tcp`（如 51413），lazy listen |
-| udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话 120s 过期；agent 用 connected UDP 透本地 |
+| udp | 每 `remote_port` 一个 UDP socket，peer→stream 会话默认 5s 空闲过期（`--udp-session-ttl` 可配；每包刷新 TTL，活跃 uTP 不回收）；agent 用 connected UDP 透本地 |
 | WebUI 登录 | bcrypt（`genhash` 生成，存 `state.json`；空=初装 admin/welcome2neutrino）+ HS256 JWT（HttpOnly cookie `nt_session` + Bearer 双通道），未登录 `/api/*` 401 |
 | 双 WebUI | server `web/index.html`（总览/隧道表单/日志）+ agent `--web` 本地页（上行状态/只读隧道/改口令/出网代理/内网入口），同视觉 token，深色模式 |
 | 期望态（server 为准）| `desired.toml`（`[[agents.<hostname]]]`，结构同 ProxyConfig）→ WebUI `GET/POST /api/desired/:hostname` 增删改 → 在线即下发 `Config`，离线 register 时覆盖+回推同步；agent 本地 proxies 忽略 |

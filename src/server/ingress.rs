@@ -781,10 +781,13 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         use crate::server::ratelimit::RateLimiter;
         let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>)> = HashMap::new();
         let mut buf = vec![0u8; 65535];
+        // TTL 语义：该 peer 静默多久就回收。每收一包都刷新 t（见下方 get_mut 分支），
+        // 所以活跃 uTP 长连接永不过期，DHT 一问一答 / 扫描器发一次就走 → 秒级清掉。
+        let ttl = Duration::from_secs(s2.udp_session_ttl_secs.max(1));
         loop {
             // expire old sessions（conns 表 UDP 行同步删）
             let n_before = sessions.len();
-            sessions.retain(|_, (_, t, _, _)| t.elapsed() < Duration::from_secs(120));
+            sessions.retain(|_, (_, t, _, _)| t.elapsed() < ttl);
             let n_exp = n_before.saturating_sub(sessions.len());
             if n_exp > 0 {
                 tracing::debug!("udp :{port} expired {n_exp} sessions ({} alive)", sessions.len());
@@ -956,6 +959,18 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// UDP session TTL 默认 5s 且可配。根因→修法：旧值写死 120s（照抄 conntrack
+    /// stream 超时），DHT 扫描器每个新源端口建一条 session，120s 内同 IP 堆几十条
+    /// → snail 侧 256 槽位瞬间打满（too many udp streams）。
+    /// 语义是「上次收包后静默多久回收」，每包刷 t，故活跃 uTP 不受影响。
+    #[test]
+    fn udp_session_ttl_defaults_to_5s() {
+        assert_eq!(crate::server::state::UDP_SESSION_TTL_SECS_DEFAULT, 5);
+        // 字段类型为 u64，可经 --udp-session-ttl 覆盖；0 在 run() 里回退默认值。
+        let s = crate::server::state::Shared::default();
+        assert_eq!(s.udp_session_ttl_secs, 0, "derive(Default) 给 0，必须在 run() 显式赋值");
+    }
+
     /// RED：UDP session 目标解析必须是纯函数（不碰 agents 锁）。
     /// 根因→修法：旧收包循环每包 agents.read() 全表扫描找 proxy，
     /// BT flood 高 pps 下读锁排队，/api/tunnels+overview 的 agents.read() 饿死

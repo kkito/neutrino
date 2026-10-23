@@ -39,6 +39,10 @@ enum Cmd {
         /// 允许已连 agent 经隧道读写 server 管理 API（默认关；开了 = token 即最高权，见 spec）。
         #[arg(long, default_value_t = false)]
         allow_agent_admin: bool,
+        /// UDP ingress session 空闲回收秒数（默认 5）。语义：该 peer 静默多久就回收；
+        /// 每包刷新 TTL，故活跃 uTP 长连接不会被回收，扫描器一问一答即清。
+        #[arg(long, default_value_t = 5)]
+        udp_session_ttl: u64,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
         detach: bool,
@@ -172,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
             quic_listen,
             kudus_listen,
             allow_agent_admin,
+            udp_session_ttl,
             detach,
             log_file,
             pid_file,
@@ -186,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin).await
+            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
             let log = if log_file.is_empty() {

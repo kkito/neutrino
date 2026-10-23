@@ -43,7 +43,7 @@ async fn api_access_log(
     resp
 }
 
-pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool) -> anyhow::Result<()> {
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool, udp_session_ttl: u64) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
         tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
@@ -69,6 +69,12 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         egress_exit: RwLock::new(crate::common::desired::DesiredStore::load_egress_exit(desired)),
         public_port,
         allow_agent_admin,
+        // 0 是 --udp-session-ttl 0 的误传：回退默认，避免 session 永不回收。
+        udp_session_ttl_secs: if udp_session_ttl == 0 {
+            state::UDP_SESSION_TTL_SECS_DEFAULT
+        } else {
+            udp_session_ttl
+        },
         ..Default::default()
     });
     if allow_agent_admin && token.len() < 16 {

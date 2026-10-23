@@ -91,8 +91,16 @@ pub(crate) struct Shared {
     /// agent-admin 开关：开 = 已连 agent 可经隧道读写 server 管理 API（token 即最高权）。
     /// 根因→修法：默认关，不传开关即锁死（B 信任模型下默认开等于裸奔）。
     pub(crate) allow_agent_admin: bool,
+    /// UDP ingress session 空闲回收秒数（默认 5，--udp-session-ttl 可配）。
+    /// 语义是「上次收到该 peer 的包之后静默多久就回收」：每包刷新 t，所以
+    /// 活跃 uTP 长连接永不回收、扫描器一问一答 5s 即清。
+    /// 根因→修法：旧值写死 120s（照抄 conntrack stream 超时），DHT 扫描器
+    /// 每个新源端口建一条 session，120s 内堆积几十条/IP → 256 槽位瞬间打满。
+    pub(crate) udp_session_ttl_secs: u64,
 }
 
+/// UDP session 空闲回收默认秒数（--udp-session-ttl 未传时）。
+pub(crate) const UDP_SESSION_TTL_SECS_DEFAULT: u64 = 5;
 /// 30天分钟点上限
 pub(crate) const TRAFFIC_CAP: usize = 43_200;
 /// 当前连接表上限（超了挤掉 id 最小的）
