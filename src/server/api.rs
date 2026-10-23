@@ -377,6 +377,20 @@ fn d_n() -> usize {
 
 /// GET /api/traffic?tunnel=<key|all>&gran=min|hour|day&n=<N>
 /// tunnel=all/空 = 全部 key 按位对齐相加（agent 汇总前端直接用此口径）。
+/// tunnel=<prefix>* = 前缀匹配（如 kudus_drop* 看全部黑洞点）。
+/// tunnel=<key> 精确匹配。
+///
+/// 根因→修法：黑洞 key 按 reason/subnet 细分后全量枚举太碎，前缀一把查。
+pub(crate) fn traffic_key_match(key: &str, q: &str) -> bool {
+    if q.is_empty() || q == "all" {
+        return true;
+    }
+    if let Some(p) = q.strip_suffix('*') {
+        return key.starts_with(p);
+    }
+    key == q
+}
+
 pub(crate) async fn api_traffic(
     State((s, _)): State<(S, Arc<String>)>,
     h: HeaderMap,
@@ -397,11 +411,7 @@ pub(crate) async fn api_traffic(
         _ => 60,
     };
     let tr = s.traffic.read().await;
-    let keys: Vec<String> = if q.tunnel.is_empty() || q.tunnel == "all" {
-        tr.keys().cloned().collect()
-    } else {
-        vec![q.tunnel.clone()]
-    };
+    let keys: Vec<String> = tr.keys().filter(|k| traffic_key_match(k, &q.tunnel)).cloned().collect();
     let now = chrono::Local::now().timestamp();
     // 按 ts 归桶：桶宽 = gran 步长，桶 ts = 桶内最新点 ts 回退对齐。
     // 根因→修法：旧逻辑按位对齐相加 + now-len*step 反推，不同 key 点数不一、
@@ -793,6 +803,15 @@ mod tests {
         assert_eq!(st, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("agents").is_some() && v.get("version").is_some());
+    }
+
+    #[test]
+    fn traffic_prefix_match() {
+        assert!(traffic_key_match("kudus_drop/short/1.2.3.0/24", "kudus_drop*"));
+        assert!(traffic_key_match("minipc7s/egress", "minipc7s/egress"));
+        assert!(!traffic_key_match("minipc7s/egress", "kudus_drop*"));
+        assert!(traffic_key_match("a/b", "all"));
+        assert!(traffic_key_match("a/b", ""));
     }
 
     #[test]

@@ -98,6 +98,7 @@ canvas.chart{width:100%;height:260px;background:var(--bg);border:1px solid var(-
 <div class="card" style="margin-bottom:10px"><div style="font-size:12px;color:var(--mut)">实时速率（5s 快照 · 每5s刷新）</div><div id="live" style="font-size:13px;margin-top:4px">-</div></div>
 <div class="legend"><span><span class="dot" style="background:#4f9cf0"></span>rx 上行</span><span><span class="dot" style="background:#3fb97f"></span>tx 下行</span><span id="tr-hint"></span></div>
 <canvas class="chart" id="chart" width="960" height="260"></canvas>
+<div class="card" style="margin-top:10px"><div style="font-size:12px;color:var(--mut)">黑洞丢包（kudus 收到的垃圾/攻击包，零回包 · 按原因/网段汇总 · 每分钟更新）</div><div id="drop" style="font-size:13px;margin-top:4px">-</div></div>
 </section>
 <section id="sec-cn" class="hidden">
 <div class="topbar"><h2>连接 <span id="cn-count" class="badge b-ok">0</span></h2><button class="btn ghost" onclick="loadConns()">刷新</button></div>
@@ -191,7 +192,7 @@ async function loadTraffic(){
   const t=await need('/api/tunnels');
   const sel=document.getElementById('trtunnel'), cur=sel.value||'all';
   const keys=[...new Set(t.tunnels.filter(x=>x.enabled).map(x=>`${x.agent}/${x.name}`))];
-  sel.innerHTML='<option value="all">全部汇总</option>'+keys.map(k=>`<option ${k===cur?'selected':''}>${k}</option>`).join('');
+  sel.innerHTML='<option value="all">全部汇总</option><option value="kudus_drop*">黑洞丢包汇总</option>'+keys.map(k=>`<option ${k===cur?'selected':''}>${k}</option>`).join('');
   const tun=sel.value||'all';
   const n=trGran==='min'?180:(trGran==='hour'?168:31);
   const j=await need(`/api/traffic?tunnel=${encodeURIComponent(tun)}&gran=${trGran}&n=${n}`);
@@ -215,6 +216,21 @@ async function loadTraffic(){
   document.getElementById('tr-hint').textContent=pts.length?`${spanTxt} · 共 ${pts.length} 点`:'';
   drawChart(pts);
   loadLive();
+  loadDrops();
+  }catch(e){}
+}
+async function loadDrops(){
+  try{
+  const n=trGran==='min'?180:(trGran==='hour'?168:31);
+  const j=await need(`/api/traffic?tunnel=${encodeURIComponent('kudus_drop*')}&gran=${trGran}&n=${n}`);
+  const pts=j.points||[];
+  if(!pts.length){ document.getElementById('drop').textContent='暂无丢包（干净）'; return; }
+  const sum=pts.reduce((a,p)=>[a[0]+p[1],a[1]+p[2]],[0,0]);
+  const last=pts[pts.length-1];
+  document.getElementById('drop').innerHTML=
+    `最近${trGran==='min'?'1分钟':(trGran==='hour'?'1小时':'1天')} <b>${human(last[1])}包 / ${human(last[2])}</b>` +
+    ` · 区间总量 <b>${human(sum[0])}包 / ${human(sum[1])}</b>` +
+    ` · 明细切 tunnel=kudus_drop/&lt;reason&gt;*（如 short*、undecryptable*）在上方下拉查看`;
   }catch(e){}
 }
 function drawChart(pts){
