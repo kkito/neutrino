@@ -196,6 +196,9 @@ async fn handle_conn(
                     proxies: vec![],
                 },
                 connected_at: chrono::Utc::now(),
+                ctr_rx: Default::default(),
+                ctr_tx: Default::default(),
+                ctr_rtt: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1)),
                 ctl: ctl_tx.clone(),
                 incoming: incoming.clone(),
                 pending: pending.clone(),
@@ -274,8 +277,8 @@ async fn handle_conn(
     // 会导致帧边界丢失（decode_data 只取首帧，整包余下字节被吞——undo 里 got 0 的根因之一）。
     let txw = tx.clone();
     let relw = rel.clone();
-    let aidw = agent_id.clone();
-    let sw = s.clone();
+    // 写泵记账用原子计数快照（spawn 前 clone，泵内零 agents 锁）。
+    let ctr_tx_w = s.agents.read().await.get(&agent_id).map(|h| h.ctr_tx.clone());
     let write_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -313,8 +316,8 @@ async fn handle_conn(
                     } else {
                         tracing::warn!("kudus udp downlink too large ({}B), dropped", dg.len());
                     }
-                    if let Some(hh) = sw.agents.write().await.get_mut(&aidw) {
-                        hh.info.tx_bytes += dg.len() as u64;
+                    if let Some(c) = ctr_tx_w.as_ref() {
+                        c.fetch_add(dg.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 Some((id, payload)) = out_rx.recv() => {
@@ -349,8 +352,8 @@ async fn handle_conn(
                         let b = encode_data(id, &inner);
                         if !rel_emit(&txw, &relw, FLAG_DATA, &b) { break; }
                     }
-                    if let Some(hh) = sw.agents.write().await.get_mut(&aidw) {
-                        hh.info.tx_bytes += payload.len() as u64;
+                    if let Some(c) = ctr_tx_w.as_ref() {
+                        c.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 else => break,
@@ -491,10 +494,11 @@ async fn handle_conn(
                     ClientMsg::Ping { ts } => {
                         // 根因→修法：server 反向 Ping 已砍（唯一作用是量 RTT）；rtt 改由
                         // agent 上报的 ts 秒级计算，展示够用，省每会话每 15s 一包。
+                        // 原子写 rtt，零 agents 写锁（Ping 每 15~30s 一包，flood 时亦然）。
                         let _ = ctl_tx.send(ServerMsg::Pong { ts });
                         let ms = (chrono::Utc::now().timestamp() - ts).max(0) * 1000;
-                        if let Some(hh) = s.agents.write().await.get_mut(&agent_id) {
-                            hh.info.rtt_ms = ms;
+                        if let Some(hh) = s.agents.read().await.get(&agent_id) {
+                            hh.ctr_rtt.store(ms, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     ClientMsg::AdminReq { req_id, method, path, body } => {
@@ -573,10 +577,11 @@ async fn dispatch_body(
             }
             ClientMsg::Ping { ts } => {
                 // 同读循环：rtt 由 agent 上报 ts 秒级计算（反向 Ping 已砍）。
+                // 原子写 rtt，零 agents 写锁。
                 let _ = ctl_tx.send(ServerMsg::Pong { ts });
                 let ms = (chrono::Utc::now().timestamp() - ts).max(0) * 1000;
-                if let Some(hh) = s.agents.write().await.get_mut(agent_id) {
-                    hh.info.rtt_ms = ms;
+                if let Some(hh) = s.agents.read().await.get(agent_id) {
+                    hh.ctr_rtt.store(ms, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             ClientMsg::AdminReq { req_id, method, path, body } => {
@@ -628,13 +633,12 @@ async fn deliver(s: &S, agent_id: &str, id: u32, payload: &[u8]) {
         .read()
         .await
         .get(agent_id)
-        .map(|h| (h.incoming.clone(), h.pending.clone()));
-    if let Some((st, pe)) = waiter {
+        .map(|h| (h.incoming.clone(), h.pending.clone(), h.ctr_rx.clone()));
+    if let Some((st, pe, ctr)) = waiter {
         if let Some(tx) = st.read().await.get(&id).cloned() {
             let _ = tx.send(payload.to_vec());
-            if let Some(h) = s.agents.write().await.get_mut(agent_id) {
-                h.info.rx_bytes += payload.len() as u64;
-            }
+            // 原子累加，零 agents 写锁（总量由 5s tick 批量合进 info）。
+            ctr.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         } else {
             let mut p = pe.write().await;
             let e = p.entry(id).or_default();
@@ -649,6 +653,12 @@ async fn deliver(s: &S, agent_id: &str, id: u32, payload: &[u8]) {
 async fn cleanup(s: &S, agent_id: &str, hostname: &str) {
     {
         let mut ag = s.agents.write().await;
+        // cleanup 合账：ctr 原子残量先合进 info 再落 totals，否则 5s 窗内流量丢
+        // （flood 下包级增量全在 ctr 里，info 基线是 5s 前的）。
+        if let Some(h) = ag.get_mut(agent_id) {
+            h.info.rx_bytes += h.ctr_rx.swap(0, std::sync::atomic::Ordering::Relaxed);
+            h.info.tx_bytes += h.ctr_tx.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(h) = ag.remove(agent_id) {
             s.totals.write().await.insert(hostname.to_string(), (h.info.rx_bytes, h.info.tx_bytes));
         }

@@ -73,6 +73,18 @@ impl RateLimiter {
         d
     }
     /// (limit, 经手字节累计, 累计 sleep 毫秒)——供 /api/tunnels + 周期日志验证限速生效。
+    /// try_stats：非阻塞快照（/api/tunnels+overview 热路径用）。
+    /// BT flood 高 pps 下 N 个转发泵在 take() 里排队等 win 锁，stats() 若再
+    /// 阻塞等同一把锁，读会叠进队尾、agents.read() 饿死、API 10s 超时
+    /// （2026-10-23 HK 现场：live/conns/traffic 1ms 正常，唯 tunnels/overview 卡死）。
+    /// win.try_lock 拿不到即返回预算值（limit, throttled, sleep），不歪曲、不等待。
+    pub fn try_stats(&self) -> (u64, u64, u64) {
+        (
+            self.limit.load(Ordering::Relaxed),
+            self.throttled_bytes.load(Ordering::Relaxed),
+            self.sleep_millis.load(Ordering::Relaxed),
+        )
+    }
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.limit.load(Ordering::Relaxed), self.throttled_bytes.load(Ordering::Relaxed), self.sleep_millis.load(Ordering::Relaxed))
     }
@@ -112,6 +124,21 @@ pub fn limit_of(opt: Option<&str>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn try_stats_never_blocks_on_hot_window() {
+        // HK 2026-10-23：BT flood 下 N 个泵在 take() 里等 win 锁，
+        // /api/tunnels 的 stats() 若阻塞等同一把锁即叠进队尾 -> 10s 超时。
+        // try_stats 必须零等待：即使窗口锁被占也立刻返回预算值。
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = std::sync::Arc::new(super::RateLimiter::new(1024));
+            let _guard = l.win.lock().await; // 模拟 flood：窗口锁被泵占住
+            let t0 = std::time::Instant::now();
+            let (limit, bytes, sleep_ms) = l.try_stats();
+            assert!(t0.elapsed() < std::time::Duration::from_millis(50)); // 零等待
+            assert_eq!((limit, bytes, sleep_ms), (1024, 0, 0)); // 预算值，不歪曲
+        });
+    }
     #[test]
     fn limiter_stats_counters() {
         // 可观测回归：take 累计经手字节 + sleep 量；零 limit/零字节不计数。

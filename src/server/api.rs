@@ -50,15 +50,12 @@ pub(crate) async fn api_overview(
     if !auth_ok(&h, &s2.jwt_secret) {
         return unauthorized();
     }
-    let ag = s.agents.read().await;
-    let list: Vec<AgentInfo> = ag
-        .values()
-        .map(|h| {
-            let mut i = h.info.clone();
-            i.online_secs = (chrono::Utc::now() - h.connected_at).num_seconds();
-            i
-        })
-        .collect();
+    // 快照先行：clone 即放锁，后续组装零持有；rx/tx/rtt 含原子计数实时值
+    // （5s tick 合账间隙的新量也可见，不等 tick）。
+    let list: Vec<AgentInfo> = {
+        let ag = s.agents.read().await;
+        super::state::snapshot_agents(&ag, chrono::Utc::now())
+    };
     Json(serde_json::json!({"agents": list, "version": crate::common::proto::VERSION})).into_response()
 }
 
@@ -70,18 +67,28 @@ pub(crate) async fn api_tunnels(
     if !auth_ok(&h, &s2.jwt_secret) {
         return unauthorized();
     }
-    let ag = s.agents.read().await;
-    let lims = s.rate_limiters.read().await;
+    // 快照先行：agents/limiters 两表克隆即放锁，后续组装零持有。
+    // BT flood 高 pps 下 N 个泵在 take() 占 win 锁 + 写 conns，API 若长持
+    // agents 读锁会被写锁后来者插队饿死（2026-10-23 HK：tunnels/overview 双双 10s 超时）。
+    // ratelimit 实况用 try_stats 非阻塞快照（锁被占即回预算值，不等）。
+    let snap: Vec<(String, String, Vec<crate::common::proto::ProxyConfig>)> = {
+        let ag = s.agents.read().await;
+        ag.values().map(|hh| (hh.info.hostname.clone(), hh.info.agent_id.clone(), hh.info.proxies.clone())).collect()
+    };
+    let lims: std::collections::HashMap<String, (u64, u64, u64)> = {
+        let g = s.rate_limiters.read().await;
+        g.iter().map(|(k, l)| (k.clone(), l.try_stats())).collect()
+    };
     let mut out = vec![];
-    for hh in ag.values() {
-        for p in &hh.info.proxies {
+    for (hostname, agent_id, proxies) in &snap {
+        for p in proxies {
             // 限速实况：key 同泵侧 traffic_key；无 key = 该映射无流量经过 limiter。
-            let rl = lims.get(&crate::server::state::traffic_key(&hh.info.hostname, &p.name)).map(|l| {
-                let (limit, bytes, sleep_ms) = l.stats();
+            let rl = lims.get(&crate::server::state::traffic_key(hostname, &p.name)).map(|(limit, bytes, sleep_ms)| {
+                let (limit, bytes, sleep_ms) = (*limit, *bytes, *sleep_ms);
                 serde_json::json!({"limit_bps": limit, "throttled_bytes": bytes, "sleep_ms": sleep_ms})
             });
             out.push(serde_json::json!({
-                "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
+                "agent": hostname, "agent_id": agent_id,
                 "name": p.name, "enabled": p.enabled,
                 "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
                 "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,
@@ -131,32 +138,35 @@ pub(crate) async fn dispatch_admin(s: &S, hostname: &str, method: &str, path: &s
     }
     match (method, base) {
         ("GET", "overview") => {
-            let ag = s.agents.read().await;
-            let list: Vec<AgentInfo> = ag
-                .values()
-                .map(|h| {
-                    let mut i = h.info.clone();
-                    i.online_secs = (chrono::Utc::now() - h.connected_at).num_seconds();
-                    i
-                })
-                .collect();
+            // 快照先行（同 api_overview 防饿死，原子计数实时合并）。
+            let list: Vec<AgentInfo> = {
+                let ag = s.agents.read().await;
+                super::state::snapshot_agents(&ag, chrono::Utc::now())
+            };
             (200, serde_json::json!({"agents": list, "version": crate::common::proto::VERSION}).to_string())
         }
         ("GET", "tunnels") => {
             // 与 api_tunnels 同组装（含 ratelimit_stats），复制不重构。
-            let ag = s.agents.read().await;
-            let lims = s.rate_limiters.read().await;
+            // 快照先行 + try_stats（同 api_tunnels 防饿死）。
+            let snap: Vec<(String, String, Vec<crate::common::proto::ProxyConfig>)> = {
+                let ag = s.agents.read().await;
+                ag.values().map(|hh| (hh.info.hostname.clone(), hh.info.agent_id.clone(), hh.info.proxies.clone())).collect()
+            };
+            let lims: std::collections::HashMap<String, (u64, u64, u64)> = {
+                let g = s.rate_limiters.read().await;
+                g.iter().map(|(k, l)| (k.clone(), l.try_stats())).collect()
+            };
             let mut out = vec![];
-            for hh in ag.values() {
-                for p in &hh.info.proxies {
+            for (hostname, agent_id, proxies) in &snap {
+                for p in proxies {
                     let rl = lims
-                        .get(&crate::server::state::traffic_key(&hh.info.hostname, &p.name))
-                        .map(|l| {
-                            let (limit, bytes, sleep_ms) = l.stats();
+                        .get(&crate::server::state::traffic_key(hostname, &p.name))
+                        .map(|(limit, bytes, sleep_ms)| {
+                            let (limit, bytes, sleep_ms) = (*limit, *bytes, *sleep_ms);
                             serde_json::json!({"limit_bps": limit, "throttled_bytes": bytes, "sleep_ms": sleep_ms})
                         });
                     out.push(serde_json::json!({
-                        "agent": hh.info.hostname, "agent_id": hh.info.agent_id,
+                        "agent": hostname, "agent_id": agent_id,
                         "name": p.name, "enabled": p.enabled,
                         "type": p.ptype, "domains": p.domains, "remote_port": p.remote_port,
                         "link_agent": p.link_agent, "link_host": p.link_host, "link_port": p.link_port,

@@ -124,8 +124,18 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
                     }
                     // 增量 = 本轮累计 - 上轮基线（基线存 live_last_host；无基线则 0，不跳变）
                     // 注：conns 行是累计值，agent 重连后行 id 变化会回绕，minute_delta 饱和为 0。
+                    // 原子计数合账：deliver/写泵的每包增量先落 ctr_*，此处 swap 清零后
+                    // 一次合进 info（每 5s 单次 write）+ per-host 增量。
                     let mut ag = s.agents.write().await;
                     for h in ag.values_mut() {
+                        let drx = h.ctr_rx.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let dtx = h.ctr_tx.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let rtt = h.ctr_rtt.load(std::sync::atomic::Ordering::Relaxed);
+                        h.info.rx_bytes += drx;
+                        h.info.tx_bytes += dtx;
+                        if rtt >= 0 {
+                            h.info.rtt_ms = rtt;
+                        }
                         if let Some((crx, ctx)) = per_host.get(&h.info.hostname) {
                             let prev = s.live_last_host.read().await.get(&h.info.hostname).cloned().unwrap_or((*crx, *ctx));
                             let d = state::minute_delta(prev, (*crx, *ctx));

@@ -20,6 +20,14 @@ pub(crate) struct AgentInfo {
 pub(crate) struct AgentHandle {
     pub(crate) info: AgentInfo,
     pub(crate) connected_at: chrono::DateTime<chrono::Utc>,
+    /// 热路径原子计数：deliver/写泵/Ping 每包累加 rx/tx/rtt，零 agents 锁。
+    /// 根因→修法：旧代码每包 agents.write() 改 info.rx/tx/rtt，BT flood 高 pps
+    /// 下写者排队、/api/overview+tunnels 的 agents.read() 饿死 10s+ 超时
+    /// （2026-10-23 HK 现场）。现只在 5s live tick 批量合进 info（单次 write），
+    /// overview 读 info 快照 + 原子 load，永不饿死。
+    pub(crate) ctr_rx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) ctr_tx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) ctr_rtt: std::sync::Arc<std::sync::atomic::AtomicI64>,
     pub(crate) ctl: mpsc::UnboundedSender<ServerMsg>,
     pub(crate) incoming: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
     /// Binary 早到缓存：egress Open 与首包背靠背时，占位注册前的包先存此表，
@@ -591,10 +599,58 @@ pub(crate) async fn test_shared_admin() -> std::sync::Arc<Shared> {
     std::sync::Arc::new(Shared { allow_agent_admin: true, ..Default::default() })
 }
 
+/// overview 快照组装（纯函数，可单测）：agents 快照 + 原子计数合并。
+/// 根因→修法：旧 api_overview 在 agents.read() 临界区内调 chrono::Utc::now()
+/// 且 info.rx/tx 靠每包 write 更新，flood 下读饿死。现快照只 clone，
+/// rx/tx = info 基线 + ctr 原子当前值（swap 不抢，load 即走）。
+pub(crate) fn snapshot_agents(
+    agents: &HashMap<String, AgentHandle>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<AgentInfo> {
+    agents
+        .values()
+        .map(|h| {
+            let mut i = h.info.clone();
+            i.online_secs = (now - h.connected_at).num_seconds();
+            i.rx_bytes += h.ctr_rx.load(std::sync::atomic::Ordering::Relaxed);
+            i.tx_bytes += h.ctr_tx.load(std::sync::atomic::Ordering::Relaxed);
+            let rtt = h.ctr_rtt.load(std::sync::atomic::Ordering::Relaxed);
+            if rtt >= 0 {
+                i.rtt_ms = rtt;
+            }
+            i
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    #[test]
+    fn snapshot_agents_merges_atomic_counters() {
+        // HK 2026-10-23：deliver/写泵的每包增量只落 ctr_*，5s tick 才合进 info。
+        // overview 必须 info 基线 + ctr 实时值，否则 5s 窗内流量不可见、rtt 旧值。
+        let mut agents: HashMap<String, AgentHandle> = HashMap::new();
+        agents.insert("a1".into(), AgentHandle {
+            info: AgentInfo {
+                agent_id: "a1".into(), hostname: "h".into(), version: "v".into(),
+                online_secs: 0, rtt_ms: -1, rx_bytes: 100, tx_bytes: 200, proxies: vec![],
+            },
+            connected_at: chrono::Utc::now(),
+            ctr_rx: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(50)),
+            ctr_tx: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(70)),
+            ctr_rtt: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(3000)),
+            ctl: tokio::sync::mpsc::unbounded_channel().0,
+            incoming: Default::default(),
+            pending: Default::default(),
+        });
+        let list = super::snapshot_agents(&agents, chrono::Utc::now());
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].rx_bytes, 150); // 100 基线 + 50 未合账
+        assert_eq!(list[0].tx_bytes, 270);
+        assert_eq!(list[0].rtt_ms, 3000); // ctr 新值覆盖 info 旧值
+    }
     fn seen_for_test() -> std::collections::HashSet<String> { Default::default() }
     fn seen_with(keys: &[&str]) -> std::collections::HashSet<String> { keys.iter().map(|k| k.to_string()).collect() }
     #[test]

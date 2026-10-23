@@ -106,6 +106,9 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                     proxies: vec![],
                 },
                 connected_at: chrono::Utc::now(),
+                ctr_rx: Default::default(),
+                ctr_tx: Default::default(),
+                ctr_rtt: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1)),
                 ctl: ctl_tx.clone(),
                 incoming: incoming.clone(),
                 pending: pending.clone(),
@@ -183,8 +186,9 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
                             Ok(ClientMsg::Pong { .. }) => {
                                 if let Some(t0) = *last_ping.read().await {
                                     let ms = t0.elapsed().as_millis() as i64;
-                                    if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                                        h.info.rtt_ms = ms;
+                                    // 原子写 rtt，零 agents 写锁。
+                                    if let Some(h) = s.agents.read().await.get(&agent_id) {
+                                        h.ctr_rtt.store(ms, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -249,6 +253,12 @@ async fn ws_loop(sock: WebSocket, s: S, token: Arc<String>) {
     // cleanup: persist counters, drop routes
     {
         let mut ag = s.agents.write().await;
+        // cleanup 合账：ctr 原子残量先合进 info 再落 totals，否则 5s 窗内流量丢
+        // （flood 下包级增量全在 ctr 里，info 基线是 5s 前的）。
+        if let Some(h) = ag.get_mut(&agent_id) {
+            h.info.rx_bytes += h.ctr_rx.swap(0, std::sync::atomic::Ordering::Relaxed);
+            h.info.tx_bytes += h.ctr_tx.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(h) = ag.remove(&agent_id) {
             s.totals.write().await.insert(hostname.clone(), (h.info.rx_bytes, h.info.tx_bytes));
         }

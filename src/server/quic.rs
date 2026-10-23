@@ -116,6 +116,9 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                     proxies: vec![],
                 },
                 connected_at: chrono::Utc::now(),
+                ctr_rx: Default::default(),
+                ctr_tx: Default::default(),
+                ctr_rtt: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1)),
                 ctl: ctl_tx.clone(),
                 incoming: incoming.clone(),
                 pending: pending.clone(),
@@ -242,8 +245,9 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                     // 每条隧道数据走独立 stream：sid 复用 QUIC stream 太重，
                     // 此处沿用 control 复用帧（agent 侧按 sid 分发），队头影响限于同 agent。
                     if ctl_send.write_all(&encode_frame(&b)).await.is_err() { break; }
-                    if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                        h.info.tx_bytes += payload.len() as u64;
+                    // 原子累加，零 agents 写锁（同 kudus 写泵）。
+                    if let Some(h) = s.agents.read().await.get(&agent_id) {
+                        h.ctr_tx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 else => break,
@@ -270,8 +274,9 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                     ClientMsg::Pong { .. } => {
                         if let Some(t0) = *last_ping.read().await {
                             let ms = t0.elapsed().as_millis() as i64;
-                            if let Some(h) = s.agents.write().await.get_mut(&agent_id) {
-                                h.info.rtt_ms = ms;
+                            // 原子写 rtt，零 agents 写锁。
+                            if let Some(h) = s.agents.read().await.get(&agent_id) {
+                                h.ctr_rtt.store(ms, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -335,13 +340,12 @@ async fn deliver(s: &S, agent_id: &str, id: u32, payload: &[u8]) {
         .read()
         .await
         .get(agent_id)
-        .map(|h| (h.incoming.clone(), h.pending.clone()));
-    if let Some((st, pe)) = waiter {
+        .map(|h| (h.incoming.clone(), h.pending.clone(), h.ctr_rx.clone()));
+    if let Some((st, pe, ctr)) = waiter {
         if let Some(tx) = st.read().await.get(&id).cloned() {
             let _ = tx.send(payload.to_vec());
-            if let Some(h) = s.agents.write().await.get_mut(agent_id) {
-                h.info.rx_bytes += payload.len() as u64;
-            }
+            // 原子累加，零 agents 写锁（同 kudus deliver）。
+            ctr.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         } else {
             let mut p = pe.write().await;
             let e = p.entry(id).or_default();
@@ -375,6 +379,12 @@ async fn drain_stream_into_incoming(
 async fn cleanup(s: &S, agent_id: &str, hostname: &str) {
     {
         let mut ag = s.agents.write().await;
+        // cleanup 合账：ctr 原子残量先合进 info 再落 totals，否则 5s 窗内流量丢
+        // （flood 下包级增量全在 ctr 里，info 基线是 5s 前的）。
+        if let Some(h) = ag.get_mut(agent_id) {
+            h.info.rx_bytes += h.ctr_rx.swap(0, std::sync::atomic::Ordering::Relaxed);
+            h.info.tx_bytes += h.ctr_tx.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(h) = ag.remove(agent_id) {
             s.totals.write().await.insert(hostname.to_string(), (h.info.rx_bytes, h.info.tx_bytes));
         }
