@@ -360,7 +360,10 @@ async fn handle_conn(
     // 重传泵：50ms 扫一次超时未确认包，原样重发（带当前 ACK 快照）。
     // 注意：rel 锁必须 try_lock 碰到就跳过——写泵搬 2MB 时长占锁，重传泵若阻塞等锁
     // 会把 50ms 节拍拖成串行，RTO 永远追不上（loopback 实测 1659577/2097152 即卡死于此）。
-    {
+    // 根因→修法：重传泵与 handle_conn 同命。旧裸 spawn 无 abort，会话被踢/cleanup
+    // 后泵继续 50ms 发纯 ACK 探活——agent 侧若认 ACK 为活，看门狗被假心跳复位、
+    // session 永不 bail（2026-10-23 workmac 现场：本地端口活、数据面死、无日志）。
+    let retx_task = {
         let txr = tx.clone();
         let relr = rel.clone();
         tokio::spawn(async move {
@@ -384,8 +387,8 @@ async fn handle_conn(
                     txr.send_pkt(&h, &body);
                 }
             }
-        });
-    }
+        })
+    };
     // 读循环
     let read_res = async {
         loop {
@@ -535,6 +538,7 @@ async fn handle_conn(
     .await;
     let _ = read_res;
     write_task.abort();
+    retx_task.abort();
     // 本端 FIN（读端结束即关，无半关闭）：200ms ×3 尽力发。
     if !fin_acked {
         for _ in 0..3 {
@@ -762,6 +766,36 @@ mod tests {
         assert!(!check_token("", "s3cret"));
         assert!(!check_token("s3cret", ""));
         assert!(check_token("s3cret", "s3cret"));
+    }
+
+    #[test]
+    fn retx_pump_is_abortable_with_session() {
+        // workmac 2026-10-23：裸 spawn 的重传泵在 handle_conn 返回后继续 50ms
+        // 纯 ACK 探活，喂出 agent 侧静默僵尸。此单测锁死“泵有 AbortHandle 且随
+        // 会话结束 abort”的结构：handle 必须存在（编译期），abort 后 task 结束。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let probe = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let p2 = probe.clone();
+            // 同 handle_conn 内重传泵形状：50ms tick 循环 + 外部 abort 即停。
+            let h = tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
+                loop {
+                    iv.tick().await;
+                    p2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            assert!(probe.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+            h.abort();
+            let _ = h.await;
+            let n = probe.load(std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            assert_eq!(probe.load(std::sync::atomic::Ordering::Relaxed), n); // 停了，不再涨
+        });
     }
 
     #[test]

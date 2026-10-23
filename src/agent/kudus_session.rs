@@ -14,7 +14,17 @@ pub(crate) struct KCtx {
     pub(crate) link_tasks: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
     pub(crate) streams: RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
     pub(crate) pending: RwLock<HashMap<u32, Vec<Vec<u8>>>>,
+    /// UDP egress 并发上限：每条 udp/link_udp 流占一个 connected socket（1 fd），
+    /// DHT flood 下无上限即 1024 fd 打满 EMFILE（snail 2026-10-23 现场）。
+    /// 注意不能跨 sid 复用一个 socket：同目标（transmission 51413）的多流回包
+    /// 全来自同一对端地址，无协议层解析就无法 demux 到 sid，只能限并发不能合 socket。
+    pub(crate) udp_slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// 单 agent UDP egress 最大并发（udp + link_udp 共用）。256 fd 预留给 TCP/控制面。
+pub(crate) const KUDUS_MAX_UDP_STREAMS: usize = 256;
+/// UDP 流 server 侧无数据空闲超时（旧 120s：DHT 下 fd 空占太久）。
+const UDP_STREAM_IDLE_SECS: u64 = 30;
 
 /// 发包器：hdr + proto_frame 封包（mpsc 发 bytes，写泵统一 send_to 保序）。
 #[derive(Clone)]
@@ -189,7 +199,10 @@ pub(crate) async fn session(
     // 重传泵：50ms 扫一次超时未确认包，原样重发（带当前 ACK 快照）。
     // 注意：take+resend 之间 rel 锁零持有还是一次拿完——写泵上行 2MB 时长占锁，
     // 重传泵若阻塞等锁会被拖成串行，RTO 形同虚设（与 server 侧 try_lock 对称）。
-    {
+    // 根因→修法：重传泵与 session 同命。旧裸 spawn 无 abort，session 结束（bail/踢）
+    // 后泵继续 50ms 空转拖着旧 rel/channel 不放（workmac 现场：僵尸 task 越堆越多）。
+    // ping loop 同理：send_ctrl 失败即自退，但 out 通道若被他人持有则退不了，同样 abort。
+    let retx_task = {
         use std::sync::TryLockError;
         let p = pkt.clone();
         tokio::spawn(async move {
@@ -217,8 +230,8 @@ pub(crate) async fn session(
                     p.out.send(crate::common::kudus::encode_packet(p.session, &n, &crate::common::kudus::seal(&p.key, &n, &plain))).ok();
                 }
             }
-        });
-    }
+        })
+    };
     *kudus_out.write().await = Some(pkt.clone());
     super::admin::set_sender(Some(super::admin::AdminSender::Kudus(pkt.clone()))).await;
     let ctx = Arc::new(KCtx {
@@ -226,6 +239,7 @@ pub(crate) async fn session(
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
         streams: RwLock::new(HashMap::new()),
         pending: RwLock::new(HashMap::new()),
+        udp_slots: Arc::new(tokio::sync::Semaphore::new(KUDUS_MAX_UDP_STREAMS)),
     });
     let kudus_link_holder = kudus_out.clone();
     super::link::sync_link_listeners_kudus(&ctx, &cfg.proxies, &up.hostname, &kudus_link_holder).await;
@@ -330,7 +344,7 @@ pub(crate) async fn session(
     // ping loop：Heartbeat 自适应（慢 15~30s / 快 5~8s）+ 每次随机防对齐。
     // 根因→修法：固定 30s 多 agent 齐步走惊群；丢包不加密则重传泵独转、
     // 对端久无确认。lossy = 本端重传缓冲非空（发的包对端还没确认）。
-    {
+    let ping_task = {
         let p = pkt.clone();
         tokio::spawn(async move {
             let mut hb = crate::common::kudus::Heartbeat::new();
@@ -342,8 +356,8 @@ pub(crate) async fn session(
                     break;
                 }
             }
-        });
-    }
+        })
+    };
     // 主分发循环（看门狗：75s 无 server 任何帧即判死，bail 走外层 backoff 重连。
     // 根因→修法：旧裸 recv 永等，server OOM 重启后 agent 卡旧会话无感知
     // （macmini 2026-10-21 现场）。握手完成后的主循环才计时。）
@@ -358,7 +372,17 @@ pub(crate) async fn session(
         )
         .await
         {
-            Ok(Some(v)) => v,
+            Ok(Some((h, body))) => {
+                // 看门狗只认 DATA 帧：泄漏的 server 重传泵每 50ms 发纯 ACK 探活，
+                // 若算活则 75s 超时永不到、session 永不 bail（2026-10-23 现场）。
+                // 纯 ACK 只清重传（读泵已做），此处直接等下一帧，看门狗照常计时。
+                // FIN 例外必须穿透：server 踢会话的 FIN 本身就是非 DATA 帧，
+                // 若一起过滤则踢人通知永远到不了关闭分支（与下 `FLAG_FIN` 对应）。
+                if !crate::common::kudus::frame_feeds_watchdog(h.flags) && h.flags & FLAG_FIN == 0 {
+                    continue;
+                }
+                (h, body)
+            }
             _ => anyhow::bail!("kudus heartbeat timeout: no server frame"),
         };
         if h.flags & FLAG_FIN != 0 {
@@ -405,6 +429,13 @@ pub(crate) async fn session(
                 ServerMsg::AdminResp { req_id, status, body } => {
                     super::admin::on_admin_resp(req_id, status, body).await;
                 }
+                ServerMsg::Error { reason } => {
+                    // server 踢旧会话/单 flight 抢路由时发 Error（kudus.rs 单 flight 段注释
+                    // 即"Error 即整 session 致命"），此处必须 bail 走外层重连——
+                    // 若吞掉（旧 `_ => {}`），agent 认知与 server 分裂：本地端口活、
+                    // 数据面死、无任何日志（2026-10-23 workmac 现场）。
+                    anyhow::bail!("kudus server error: {reason}");
+                }
                 ServerMsg::Close { stream, .. } => {
                     // server eof 语义（与 WSS/QUIC 对齐）：主表删后，link/egress 泵侧推空包
                     // 触发 to_local 退出；纯删表不推包会导致 client 侧 hang 住不断（已现网踩坑）。
@@ -449,6 +480,8 @@ pub(crate) async fn session(
     super::admin::set_sender(None).await;
     writer.abort();
     reader.abort();
+    retx_task.abort();
+    ping_task.abort();
     anyhow::Ok(())
 }
 
@@ -631,6 +664,17 @@ async fn open_udp_stream_to(
     sid: u32,
     sock: tokio::net::UdpSocket,
 ) -> anyhow::Result<()> {
+    // 并发上限：DHT flood 下每流 1 fd 无上限即 EMFILE。占不到槽位直接拒（server 侧
+    // session 随对端超时自然过期），不挂起——挂起会把 Open task 堆成内存泄漏。
+    let _slot = match ctx.udp_slots.clone().try_acquire_owned() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::warn!("kudus udp stream {sid} rejected: too many udp streams");
+            let e = ClientMsg::Close { stream: sid, reason: "udp busy".into() };
+            let _ = pkt.send_ctrl(&e);
+            return Ok(());
+        }
+    };
     let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
@@ -641,7 +685,7 @@ async fn open_udp_stream_to(
     let w = sock.clone();
     let ws_to_udp = tokio::spawn(async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(120), drx.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(UDP_STREAM_IDLE_SECS), drx.recv()).await {
                 Ok(Some(dg)) => {
                     if w.send(&dg).await.is_err() {
                         return;
@@ -690,6 +734,14 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_concurrency_capped() {
+        // snail 2026-10-23：无上限时 DHT flood 每流 1 fd 打满 1024 EMFILE。
+        // 注意不能跨 sid 复用 socket：同目标回包无法 demux，只能限并发。
+        assert!(super::KUDUS_MAX_UDP_STREAMS <= 512);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(super::KUDUS_MAX_UDP_STREAMS));
+        assert_eq!(sem.available_permits(), super::KUDUS_MAX_UDP_STREAMS);
+    }
     #[test]
     fn heartbeat_contract() {
         // Task 2 依赖 Task 1 的接口形状：改名/改签名即红。

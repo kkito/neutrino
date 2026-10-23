@@ -52,6 +52,13 @@ impl Heartbeat {
     }
 }
 
+/// 看门狗喂食判定：只有 DATA 帧算活（含控制面分片，同样 FLAG_DATA 帧）。
+/// 纯 ACK（泄漏重传泵的探活包）/FIN/SYN 一律不算——否则 server 踢掉会话后，
+/// 对端靠 50ms 纯 ACK 把 75s 看门狗无限复位，session 永不 bail（2026-10-23 现场）。
+pub fn frame_feeds_watchdog(flags: u8) -> bool {
+    flags & FLAG_DATA != 0
+}
+
 /// 纯判定：now-last_seen 超 75s 即僵尸（kudus 版；WSS 用 state::is_idle_stale 45s，不动）。
 pub fn kudus_idle_stale(last_seen_unix: i64, now_unix: i64) -> bool {
     now_unix - last_seen_unix > KUDUS_IDLE_KICK_SECS
@@ -487,6 +494,23 @@ mod tests {
         assert!(hb.is_fast()); // 2 连好仍在快档
         hb.next_interval(false);
         assert!(!hb.is_fast()); // 3 连好回慢档
+    }
+
+    #[test]
+    fn only_data_frames_feed_watchdog() {
+        // snail/workmac 2026-10-23 现场：server 会话被踢后泄漏的重传泵每 50ms
+        // 发纯 ACK 探活，agent 读泵把它投进 dec 通道，主循环 75s 看门狗被
+        // 假心跳复位，session 永远不 bail（本地端口活、数据面死、无任何日志）。
+        // 看门狗只认 DATA 帧（含控制面分片，同样 FLAG_DATA）：纯 ACK/FIN/SYN 不算活。
+        use super::{frame_feeds_watchdog, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_SYN};
+        assert!(frame_feeds_watchdog(FLAG_DATA));
+        assert!(frame_feeds_watchdog(FLAG_DATA | FLAG_ACK)); // 捎带确认的数据帧照样算活
+        assert!(!frame_feeds_watchdog(FLAG_ACK)); // 泄漏泵的探活包：不清看门狗
+        // FIN 不算“活”但必须穿透到关闭分支：主循环过滤条件是
+        // `!feeds && !FIN`（见 kudus_session 主循环），此处只锁 feeds 判定。
+        assert!(!frame_feeds_watchdog(FLAG_FIN));
+        assert!(!frame_feeds_watchdog(FLAG_SYN));
+        assert!(!frame_feeds_watchdog(0));
     }
 
     #[test]

@@ -187,6 +187,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_error_is_fatal_shape() {
+        // workmac 2026-10-23：server 踢旧会话/单 flight 抢路由时发 Error，
+        // agent 主循环若 `_ => {}` 吞掉则认知分裂（本地端口活、数据面死、无日志）。
+        // Error 必须保持独立可辨形状：与 Pong/Config 等活帧互斥，
+        // 从 wire 上回来仍是 Error（主循环 match 到 Error 即 bail 是编译期保证）。
+        let m = ServerMsg::Error { reason: "superseded".into() };
+        let s = serde_json::to_vec(&m).unwrap();
+        let back: ServerMsg = serde_json::from_slice(&s).unwrap();
+        assert!(matches!(back, ServerMsg::Error { .. }));
+        for other in [
+            serde_json::to_vec(&ServerMsg::Pong { ts: 1 }).unwrap(),
+            serde_json::to_vec(&ServerMsg::Config { proxies: vec![] }).unwrap(),
+            serde_json::to_vec(&ServerMsg::Close { stream: 1, reason: "x".into() }).unwrap(),
+        ] {
+            let o: ServerMsg = serde_json::from_slice(&other).unwrap();
+            assert!(!matches!(o, ServerMsg::Error { .. })); // 活帧/流关闭都不该误判致命
+        }
+    }
+
+    #[test]
     fn hello_roundtrip() {
         let m = ClientMsg::Hello {
             hostname: "minipc7s".into(),
