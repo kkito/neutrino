@@ -137,6 +137,19 @@ pub struct RetxStats {
     pub backlog_max: usize,
 }
 
+/// 第 `retx` 次重传应等待的 RTO（指数退避，KUDUS_RTO_MAX 封顶）。
+/// 根因→修法：旧实现固定 KUDUS_RTO=200ms 线性重传，每秒 5 次，
+/// 积压包越多放大越猛（256 包 ≈1.22MB/s，8192 包 ≈39MB/s）。退避后
+/// 单包 10 次重传总耗时 ≈ 200+400+...+6400 ≈ 25s，期间速率被压住。
+pub fn rto_for(retx: u32) -> Duration {
+    // 1u32 << 6 = 64 → 200ms × 64 = 12.8s，被 min(RTO_MAX) 截到 8s。
+    // retx > 6 时移位数封顶，避免 u32 左移溢出（debug 下会 panic）。
+    let shift = retx.min(6);
+    KUDUS_RTO
+        .saturating_mul(1u32 << shift)
+        .min(KUDUS_RTO_MAX)
+}
+
 /// RetxBuf 已满（达到 KUDUS_RETX_CAP）。调用方据此丢弃新包。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetxFull;
@@ -145,7 +158,6 @@ pub struct RetxFull;
 struct RetxEntry {
     payload: Vec<u8>,
     last_sent: u64,
-    #[allow(dead_code)] // 使用者：Task 3（指数退避）
     retx: u32,
 }
 
@@ -211,10 +223,15 @@ impl RetxBuf {
         });
     }
     /// 取出超时未确认包，按 seq 排序。
-    pub fn take_expired(&mut self, rto: Duration, now: u64) -> Vec<(u32, Vec<u8>)> {
+    ///
+    /// 退避：按每包自身 `retx` 算出的 RTO 判断到期（`_rto` 参数保留仅为
+    /// 签名兼容两个调用方，实际 RTO 由 `rto_for(e.retx)` 决定）。
+    /// 命中即 `retx += 1` 并刷新 `last_sent`——下次到期自然延后一倍。
+    pub fn take_expired(&mut self, _rto: Duration, now: u64) -> Vec<(u32, Vec<u8>)> {
         let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
         for (seq, e) in self.seqs.iter_mut() {
-            if now.wrapping_sub(e.last_sent) >= rto.as_millis() as u64 {
+            if now.wrapping_sub(e.last_sent) >= rto_for(e.retx).as_millis() as u64 {
+                e.retx += 1;
                 e.last_sent = now;
                 self.stats.sent += 1; // spec §15.3：每重发一包 +1
                 due.push((*seq, e.payload.clone()));
@@ -543,6 +560,39 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 指数退避序列：200 → 400 → 800 → 1.6s → 3.2s → 6.4s → 8s(封顶)。
+    /// 旧代码固定 200ms 线性重传，每秒重发 5 次，包越多放大越猛。
+    #[test]
+    fn retx_backoff_is_exponential() {
+        assert_eq!(super::rto_for(0), Duration::from_millis(200));
+        assert_eq!(super::rto_for(1), Duration::from_millis(400));
+        assert_eq!(super::rto_for(2), Duration::from_millis(800));
+        assert_eq!(super::rto_for(3), Duration::from_millis(1600));
+        assert_eq!(super::rto_for(4), Duration::from_millis(3200));
+        assert_eq!(super::rto_for(5), Duration::from_millis(6400));
+        assert_eq!(super::rto_for(6), Duration::from_secs(8), "6.4s×2=12.8s 应被 RTO_MAX 封顶");
+        assert_eq!(super::rto_for(9), Duration::from_secs(8), "超过也应封顶，不能溢出");
+    }
+
+    /// 重传计数必须递增，且退避生效：首次 200ms 到期，重发后下一次要等 400ms。
+    /// 旧代码 take_expired 只做 *sent = now，无计数、无退避。
+    #[test]
+    fn retx_counts_and_backs_off() {
+        let mut tx = super::RetxBuf::new(1);
+        let s = tx.on_send(b"x".to_vec()).unwrap();
+        let t0 = super::now_ms();
+        // 首次：200ms 后到期
+        let due = tx.take_expired(Duration::from_millis(200), t0 + 200);
+        assert_eq!(due.len(), 1, "首次应到期");
+        assert_eq!(due[0].0, s);
+        // 重发后：再过 200ms 不该到期（因为退避到 400ms）
+        let due = tx.take_expired(Duration::from_millis(200), t0 + 400);
+        assert!(due.is_empty(), "退避后 200ms 内不应再次到期（旧代码会立刻再发）");
+        // 等到 400ms 才到期
+        let due = tx.take_expired(Duration::from_millis(200), t0 + 610);
+        assert_eq!(due.len(), 1, "退避 400ms 后应到期");
+    }
 
     /// 容量上限：满 4096 后 on_send 必须拒绝，不能无限增长。
     /// 旧代码：seqs 是裸 HashMap，无上限，无 ACK 时无限涨（事故 8192 包）。
