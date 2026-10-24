@@ -10,6 +10,7 @@
 - `README.md`：协议/功能对照/本地验证/部署。
 - `docs/architecture.md`：架构与典型流程（含 mermaid 图）。
 - `docs/nginx.md`：natproxy 侧 nginx 接入（管理域/业务域/tcp-udp/验证）。
+- **`docs/incidents/README.md`：线上事故索引 + 分诊表（排障先看这个）。**
 - `docs/superpowers/specs/2026-10-19-dual-webui-design.md`：双 WebUI + 期望态设计。
 
 ## 常用命令
@@ -21,9 +22,9 @@ cargo test --test e2e <name>       # 跑单个 e2e
 ```
 
 ## 测试现状（2026-10-24）
-- 单测 178（`src/server/*::tests`、`src/agent*::tests`、`src/common/kudus.rs::tests`、`src/main.rs::main_tests`）。
-- e2e 40（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link/udp 多 peer 并发/日志可观测性（tunnel stats 行、无 INFO 刷屏、retx 格式）。
-- 全量串行：单测 ~13s + e2e ~48s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
+- 单测 203（`src/server/*::tests`、`src/agent*::tests`、`src/common/kudus.rs::tests`、`src/main.rs::main_tests`）。
+- e2e 41（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link/udp 多 peer 并发/日志可观测性（tunnel stats 行、无 INFO 刷屏、retx 格式）。
+- 全量串行：单测 ~9s + e2e ~47s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
 
 ### 测试等待规范（必读，已优化过一轮）
 禁止盲等 `sleep(Ns)` 来“等某状态就绪”。两类正确做法：
@@ -45,7 +46,7 @@ cargo test --test e2e <name>       # 跑单个 e2e
 ## 铁律：TDD 修 bug / 加功能
 1. **先写失败测试（RED）**：单测放对应模块 `mod tests`，回归放 `tests/e2e.rs`。必须亲眼看到它红，且红的原因是"行为缺失"（不是笔误）。修复前回退验证：临时关掉修复，测试必须变红（如 `overlay log count 250: Register/Config loop!`）。
 2. **最小实现（GREEN）**：只让测试变绿，不顺手重构、不加功能。纯判定逻辑抽成无 IO 纯函数（如 `route_fallback`、`needs_config_push`、`merge_upstream_toml`、`parse_response_head`）再测。
-3. **改完必须验证**：`make build`（已配 `RUSTFLAGS="-D warnings"`，任何 warning 直接变 error 中断）+ `make test`（30+7）全过才算完。e2e 允许重试的时间断言用轮询+上限（如 40×200ms），不用固定 sleep 赌竞态。
+3. **改完必须验证**：`make build`（已配 `RUSTFLAGS="-D warnings"`，任何 warning 直接变 error 中断）+ `make test`（单测 203 + e2e 41）全过才算完。e2e 允许重试的时间断言用轮询+上限（如 40×200ms），不用固定 sleep 赌竞态。
 4. **再提交**：注释写清"根因→修法"（参考 `Register -> Config -> Register ping-pong` 那次），e2e 注释写清"旧代码如何复现、断言抓什么"。
 
 ## 部署（natproxy server 二进制）
@@ -63,6 +64,23 @@ cargo test --test e2e <name>       # 跑单个 e2e
 - agent `Config` 回 `Register` 确认；WebUI 改上行走 redial generation 比对，睡眠间隙的 bump 不能丢。
 - agent `--web-pass` 只在首次生成 hash 时生效，已有 `{config}.webpass` 时传参 warn 忽略；删文件才重置。
 - `ProxyConfig` 比较依赖 `PartialEq`；加字段记得检查收敛比较与单测。
+
+### kudus 传输层（2026-10-24/25 连续踩坑总结）
+- **抓包看到 `In` 全是 94 字节 = 纯 ACK 风暴**。同一形态三个不同根因，
+  按 `docs/incidents/README.md` 分诊表走，不要凭直觉下结论。
+- **`ReorderBuf::push` 里 `seq == next` 必须不受 `KUDUS_WINDOW` 限制**：
+  旧代码先查窗满再插入，连唯一能推进窗口的包都挡住 ⇒ 窗口填满后**永久死锁**，
+  只能重连。单测 `reorder_window_deadlocks_on_permanent_hole`。
+- **`tokio::time::timeout` 是相对计时**：写在循环体内 + 命中 `continue` ⇒
+  计时器被重置。看门狗必须用循环外的绝对时刻算**剩余预算**。
+  单测 `watchdog_budget_drains_under_pure_ack`。
+- **快速重传：一轮只补最小那个洞**（整窗重发 = 2026-10-23 风暴）；
+  `retx > 0` 时用 `continue` 跳过而不是 `return`（否则退避中的洞会堵死后面所有洞）；
+  循环上界是 `1..=highest`（`..highest` 会漏掉最后一个洞）；
+  另有 `FAST_RETX_PER_MIN` 每分钟硬闸。
+- **两边指标都健康 ≠ 链路通**：重排窗死锁时 `send_fail=0`、`abandoned=0`、
+  `backlog_max` 很小，一切看着正常。**必看 `tx`（对端实际收到多少）**。
+- **丢包率测量必须 `ping -i 1`**：`-i 0.05` 触发 ICMP 限速产生 `6667%` 假数据。
 - `RetxBuf` 有硬上限 `KUDUS_RETX_CAP=4096`，`on_send` 返回 `Result`；满了要丢包，
   别忽略返回值（`-D warnings` 会拦 `unused_must_use`）。重传按 `rto_for(retx)` 指数退避，
   超 `KUDUS_MAX_RETX=10` 次即放弃——这是 2026-10-23 流量风暴的止血点，别改回固定 RTO。
