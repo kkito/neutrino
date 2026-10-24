@@ -107,22 +107,46 @@ impl ReorderBuf {
     }
 }
 
+/// 重传埋点（spec §15.3）。取走即归零，tick 汇总打增量。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetxStats {
+    /// take_expired 实际重发的包数
+    pub sent: u64,
+    /// 重传超上限被真丢弃的包数
+    pub abandoned: u64,
+    /// RetxFull 拒收次数
+    pub full: u64,
+    /// 本窗口内未确认包峰值
+    pub backlog_max: usize,
+}
+
 /// 发送重传缓冲：on_send 记 seq→(payload, sent_ms)；on_ack 按累积+SACK 清；
 /// take_expired 吐超时未确认包（调用方原样重发并刷新计时）。
 pub struct RetxBuf {
     next: u32,
     seqs: HashMap<u32, (Vec<u8>, u64)>,
+    /// 重传埋点（spec §15.3），take_stats 取走即归零。
+    stats: RetxStats,
 }
 
 impl RetxBuf {
     pub fn new(start: u32) -> Self {
-        Self { next: start, seqs: HashMap::new() }
+        Self { next: start, seqs: HashMap::new(), stats: RetxStats::default() }
+    }
+    /// 取走本窗口统计并归零（spec §15.3）。
+    /// 峰值由 on_send 维护，这里只取走与重置。
+    pub fn take_stats(&mut self) -> RetxStats {
+        std::mem::take(&mut self.stats)
     }
     /// 登记一次发送，返回分配的 seq。
     pub fn on_send(&mut self, payload: Vec<u8>) -> u32 {
         let s = self.next;
         self.next = self.next.wrapping_add(1);
         self.seqs.insert(s, (payload, now_ms()));
+        // spec §15.3：峰值唯一来源——只在插入后更新，on_ack 不抹平。
+        if self.seqs.len() > self.stats.backlog_max {
+            self.stats.backlog_max = self.seqs.len();
+        }
         s
     }
     /// 对端 ACK：清累积确认（<=ack）+ SACK 洞外已到包。
@@ -708,5 +732,39 @@ mod tests {
         let mut r2 = super::CtrlReasm::new();
         let (_, pl) = crate::common::proto::decode_data(&one[0]).unwrap();
         assert_eq!(r2.feed(pl).unwrap(), small);
+    }
+
+    #[test]
+    fn retx_stats_starts_zero() {
+        let mut b = super::RetxBuf::new(0);
+        let s = b.take_stats();
+        assert_eq!(s.sent, 0);
+        assert_eq!(s.abandoned, 0);
+        assert_eq!(s.full, 0);
+        assert_eq!(s.backlog_max, 0);
+    }
+
+    #[test]
+    fn retx_stats_tracks_backlog_peak() {
+        let mut b = super::RetxBuf::new(0);
+        for _ in 0..100 {
+            b.on_send(vec![1u8; 10]);
+        }
+        // 全部 ACK 后 backlog 归零，但峰值必须保留 100
+        b.on_ack(100, &[0u8; 32]);
+        let s = b.take_stats();
+        assert_eq!(s.backlog_max, 100, "峰值必须保留，不能被 ACK 抹平");
+    }
+
+    #[test]
+    fn retx_stats_take_resets() {
+        let mut b = super::RetxBuf::new(0);
+        for _ in 0..5 {
+            b.on_send(vec![1u8; 10]);
+        }
+        let first = b.take_stats();
+        assert_eq!(first.backlog_max, 5);
+        let second = b.take_stats();
+        assert_eq!(second, super::RetxStats::default(), "取走后必须归零");
     }
 }
