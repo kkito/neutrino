@@ -635,6 +635,28 @@ pub(crate) fn snapshot_agents(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// desired 清空（hostname 不在表里）必须推出空表，而不是“不推”。
+    /// 旧实现只遍历 fresh，空表时连循环都不进 -> 在线 agent 的隧道永远留着。
+    #[test]
+    fn proxies_to_push_clears_when_hostname_absent() {
+        let mut desired: HashMap<String, Vec<ProxyConfig>> = HashMap::new();
+        let old = ProxyConfig {
+            name: "web".into(), ptype: "http".into(), local_ip: "127.0.0.1".into(),
+            local_port: 80, remote_port: 0, domains: vec!["w.e2e.test".into()],
+            set_x_forwarded_proto: None, basic_auth: None, enabled: true,
+            link_agent: String::new(), link_host: String::new(), link_port: 0,
+            rate_limit: None,
+        };
+        // 有该 hostname：推它自己的表
+        desired.insert("e2e".into(), vec![old.clone()]);
+        assert_eq!(proxies_to_push(&desired, "e2e"), vec![old.clone()]);
+        // 清空 desired：必须推空（显式清空），否则 agent 侧路由残留
+        desired.clear();
+        assert!(proxies_to_push(&desired, "e2e").is_empty(), "清空 desired 必须推空表");
+        // 完全没列出的 hostname 同样推空
+        assert!(proxies_to_push(&desired, "other").is_empty());
+    }
     #[test]
     fn snapshot_agents_merges_atomic_counters() {
         // HK 2026-10-23：deliver/写泵的每包增量只落 ctr_*，5s tick 才合进 info。
@@ -1030,4 +1052,16 @@ mod tests {
         assert!(resolve_proxies(None, vec![]).is_empty());
     }
 
+}
+
+/// desired reload 后应推给某个在线 hostname 的代理表。
+///
+/// 根因→修法：原 `api_desired_reload` 只遍历 `fresh`（新 desired 里存在的 hostname），
+/// 于是把 desired 改成空表（清空所有隧道）时循环一次都不走 —— 在线 agent 收不到
+/// 空 Config，`s.desired` 空了但 `agents[].info.proxies` 仍是旧的，隧道照旧可访问。
+/// 表现为 e2e `local_ingress_http_names` 里“清空后路由不消失”（改前偶发、全量必红）。
+///
+/// 语义：desired 里列出该 hostname → 用它；未列出 → 推空表（显式清空）。
+pub(crate) fn proxies_to_push(desired: &HashMap<String, Vec<ProxyConfig>>, hostname: &str) -> Vec<ProxyConfig> {
+    desired.get(hostname).cloned().unwrap_or_default()
 }

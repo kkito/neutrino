@@ -1,7 +1,7 @@
 //! server WebUI API：login/overview/tunnels/logs/config/desired/toggle。
 use crate::common::proto::*;
 use super::auth::{auth_ok, mint_jwt, unauthorized};
-use super::state::{apply_proxies_for_agent, log_ev, log_ev_err, AgentInfo, ConnInfo, S};
+use super::state::{apply_proxies_for_agent, log_ev, log_ev_err, proxies_to_push, AgentInfo, ConnInfo, S};
 use axum::{extract::{Path, Query, State}, http::{header, HeaderMap, StatusCode}, response::{Html, IntoResponse, Json}};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
@@ -720,9 +720,21 @@ pub(crate) async fn api_desired_reload(
     let reloaded: usize = fresh.values().map(|v| v.len()).sum();
     *s.desired.write().await = fresh.clone();
     *s.egress_exit.write().await = exit;
-    // 对在线 agent 按 hostname 推送（复用 api_desired_set 后半段语义，不落盘）
+    // 对在线 agent 按 hostname 推送（复用 api_desired_set 后半段语义，不落盘）。
+    // 根因→修法：原实现只遍历 `fresh`（新 desired 里存在的 hostname），于是把 desired
+    // 清空（`[agents]` 空表）时循环一次都不进 —— 在线 agent 收不到空 Config，
+    // 隧道照旧可访问（e2e `local_ingress_http_names` 的“清空后路由不消失”）。
+    // 现改为遍历「desired 里的 hostname ∪ 当前在线 agent 的 hostname」：
+    // 未列出的 hostname 用 proxies_to_push 得到空表并显式下发，才真正做到清空。
     let mut pushed = 0;
-    for (hostname, proxies) in &fresh {
+    let mut hostnames: Vec<String> = fresh.keys().cloned().collect();
+    for hh in s.agents.read().await.values() {
+        if !hostnames.contains(&hh.info.hostname) {
+            hostnames.push(hh.info.hostname.clone());
+        }
+    }
+    for hostname in &hostnames {
+        let proxies = proxies_to_push(&fresh, hostname);
         let targets: Vec<(String, mpsc::UnboundedSender<ServerMsg>)> = {
             s.agents
                 .read()
@@ -734,7 +746,7 @@ pub(crate) async fn api_desired_reload(
         };
         for (aid, ctl) in &targets {
             let _ = ctl.send(ServerMsg::Config { proxies: proxies.clone() });
-            apply_proxies_for_agent(&s, aid, proxies).await;
+            apply_proxies_for_agent(&s, aid, &proxies).await;
             pushed += 1;
         }
     }
