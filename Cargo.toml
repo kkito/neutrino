@@ -25,7 +25,7 @@ axum-test = "17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono", "registry"] }
 anyhow = "1"
 libc = "0.2"
 thiserror = "1"

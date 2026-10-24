@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod common;
+pub mod log_level;
 pub mod server;
 
 pub(crate) use server::auth::{mint_jwt as server_mint_jwt, verify_jwt as server_auth_verify};
@@ -198,14 +199,20 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    // stdout 时间戳用本地 wall clock（默认 SystemTime 打 UTC，如 HKT 机器 18:00 打成 10:00Z）。
-    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%dT%H:%M:%S%.3f%:z".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stdout)
-        .with_timer(timer)
-        .init();
+    // spec §16.5：可 reload 的日志层（SIGUSR1 临时开 debug 60s 用）。
+    // 内部仍读 RUST_LOG，行为与非 reload 版一致。必须在 Cli::parse() **之前**
+    // 初始化，否则参数错误时没有日志输出。
+    log_level::install();
     let cli = Cli::parse();
+    // 信号开关：注册失败绠不能假装可用（SIGUSR1 默认行为是杀进程）。
+    let sig_ok = log_level::spawn_signal_handler();
+    if !sig_ok {
+        tracing::warn!("signal-based log level unavailable; use RUST_LOG env var instead");
+    }
+    println!(
+        "{}",
+        log_level::hint_line(sig_ok, log_level::restore_target())
+    );
     match cli.cmd {
         Cmd::Server {
             listen,
