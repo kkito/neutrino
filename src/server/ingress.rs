@@ -578,9 +578,11 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         };
                         let hostname = s3.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
                         let sid = next_sid();
-                        // 建连日志（每连接一行，量可接受；断开在双泵结束处记）：
-                        // 之前连上谁/去哪/限速多少全黑盒，BT flood 时连 conns 数都看不到。
-                        tracing::info!("tcp accept :{port} peer={peer} -> sid={sid} tunnel={pname} target={target} limit={}", rate_bps.map(|b| b.to_string()).unwrap_or_else(|| "none".into()));
+                        // 建连日志：降 DEBUG（spec §15.4）。2026-10-23 BT flood 时
+                        // 这里 800 条/分把 INFO 层刷屏，事故信号全被淹没；
+                        // INFO 层改由 per-tunnel 每分钟汇总承担（Task 0b-4），
+                        // 需要逐连接明细时 `RUST_LOG=debug` 按需打开。
+                        tracing::debug!("tcp accept :{port} peer={peer} -> sid={sid} tunnel={pname} target={target} limit={}", rate_bps.map(|b| b.to_string()).unwrap_or_else(|| "none".into()));
                         // 连接快照行（双泵结束处 remove）
                         {
                             let mut m = s3.conns.write().await;
@@ -712,9 +714,9 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         if let Some(h) = s3.agents.read().await.get(&aid) {
                             h.incoming.write().await.remove(&sid);
                         }
-                        // 断开日志：conns 行累计 rx/tx 一起记，连接泄漏/流量对不上时有据可查。
+                        // 断开日志：降 DEBUG（spec §15.4），汇总由 per-tunnel tick 承担。
                         if let Some(c) = s3.conns.write().await.remove(&(sid as u64)) {
-                            tracing::info!("tcp close :{port} peer={peer} sid={sid} rx={} tx={}", c.rx, c.tx);
+                            tracing::debug!("tcp close :{port} peer={peer} sid={sid} rx={} tx={}", c.rx, c.tx);
                         }
                         let _ = ctl.send(ServerMsg::Close {
                             stream: sid,
@@ -1129,4 +1131,33 @@ mod tests {
         assert!(rest2.is_empty());
     }
 
+    /// spec §15.4：accept/close 明细必须降 DEBUG。
+    /// 2026-10-23 现场：800 条/分里 99% 是这两行，事故时 INFO 层被刷屏淹没。
+    /// 用源码断言而非运行时断言，零成本防回归。
+    #[test]
+    fn accept_log_level_is_debug() {
+        // 注意：include_str! 会把本测试自身的字符串也算进去，
+        // 故断言用的 needle 必须拼接构造，不能写字面量（否则自匹配恒真）。
+        let dbg = concat!("tracing::deb", "ug!(");
+        let inf = concat!("tracing::inf", "o!(");
+        let acc = "\"tcp accept";
+        let clo = "\"tcp close";
+        let src = include_str!("ingress.rs");
+        assert!(
+            src.contains(&format!("{dbg}{acc}")),
+            "tcp accept 必须降级为 debug"
+        );
+        assert!(
+            src.contains(&format!("{dbg}{clo}")),
+            "tcp close 必须降级为 debug"
+        );
+        assert!(
+            !src.contains(&format!("{inf}{acc}")),
+            "tcp accept 不能是 info（回归）"
+        );
+        assert!(
+            !src.contains(&format!("{inf}{clo}")),
+            "tcp close 不能是 info（回归）"
+        );
+    }
 }
