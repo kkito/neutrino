@@ -3516,3 +3516,77 @@ async fn e2e_retx_stats_line_format() {
     }
     drop(env);
 }
+
+/// spec §16.4：UDP ingress 必须累计 tunnel_stats。
+/// 旧代码只有 TCP/HTTP 埋点，UDP 路径一处都没有——而 BT 的 tracker/DHT/uTP
+/// 全走 UDP，等于最重的流量在汇总行里不存在。
+///
+/// 断言抓什么：打一次 UDP 包后，`tunnel stats <host>/<proxy> accepts=` 必须 >=1。
+/// 回退验证：注释掉 udp 分支的 accepts += 1，本用例必须变红。
+///
+/// 注意：server 把 UDP ingress socket 的 SO_RCVBUF 钳到 64KB（故意限速设计），
+/// 突发灌包会在 ingress 之前被内核丢掉，实测恒定只进 ~137 个。所以这里只发
+/// 少量包并错峰，不做洪泛。
+#[tokio::test]
+async fn e2e_udp_tunnel_stats_line_emitted() {
+    // 一个回显的 UDP 后端
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = [0u8; 2048];
+        loop {
+            let Ok((n, peer)) = back.recv_from(&mut b).await else {
+                return;
+            };
+            let _ = back.send_to(&b[..n], peer).await;
+        }
+    });
+    // 隧道配在 server 的 desired.toml（desired 是唯一源头）。
+    // remote_port 必须用 free_port() 另取：直接复用 bport 会和后端 socket 撞车
+    // （server udp bind 报 Address already in use，隧道根本没建起来）。
+    let rport = free_port();
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"udpstats\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\n\
+         remote_port={rport}\n"
+    );
+    let (env, log) = boot_with_logfile("", Some(&desired)).await;
+    let n = wait_agents_count(env.http_port, 1, 40).await;
+    assert_eq!(n, 1, "agent 没上线，日志类断言无意义");
+    // 少量错峰发包（不做洪泛，见函数注释）
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for _ in 0..5u8 {
+        let _ = cli.send_to(&[b'x'; 32], ("127.0.0.1", rport)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 等汇总行出现（traffic tick 50ms；上限 3s 兜底）
+    assert!(
+        wait_log_contains(&log, "tunnel stats ", 60),
+        "缺少 per-tunnel 汇总行\n--- log ---\n{}",
+        read_log(&log)
+    );
+    let text = read_log(&log);
+    // 注意：tick 每轮 drain 归零，accepts 只会出现在「建 session 那一轮」的汇总行，
+    // 之后的轮次是 accepts=0。所以必须扫**所有**行取最大值，不能只看最后一行
+    // （只发 5 个包时，第 1 包建会话，后 4 包只累加 rx/tx）。
+    let mut max_accepts: u64 = 0;
+    let mut n_lines = 0;
+    for l in text.lines().filter(|l| l.contains("tunnel stats e2e/udpstats")) {
+        n_lines += 1;
+        let a: u64 = l
+            .split("accepts=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        max_accepts = max_accepts.max(a);
+    }
+    assert!(
+        n_lines > 0,
+        "没有 udpstats 的汇总行\n--- log ---\n{text}"
+    );
+    assert!(
+        max_accepts >= 1,
+        "UDP 隧道必须累计 accepts（旧代码 UDP 路径完全没有 tunnel_stats 埋点）\
+         ；扫了 {n_lines} 行都是 0\n--- log ---\n{text}"
+    );
+}

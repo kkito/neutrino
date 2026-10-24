@@ -852,6 +852,12 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         // 包循环零分支：UDP 整包直达 outbox 会被 kudus 写泵按 TCP 切片拆碎。
         use crate::server::ratelimit::RateLimiter;
         let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>, mpsc::UnboundedSender<ServerMsg>)> = HashMap::new();
+        // spec §16.4：sid -> "hostname/proxyname"，供 tunnel_stats 累加用。
+        // 为什么旁挂而不塞进 sessions 元组：元组已有 5 个字段，再塞一个要动所有
+        // 解构模式（get_mut / retain / 各遍历点）。旁挂表代价更低。
+        // 必须与 sessions 同步回收（见下方两处 retain），否则 agent 主动 Close
+        // （池满踢流、断线）这些不走 TTL 的路径会让它无限增长。
+        let mut sid_stats: HashMap<u32, String> = HashMap::new();
         let mut buf = vec![0u8; 65535];
         // TTL 语义：该 peer 静默多久就回收。每收一包都刷新 t（见下方 get_mut 分支），
         // 所以活跃 uTP 长连接永不过期，DHT 一问一答 / 扫描器发一次就走 → 秒级清掉。
@@ -877,14 +883,29 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                         let _ = ctl.send(ServerMsg::Close { stream: *id, reason: "udp idle".into() });
                     }
                 }
+                // spec §16.4：先累加 closes 再删旁挂表——顺序反了 sid_stats 里
+                // 已经查不到 key，closes 会永远是 0。
+                if let Ok(mut m) = s2.tunnel_stats.lock() {
+                    for sid_d in dead_set.iter() {
+                        if let Some(key) = sid_stats.get(sid_d) {
+                            m.entry(key.clone()).or_default().closes += 1;
+                        }
+                    }
+                }
+                for sid_d in dead_set.iter() {
+                    sid_stats.remove(sid_d);
+                }
             }
             sessions.retain(|_, (_, t, _, _, _)| t.elapsed() < ttl);
-            if n_exp > 0 {
-                tracing::debug!("udp :{port} expired {n_exp} sessions ({} alive)", sessions.len());
-            }
+            // agent 主动 Close（池满踢流/断线）不走 TTL 路径，用同一次 retain 对齐清理，
+            // 否则这些 sid 会永久留在旁挂表里。
             {
                 let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _, _, _, _)| *id).collect();
+                sid_stats.retain(|sid_d, _| live.contains(sid_d));
                 s2.conns.write().await.retain(|_, c| c.proto != "udp" || live.contains(&(c.id as u32)));
+            }
+            if n_exp > 0 {
+                tracing::debug!("udp :{port} expired {n_exp} sessions ({} alive)", sessions.len());
             }
             // recv_from 必须带超时：过期检查在循环顶部，旧代码不带超时就会一直
             // 阻塞在这里——只要对端不发新包，过期检查永远轮不到执行，TTL 形同虚设
@@ -935,7 +956,7 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     // 建 limiter + 缓存 outbox，后续每包零锁。
                     let sock2 = sock.clone();
                     let s3 = s2.clone();
-                    let (_sess_host, sess_key, _sess_pname, sess_bps) = {
+                    let (sess_host, sess_key, sess_pname, sess_bps) = {
                         let ag = s2.agents.read().await;
                         let snap: Vec<(&str, Vec<ProxyConfig>)> = ag.values().map(|h| (h.info.hostname.as_str(), h.info.proxies.clone())).collect();
                         match resolve_udp_session(&snap, port) {
@@ -949,6 +970,10 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                         None => None,
                     };
                     let up_limiter = sess_limiter.clone();
+                    // spec §16.4：隧道级 tx 在回包路径累加。key 必须在 spawn 前克隆进去——
+                    // sid_stats 是循环局部变量，闭包捕获会与主循环的借用冲突。
+                    let tx_key = format!("{sess_host}/{sess_pname}");
+                    let s_tx = s3.clone();
                     tokio::spawn(async move {
                         while let Some(chunk) = drx.recv().await {
                             if let Some(l) = &up_limiter {
@@ -965,6 +990,9 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                                     c.tx += chunk.len() as u64;
                                 }
                             }
+                            if let Ok(mut m) = s_tx.tunnel_stats.lock() {
+                                m.entry(tx_key.clone()).or_default().tx += chunk.len() as u64;
+                            }
                             let _ = sock2.send_to(&chunk, peer).await;
                             // agent 级 tx 不在此记（包循环零 agents 锁；conns 行 tx 已记，
                             // 总量由 persist 循环批量刷）。
@@ -972,7 +1000,18 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     });
                     // session 级日志（建时一次，包循环不打）：UDP flood 排查看 session 数，
                     // 每包日志会把盘打爆。
-                    tracing::info!("udp session {peer} -> sid={id} tunnel={_sess_pname} host={_sess_host}");
+                    // spec §16.4 ④：udp session 单连接明细降 DEBUG（同类日志 tcp accept/close
+                    // 已在 258330e 降级，只留 udp 在 INFO 会不一致）。
+                    tracing::debug!("udp session {peer} -> sid={id} tunnel={sess_pname} host={sess_host}");
+                    // spec §16.4 ③：accepts 语义 = 新建会话数（非收包数），与 TCP 的
+                    // 「建立连接」对等，accepts/closes 配对才有意义；包量由 rx/tx 字节体现。
+                    {
+                        let key = format!("{sess_host}/{sess_pname}");
+                        if let Ok(mut m) = s2.tunnel_stats.lock() {
+                            m.entry(key.clone()).or_default().accepts += 1;
+                        }
+                        sid_stats.insert(id, key);
+                    }
                     sessions.insert(peer, (id, Instant::now(), out_cached, sess_limiter, ctl.clone()));
                     // UDP 连接行（peer 一行；since 每次收包刷新见下）
                     {
@@ -1027,6 +1066,13 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                 if let Some(c) = m.values_mut().find(|c| c.proto == "udp" && c.peer == peer_s) {
                     c.rx += payload.len() as u64;
                     c.since = chrono::Local::now().timestamp();
+                }
+            }
+            // spec §16.4 ③：隧道级 rx 同样在包路径累加（不是 tick 扫表——
+            // UDP 会话关得快，扫表会严重偏低）。
+            if let Some(key) = sid_stats.get(&sid) {
+                if let Ok(mut m) = s2.tunnel_stats.lock() {
+                    m.entry(key.clone()).or_default().rx += payload.len() as u64;
                 }
             }
             // 发给 session 建时缓存的 outbox sender（零 agents 锁）。
