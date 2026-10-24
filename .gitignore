@@ -5,5 +5,9 @@ agent.toml
 agent.toml.webpass
 *.webpass
 neutrino-agent.log
-# 线上事故复盘：本地记录，不进仓库（含真实 IP / token / 内网拓扑）
-docs/incidents/
+# 线上事故复盘：markdown 入库（已脱敏：公网 IP / token / 内网地址均为占位符），
+# 部署脚本与本地运行产物不入库。改 .md 时务必先跑：
+#   grep -rnE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]{40}' docs/incidents/*.md
+# 确认只剩 127.0.0.1 / 0.0.0.0 / 容器网段等无信息量的值。
+docs/incidents/*
+!docs/incidents/*.md
