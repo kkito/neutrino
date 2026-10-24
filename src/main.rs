@@ -92,6 +92,14 @@ enum Cmd {
     Genhash { password: String },
 }
 
+/// --log-file 只在 --detach 时生效（spec §15.5）。
+///
+/// 根因→修法：旧代码在 systemd（非 detach）下传 `--log-file` 会被静默忽略
+/// （tracing 固定写 stdout），运维以为日志写进了文件，实际只在 journal 里。
+fn should_warn_log_file_ignored(detach: bool, log_file: &str) -> bool {
+    !detach && !log_file.is_empty()
+}
+
 /// Strip the `--detach` flag from argv for the background respawn.
 fn strip_detach(args: Vec<String>) -> Vec<String> {
     args.into_iter().filter(|a| a != "--detach").collect()
@@ -139,6 +147,22 @@ fn detach_spawn(log_file: &str, pid_file: &str) -> anyhow::Result<()> {
 mod main_tests {
     use super::strip_detach;
     use clap::Parser;
+
+    /// spec §15.5：--log-file 只在 --detach 时生效。
+    /// 旧代码：systemd（非 detach）下传了完全无效且无任何提示。
+    #[test]
+    fn log_file_warns_when_ignored() {
+        assert!(
+            super::should_warn_log_file_ignored(false, "/tmp/x.log"),
+            "非 detach 传了 --log-file 应 warn"
+        );
+        assert!(
+            !super::should_warn_log_file_ignored(true, "/tmp/x.log"),
+            "detach 时生效，不 warn"
+        );
+        assert!(!super::should_warn_log_file_ignored(false, ""), "未传不 warn");
+        assert!(!super::should_warn_log_file_ignored(true, ""), "detach 未传不 warn");
+    }
 
     #[test]
     fn agent_admin_switch_defaults_off() {
@@ -197,6 +221,11 @@ async fn main() -> anyhow::Result<()> {
             limiter_tick_ms,
             persist_tick_ms,
         } => {
+            if should_warn_log_file_ignored(detach, &log_file) {
+                tracing::warn!(
+                    "--log-file 仅在 --detach 时生效，当前已忽略；systemd 场景请用 journalctl -u <unit>"
+                );
+            }
             let log = if log_file.is_empty() {
                 format!("{data}/neutrino.log")
             } else {
@@ -216,6 +245,11 @@ async fn main() -> anyhow::Result<()> {
             server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, ticks).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
+            if should_warn_log_file_ignored(detach, &log_file) {
+                tracing::warn!(
+                    "--log-file 仅在 --detach 时生效，当前已忽略；systemd 场景请用 journalctl -u <unit>"
+                );
+            }
             let log = if log_file.is_empty() {
                 "./neutrino-agent.log".to_string()
             } else {
