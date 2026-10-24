@@ -35,6 +35,41 @@ pub(crate) struct AgentHandle {
     pub(crate) pending: Arc<RwLock<HashMap<u32, Vec<Vec<u8>>>>>,
 }
 
+/// 隧道级累计（spec §15.4）。在「关闭时刻」累加，不等 tick 扫表——
+/// conns 表 close 即 remove，扫表只能看到存活连接，BT 短连接会严重偏低。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TunnelStats {
+    pub(crate) accepts: u64,
+    pub(crate) closes: u64,
+    pub(crate) rx: u64,
+    pub(crate) tx: u64,
+    /// first-chunk timeout 次数
+    pub(crate) stick: u64,
+}
+
+/// 取走并清空（tick 汇总用）。取走即归零，下轮重新累计。
+pub(crate) fn drain_tunnel_stats(
+    m: &mut HashMap<String, TunnelStats>,
+) -> HashMap<String, TunnelStats> {
+    std::mem::take(m)
+}
+
+/// 人类可读字节数（日志用）。
+pub(crate) fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n}B")
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Shared {
     pub(crate) agents: RwLock<HashMap<String, AgentHandle>>,
@@ -82,6 +117,9 @@ pub(crate) struct Shared {
     pub(crate) drop_hits: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// warn 限流表：key -> 上次 warn 的 unix ts，纯内存不落盘。
     pub(crate) drop_warn: std::sync::Mutex<HashMap<String, i64>>,
+    /// 隧道级累计（spec §15.4），key = tunnel 名（如 "minipc7s/trans-bt"）。
+    /// 在 accept/close/first-chunk timeout 三处累加，traffic tick 取走即归零。
+    pub(crate) tunnel_stats: std::sync::Mutex<HashMap<String, TunnelStats>>,
     /// 当前连接快照：key = conn id
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
     /// --listen 解析出的公网端口（HTTP fallback 连接行用）
@@ -1052,6 +1090,44 @@ mod tests {
         assert!(resolve_proxies(None, vec![]).is_empty());
     }
 
+
+    #[test]
+    fn tunnel_stats_accumulate_and_drain() {
+        let mut st = super::TunnelStats::default();
+        st.accepts += 2;
+        st.closes += 1;
+        st.rx += 100;
+        st.tx += 200;
+        st.stick += 1;
+        assert_eq!(st.accepts, 2);
+        assert_eq!(st.closes, 1);
+        assert_eq!(st.rx, 100);
+        assert_eq!(st.tx, 200);
+        assert_eq!(st.stick, 1);
+    }
+
+    #[test]
+    fn tunnel_stats_drain_returns_and_clears() {
+        let mut m: std::collections::HashMap<String, super::TunnelStats> =
+            std::collections::HashMap::new();
+        let e = m.entry("a/bt".into()).or_default();
+        e.accepts = 5;
+        e.rx = 1024;
+        let drained = super::drain_tunnel_stats(&mut m);
+        assert_eq!(drained.len(), 1);
+        let s = &drained["a/bt"];
+        assert_eq!(s.accepts, 5);
+        assert_eq!(s.rx, 1024);
+        assert!(m.is_empty(), "取走后必须清空，下轮重新累计");
+    }
+
+    #[test]
+    fn tunnel_stats_format_human_bytes() {
+        assert_eq!(super::fmt_bytes(0), "0B");
+        assert_eq!(super::fmt_bytes(1023), "1023B");
+        assert_eq!(super::fmt_bytes(1024), "1.0KB");
+        assert_eq!(super::fmt_bytes(1024 * 1024 * 12 + 1024 * 300), "12.3MB");
+    }
 }
 
 /// desired reload 后应推给某个在线 hostname 的代理表。
