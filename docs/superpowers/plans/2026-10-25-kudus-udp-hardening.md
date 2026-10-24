@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 修掉 kudus 重传缓冲无上限导致的流量自我放大（事故实测超限 42 倍），并把 agent 侧 UDP 出站从「一会话一 socket + 64KB buffer」改成「动态池复用 + 2KB buffer」。
+**Goal:** 修掉 kudus 重传缓冲无上限导致的流量自我放大（事故实测超限 42 倍），并把 agent 侧 UDP 出站从「一会话一 socket + 64KB buffer」改成「动态池复用 + 2KB buffer」；同时补上可观测性（重传埋点 + 降噪 + 留存），使下次事故可被定位。
 
-**Architecture:** 分三层独立推进。层 1 重构 `common/kudus.rs::RetxBuf`（容量上限 + 重传计数 + 指数退避 + 放弃），层 2 修背压失效（server 侧 `bail!` 关会话、agent 侧超时丢包），层 3 新增 `agent/udp_pool.rs` 纯逻辑池模块并接入 `kudus_session.rs`。层 1↔2 是同一事故上下游必须一起修；层 3 完全独立。
+**Architecture:** 先做阶段 0（可观测性，spec §15）：`RetxStats` 埋点、accept/close 降 DEBUG + per-tunnel 汇总、journald 留存。再做三层止血：层 1 重构 `common/kudus.rs::RetxBuf`（容量上限 + 重传计数 + 指数退避 + 放弃），层 2 修背压失效（server 侧 `bail!` 关会话、agent 侧超时丢包），层 3 新增 `agent/udp_pool.rs` 纯逻辑池模块并接入 `kudus_session.rs`。层 1↔2 是同一事故上下游必须一起修；层 3 完全独立。**先有埋点再做修复，才能用真实计数验证「放大被封住」。**
 
 **Tech Stack:** Rust 2021、tokio（async runtime / `Mutex` / `Semaphore`）、`tracing`（日志）、`anyhow`（错误）、cargo test（单测 + `tests/e2e.rs` 真子进程 e2e）。
 
@@ -22,11 +22,16 @@
 
 | 文件 | 职责 | 动作 |
 | --- | --- | --- |
-| `src/common/kudus.rs` | kudus 可靠传输核心：`RetxBuf`、常量、分片 | **改**：RetxBuf 重构 + 新常量 + 单测 |
-| `src/server/kudus.rs` | server 侧 kudus 会话：写泵、重传泵、背压 | **改**：两处背压改 `bail!` + 抽常量 |
-| `src/agent/kudus_session.rs` | agent 侧 kudus 会话：UDP 流开闭、发送 | **改**：buffer 2048、`wait_window` 返回 bool、池接入、超时 5s |
+| `src/common/kudus.rs` | kudus 可靠传输核心：`RetxBuf`、常量、分片 | **改**：RetxStats 埋点（阶段 0a）+ RetxBuf 重构 + 新常量 + 单测 |
+| `src/server/kudus.rs` | server 侧 kudus 会话：写泵、重传泵、背压 | **改**：两处背压改 `bail!` + 抽常量 + retx 汇总采集 |
+| `src/agent/kudus_session.rs` | agent 侧 kudus 会话：UDP 流开闭、发送 | **改**：buffer 2048、`wait_window` 返回 bool、池接入、超时 5s、retx 汇总采集 |
 | `src/agent/udp_pool.rs` | **新建**：UDP socket 池纯逻辑（分配/LRU/扩容），无 IO | **建** |
 | `src/agent/mod.rs` | agent 子模块声明 | **改**：加 `pub mod udp_pool;` |
+| `src/server/state.rs` | server 全局状态 | **改**（阶段 0b）：`TunnelStats` + `drain_tunnel_stats` + `fmt_bytes` |
+| `src/server/ingress.rs` | TCP/UDP 入站 | **改**（阶段 0b）：accept/close 降 DEBUG + 三处 TunnelStats 累加 |
+| `src/server/mod.rs` | server 装配与后台 tick | **改**（阶段 0b）：per-tunnel / retx 汇总行输出 |
+| `src/main.rs` | CLI 入口 | **改**（阶段 0c）：`--log-file` 被忽略时 warn |
+| `deploy/journald-neutrino.conf` | journald 留存配置 | **建**（阶段 0c） |
 | `tests/e2e.rs` | 端到端测试（真子进程 + 随机端口） | **改**：加 2 个 e2e |
 
 **为什么新建 `udp_pool.rs`：** 池的分配/LRU/扩容决策是纯逻辑，抽出来后可以完全单测（不需要真 socket、不需要 tokio runtime），也让 `kudus_session.rs`（已 800+ 行）不再膨胀。符合 spec §7.2。
@@ -37,12 +42,862 @@
 
 | 阶段 | Tasks | 说明 |
 | --- | --- | --- |
+| **阶段 0：可观测性** | **0a-1~0c-2** | **必须先做**：先有计数器，阶段 1 才能验证修复效果 |
 | 阶段 1：RetxBuf | Task 1-5 | 止血核心，必须在阶段 2 之前 |
 | 阶段 2：背压 | Task 6-7 | 依赖阶段 1 的常量 |
 | 阶段 3：buffer | Task 8 | 独立 |
 | 阶段 4：池模块 | Task 9-12 | 纯逻辑，独立 |
 | 阶段 5：池接入 | Task 13-15 | 依赖阶段 4 |
 | 阶段 6：e2e + 回归 | Task 16-17 | 依赖阶段 1-5 |
+| **阶段 7：可观测性 e2e** | **Task 18** | 依赖阶段 0 + 阶段 1 |
+
+> **`full`/`abandoned` 埋点的特殊依赖**：Task 0a-3 依赖阶段 1 的 `RetxFull` 与
+> `KUDUS_MAX_RETX`。**推荐执行顺序**：0a-1 → 0a-2（只做 `sent`）→ 0b 全部 → 0c 全部
+> → 阶段 1（Task 1-5）→ **回来做 0a-3**。阶段 1 的 Task 2/4 完成后再补这两个埋点。
+
+---
+
+## 阶段 0：可观测性补强（对应 spec §15，**必须先做**）
+
+> **为什么排在最前**：阶段 1 要重构 `RetxBuf`。先埋好 `RetxStats` 计数器，
+> 阶段 1 改完就能**用真实计数验证「放大被封住」**，而不是只靠单测猜。
+> 详见 spec §15.1 / §15.7 / §11。
+
+---
+
+### Task 0a-1: `RetxStats` 结构 + `take_stats`
+
+**Files:**
+- Modify: `src/common/kudus.rs:112-166`（`RetxBuf` 定义与 `impl`）
+- Test: `src/common/kudus.rs`（文件末尾 `mod tests`，若无则新建）
+
+- [ ] **Step 1: 写失败测试**
+
+在 `src/common/kudus.rs` 的 `mod tests` 中加：
+
+```rust
+#[test]
+fn retx_stats_starts_zero() {
+    let b = RetxBuf::new(0);
+    let s = b.take_stats();
+    assert_eq!(s.sent, 0);
+    assert_eq!(s.abandoned, 0);
+    assert_eq!(s.full, 0);
+    assert_eq!(s.backlog_max, 0);
+}
+
+#[test]
+fn retx_stats_tracks_backlog_peak() {
+    let mut b = RetxBuf::new(0);
+    for _ in 0..100 {
+        b.on_send(vec![1u8; 10]);
+    }
+    // 全部 ACK 后 backlog 归零，但峰值应保留 100
+    b.on_ack(100, &[0u8; 32]);
+    let s = b.take_stats();
+    assert_eq!(s.backlog_max, 100, "峰值必须保留，不能被 ACK 抹平");
+}
+
+#[test]
+fn retx_stats_take_resets() {
+    let mut b = RetxBuf::new(0);
+    for _ in 0..5 {
+        b.on_send(vec![1u8; 10]);
+    }
+    let first = b.take_stats();
+    assert_eq!(first.backlog_max, 5);
+    let second = b.take_stats();
+    assert_eq!(second, RetxStats::default(), "取走后必须归零");
+}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test --bin neutrino retx_stats`
+Expected: FAIL — `cannot find type RetxStats` / `no method take_stats`
+
+- [ ] **Step 3: 最小实现**
+
+在 `src/common/kudus.rs` 中，`pub struct RetxBuf` **之前**加：
+
+```rust
+/// 重传埋点（spec §15.3）。取走即归零，tick 汇总打增量。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetxStats {
+    /// take_expired 实际重发的包数
+    pub sent: u64,
+    /// 重传超上限被真丢弃的包数
+    pub abandoned: u64,
+    /// RetxFull 拒收次数
+    pub full: u64,
+    /// 本窗口内未确认包峰值
+    pub backlog_max: usize,
+}
+```
+
+`RetxBuf` 加字段（现有两个字段之后）：
+
+```rust
+pub struct RetxBuf {
+    next: u32,
+    seqs: HashMap<u32, (Vec<u8>, u64)>,
+    stats: RetxStats,   // 新增
+}
+```
+
+`RetxBuf::new` 改：
+
+```rust
+pub fn new(start: u32) -> Self {
+    Self { next: start, seqs: HashMap::new(), stats: RetxStats::default() }
+}
+```
+
+`impl RetxBuf` 内加：
+
+```rust
+/// 取走本窗口统计并归零（spec §15.3）。
+/// 峰值由 on_send 维护，这里只取走与重置。
+pub fn take_stats(&mut self) -> RetxStats {
+    std::mem::take(&mut self.stats)
+}
+
+```
+
+`on_send` 中插入后更新峰值：
+
+```rust
+pub fn on_send(&mut self, payload: Vec<u8>) -> u32 {
+    let s = self.next;
+    self.next = self.next.wrapping_add(1);
+    self.seqs.insert(s, (payload, now_ms()));
+    if self.seqs.len() > self.stats.backlog_max {
+        self.stats.backlog_max = self.seqs.len();
+    }
+    s
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test --bin neutrino retx_stats`
+Expected: PASS（3 个测试全绿）
+
+- [ ] **Step 5: 全量验证 + 提交**
+
+```bash
+make build && cargo test --bin neutrino kudus
+git add src/common/kudus.rs
+git commit -m "feat(kudus): RetxStats 埋点结构 + backlog 峰值跟踪
+
+spec §15.3 第一步：只加计数器，不改任何重传/放弃判定逻辑。
+backlog_max 在 on_send 插入后更新（唯一峰值来源），take_stats 取走即归零。"
+```
+
+---
+
+### Task 0a-2: `sent` 埋点（take_expired）
+
+> 本 task 只做 `sent`，它不依赖阶段 1。`full`/`abandoned` 见 Task 0a-3。
+> **推荐顺序**：0a-1 → 0a-2 → 0b 全部 → 0c 全部 → 阶段 1 → 回来做 0a-3。
+
+**Files:**
+- Modify: `src/common/kudus.rs`（`take_expired`、`on_send`）
+- Test: `src/common/kudus.rs`
+
+- [ ] **Step 1: 写失败测试（sent）**
+
+```rust
+#[test]
+fn retx_stats_counts_resends() {
+    let mut b = RetxBuf::new(0);
+    b.on_send(vec![1u8; 10]);
+    // RTO=200ms，now 取足够大的值让包到期
+    let now = now_ms() + 10_000;
+    let due1 = b.take_expired(Duration::from_millis(200), now);
+    assert_eq!(due1.len(), 1, "首轮应有 1 包到期");
+    let due2 = b.take_expired(Duration::from_millis(200), now);
+    assert_eq!(due2.len(), 1, "第二轮仍到期（本版仍会重新计时）");
+    let s = b.take_stats();
+    assert_eq!(s.sent, 2, "重发 2 次应记 sent=2");
+}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cargo test --bin neutrino retx_stats_counts_resends`
+Expected: FAIL — `assertion left: 0, right: 2`
+
+- [ ] **Step 3: 最小实现**
+
+`take_expired` 内，每次 `due.push` 后累加：
+
+```rust
+pub fn take_expired(&mut self, rto: Duration, now: u64) -> Vec<(u32, Vec<u8>)> {
+    let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
+    for (seq, (p, sent)) in self.seqs.iter_mut() {
+        if now.wrapping_sub(*sent) >= rto.as_millis() as u64 {
+            *sent = now;
+            self.stats.sent += 1;   // 新增：埋点
+            due.push((*seq, p.clone()));
+        }
+    }
+    due.sort_by_key(|(s, _)| *s);
+    due
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test --bin neutrino retx_stats_counts_resends`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino retx_stats
+git add src/common/kudus.rs
+git commit -m "feat(kudus): RetxStats.sent 埋点（take_expired 每重发一包 +1）"
+```
+
+---
+
+### Task 0a-3: `full` / `abandoned` 埋点（**在阶段 1 的 Task 2/4 之后做**）
+
+**Files:**
+- Modify: `src/common/kudus.rs`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn retx_stats_counts_full() {
+    let mut b = RetxBuf::new(0);
+    for _ in 0..KUDUS_RETX_CAP {
+        b.on_send(vec![1u8; 10]);
+    }
+    let r = b.try_send(vec![1u8; 10]);
+    assert!(r.is_err(), "满 cap 后应拒绝");
+    let s = b.take_stats();
+    assert_eq!(s.full, 1);
+}
+
+#[test]
+fn retx_stats_counts_abandoned() {
+    let mut b = RetxBuf::new(0);
+    b.on_send(vec![1u8; 10]);
+    let mut now = now_ms();
+    for _ in 0..KUDUS_MAX_RETX {
+        now += 10_000;
+        b.take_expired(Duration::from_millis(200), now);
+    }
+    now += 10_000;
+    b.take_expired(Duration::from_millis(200), now);
+    let s = b.take_stats();
+    assert_eq!(s.abandoned, 1, "超上限应记 1 次放弃");
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino retx_stats_counts`
+Expected: FAIL — `assertion left: 0, right: 1`
+
+- [ ] **Step 3: 最小实现**
+
+`on_send` 的 cap 拒绝分支加 `self.stats.full += 1;`；
+`take_expired` 的放弃分支加 `self.stats.abandoned += 1;`。
+（具体代码位置随阶段 1 的 Task 2/4 而定，在对应 `RetxFull` / `retx >= KUDUS_MAX_RETX` 处。）
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino retx_stats`
+Expected: PASS（全 5 个测试）
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino kudus
+git add src/common/kudus.rs
+git commit -m "feat(kudus): RetxStats.full/abandoned 埋点"
+```
+
+---
+
+### Task 0b-1: `tcp accept/close` 降 DEBUG
+
+**Files:**
+- Modify: `src/server/ingress.rs:583`（accept）、`:717`（close）
+- Test: `src/server/ingress.rs`（`mod tests`）
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn accept_log_level_is_debug() {
+    // 防回归：这两个日志点必须是 DEBUG。若有人改回 INFO，
+    // BT 场景下 800 条/分刷屏回归（2026-10-23 现场，spec §15.1）。
+    // 用源码断言而非运行时断言，零成本。
+    let src = include_str!("ingress.rs");
+    assert!(
+        src.contains(r#"tracing::debug!("tcp accept"#),
+        "tcp accept 必须降级为 debug"
+    );
+    assert!(
+        src.contains(r#"tracing::debug!("tcp close"#),
+        "tcp close 必须降级为 debug"
+    );
+    assert!(
+        !src.contains(r#"tracing::info!("tcp accept"#),
+        "tcp accept 不能是 info（回归）"
+    );
+    assert!(
+        !src.contains(r#"tracing::info!("tcp close"#),
+        "tcp close 不能是 info（回归）"
+    );
+}
+```
+
+> 注：`include_str!("ingress.rs")` 在 `src/server/ingress.rs` 的 `mod tests` 里
+> 路径需为 `include_str!("ingress.rs")`（相对当前文件所在目录）。
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino accept_log_level_is_debug`
+Expected: FAIL — 含 info 版存在
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+// src/server/ingress.rs:583
+tracing::debug!("tcp accept :{port} peer={peer} -> sid={sid} tunnel={pname} target={target} limit={}", ...);
+
+// src/server/ingress.rs:717
+tracing::debug!("tcp close :{port} peer={peer} sid={sid} rx={} tx={}", c.rx, c.tx);
+```
+
+同时把上方注释（`// 建连日志（每连接一行，量可接受；断开在双泵结束处记）`）改为
+说明降级原因与 per-tunnel 汇总替代。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino accept_log_level_is_debug`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino accept_log_level
+git add src/server/ingress.rs
+git commit -m "feat(server): tcp accept/close 日志降 DEBUG，为 per-tunnel 汇总让出 INFO
+
+spec §15.4：事故时 800 条/分里 99% 是这两行的刷屏，明细降 DEBUG 按需开，
+INFO 层改由 per-tunnel 每分钟汇总承担（Task 0b-2）。"
+```
+
+---
+
+### Task 0b-2: `TunnelStats` 累加与取走
+
+**Files:**
+- Modify: `src/server/state.rs`（`Shared` 结构加字段 + `TunnelStats` 定义 + `Shared::new`）
+- Test: `src/server/state.rs`（`mod tests`）
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn tunnel_stats_accumulate_and_drain() {
+    let mut st = TunnelStats::default();
+    st.accepts += 2;
+    st.closes += 1;
+    st.rx += 100;
+    st.tx += 200;
+    st.stick += 1;
+    assert_eq!(st.accepts, 2);
+    assert_eq!(st.rx, 100);
+}
+
+#[test]
+fn tunnel_stats_drain_returns_and_clears() {
+    let mut m: HashMap<String, TunnelStats> = HashMap::new();
+    let e = m.entry("a/bt".into()).or_default();
+    e.accepts = 5;
+    e.rx = 1024;
+    let drained = drain_tunnel_stats(&mut m);
+    assert_eq!(drained.len(), 1);
+    let s = &drained["a/bt"];
+    assert_eq!(s.accepts, 5);
+    assert_eq!(s.rx, 1024);
+    assert!(m.is_empty(), "取走后必须清空，下轮重新累计");
+}
+
+#[test]
+fn tunnel_stats_format_human_bytes() {
+    assert_eq!(fmt_bytes(0), "0B");
+    assert_eq!(fmt_bytes(1023), "1023B");
+    assert_eq!(fmt_bytes(1024), "1.0KB");
+    assert_eq!(fmt_bytes(1024 * 1024 * 12 + 1024 * 300), "12.3MB");
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino tunnel_stats`
+Expected: FAIL — `cannot find type TunnelStats`
+
+- [ ] **Step 3: 最小实现**
+
+`src/server/state.rs` 中，`Shared` 定义**之前**加：
+
+```rust
+/// 隧道级累计（spec §15.4）。在「关闭时刻」累加，不等 tick 扫表——
+/// conns 表 close 即 remove，扫表只能看到存活连接，BT 短连接会严重偏低。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TunnelStats {
+    pub(crate) accepts: u64,
+    pub(crate) closes: u64,
+    pub(crate) rx: u64,
+    pub(crate) tx: u64,
+    /// first-chunk timeout 次数
+    pub(crate) stick: u64,
+}
+
+/// 取走并清空（tick 汇总用）。
+pub(crate) fn drain_tunnel_stats(
+    m: &mut HashMap<String, TunnelStats>,
+) -> HashMap<String, TunnelStats> {
+    std::mem::take(m)
+}
+
+/// 人类可读字节数（日志用）。
+pub(crate) fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n}B")
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+```
+
+`Shared` 结构内（`conns` 字段之后）加：
+
+```rust
+/// 隧道级累计（spec §15.4），key = tunnel 名（如 "minipc7s/trans-bt"）
+pub(crate) tunnel_stats: std::sync::Mutex<HashMap<String, TunnelStats>>,
+```
+
+`Shared::new` / `Default` 构造处加：
+
+```rust
+tunnel_stats: std::sync::Mutex::new(HashMap::new()),
+```
+
+> 用 `std::sync::Mutex` 而非 `tokio::sync`：临界区只有 entry+1（纳秒级），
+> 与现有 `drop_hits`/`drop_warn` 一致，不在 async 里 await 该锁。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino tunnel_stats`
+Expected: PASS（3 个全绿）
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino tunnel_stats
+git add src/server/state.rs
+git commit -m "feat(server): TunnelStats 隧道级累计结构 + 人类可读字节格式化
+
+spec §15.4：累加在关闭时刻做（conns close 即 remove，扫表会偏低）。"
+```
+
+---
+
+### Task 0b-3: ingress 三处累加接入
+
+**Files:**
+- Modify: `src/server/ingress.rs:583`（accept）、`:717`（close）、`:675`（first-chunk timeout）
+
+- [ ] **Step 1: 写失败测试**
+
+`src/server/ingress.rs` 的 `mod tests` 里加源码断言（与 0b-1 同风格）：
+
+```rust
+#[test]
+fn ingress_accumulates_tunnel_stats() {
+    let src = include_str!("ingress.rs");
+    assert!(src.contains("tunnel_stats"), "accept/close 必须累加 TunnelStats");
+    assert!(src.contains("stick"), "first-chunk timeout 必须计数");
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino ingress_accumulates`
+Expected: FAIL
+
+- [ ] **Step 3: 最小实现**
+
+accept 处（`ingress.rs:583` 那行日志之后）：
+
+```rust
+{
+    let key = format!("{hostname}/{pname}");
+    if let Ok(mut m) = s3.tunnel_stats.lock() {
+        let e = m.entry(key).or_default();
+        e.accepts += 1;
+    }
+}
+```
+
+close 处（`ingress.rs:717` 的 `if let Some(c) = ...` 块内）：
+
+```rust
+{
+    let key = format!("{hostname}/{pname}");
+    if let Ok(mut m) = s3.tunnel_stats.lock() {
+        let e = m.entry(key).or_default();
+        e.closes += 1;
+        e.rx += c.rx;
+        e.tx += c.tx;
+    }
+}
+```
+
+first-chunk timeout 处（`ingress.rs:675` 的 warn 之后）：
+
+```rust
+{
+    let key = format!("{hostname}/{pname}");
+    if let Ok(mut m) = s3.tunnel_stats.lock() {
+        m.entry(key).or_default().stick += 1;
+    }
+}
+```
+
+> 若 `hostname`/`pname` 在该作用域不可用，用已有的 `traffic_key` 或
+> 从 `p` 取到的 tunnel 名替代——**执行时以实际变量为准**，保持 key 与
+> `ratelimit stats` 行一致（`hostname/proxy名`）。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino ingress_accumulates`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino ingress
+git add src/server/ingress.rs
+git commit -m "feat(server): ingress 三处接入 TunnelStats 累加（accept/close/first-chunk timeout）"
+```
+
+---
+
+### Task 0b-4: tick 汇总输出
+
+**Files:**
+- Modify: `src/server/mod.rs`（`traffic` tick 内，约 `:285` 打 `tick traffic` 那处之后）
+- Test: `src/server/mod.rs`（`tick_tests`）
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn tunnel_stats_line_format() {
+    let mut m: HashMap<String, crate::server::state::TunnelStats> = HashMap::new();
+    let e = m.entry("minipc7s/trans-bt".into()).or_default();
+    e.accepts = 523;
+    e.closes = 521;
+    e.stick = 2;
+    e.rx = 1024 * 1024 * 12 + 1024 * 300;
+    e.tx = 1024 * 1024 * 88 + 1024 * 100;
+    let line = format_tunnel_stats_line(&m);
+    assert!(
+        line.contains("tunnel stats minipc7s/trans-bt accepts=523 closes=521 stick=2"),
+        "got: {line}"
+    );
+    assert!(line.contains("rx=12.3MB"), "got: {line}");
+    assert!(line.contains("tx=88.1MB"), "got: {line}");
+}
+
+#[test]
+fn tunnel_stats_absent_tunnel_not_emitted() {
+    let mut m: HashMap<String, crate::server::state::TunnelStats> = HashMap::new();
+    m.entry("idle/tun".into()).or_default();  // 全零
+    assert!(format_tunnel_stats_line(&m).is_empty(), "全零隧道不应产生日志");
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino tunnel_stats_line`
+Expected: FAIL — `cannot find function format_tunnel_stats_line`
+
+- [ ] **Step 3: 最小实现**
+
+`src/server/mod.rs` 加纯函数：
+
+```rust
+/// 格式化隧道汇总行（spec §15.4）。全零隧道跳过，每条隧道一行。
+fn format_tunnel_stats_line(
+    m: &std::collections::HashMap<String, state::TunnelStats>,
+) -> String {
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort();
+    let mut lines: Vec<String> = Vec::new();
+    for k in keys {
+        let s = &m[k];
+        if s.accepts + s.closes + s.stick + s.rx + s.tx == 0 {
+            continue;
+        }
+        // 注意：rx/tx==0 但 accepts>0 也要打（短连接可能无字节）
+        let rx = state::fmt_bytes(s.rx);
+        let tx = state::fmt_bytes(s.tx);
+        lines.push(format!(
+            "tunnel stats {k} accepts={} closes={} stick={} rx={rx} tx={tx}",
+            s.accepts, s.closes, s.stick
+        ));
+    }
+    lines.join("\n")
+}
+```
+
+traffic tick 里（`tracing::info!("{}", state::tick_heartbeat("traffic", ...))` 之后）加：
+
+```rust
+{
+    let drained = {
+        let mut m = s.tunnel_stats.lock().unwrap_or_else(|e| e.into_inner());
+        state::drain_tunnel_stats(&mut m)
+    };
+    for line in format_tunnel_stats_line(&drained).lines() {
+        tracing::info!("{line}");
+    }
+}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino tunnel_stats_line`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino tunnel_stats
+git add src/server/mod.rs
+git commit -m "feat(server): traffic tick 输出 per-tunnel 汇总行
+
+每分一行：tunnel stats <name> accepts= closes= stick= rx= tx=
+全零隧道跳过，不产生噪音。"
+```
+
+---
+
+### Task 0b-5: retx 汇总接入 tick（**依赖阶段 1 完成**）
+
+**Files:**
+- Modify: `src/server/kudus.rs`（session 结构处采集）、`src/server/mod.rs`（tick 输出）
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn retx_stats_line_format() {
+    let s = RetxStats { sent: 4821, abandoned: 0, full: 0, backlog_max: 1024 };
+    let line = format_retx_stats_line("3f2a1b8c", "minipc7s", &s);
+    assert_eq!(
+        line,
+        "kudus retx session=3f2a1b8c hostname=minipc7s sent=4821 abandoned=0 full=0 backlog_max=1024"
+    );
+}
+
+#[test]
+fn retx_stats_skips_idle() {
+    let s = RetxStats::default();
+    assert!(format_retx_stats_line("a", "h", &s).is_empty());
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino retx_stats_line`
+Expected: FAIL
+
+- [ ] **Step 3: 最小实现**
+
+`src/server/mod.rs`（或 kudus.rs，取就近）加：
+
+```rust
+/// 格式化单会话重传统计行（spec §15.3）。全零跳过。
+fn format_retx_stats_line(session: &str, hostname: &str, s: &RetxStats) -> String {
+    if s.sent + s.abandoned + s.full == 0 && s.backlog_max == 0 {
+        return String::new();
+    }
+    format!(
+        "kudus retx session={session} hostname={hostname} sent={} abandoned={} full={} backlog_max={}",
+        s.sent, s.abandoned, s.full, s.backlog_max
+    )
+}
+```
+
+采集：在 server kudus 会话的 tick 路径里，对每个活跃 session：
+
+```rust
+let st = relw.lock().map(|mut r| r.retx.take_stats()).unwrap_or_default();
+let line = format_retx_stats_line(&format!("{session:08x}"), &hostname, &st);
+if !line.is_empty() {
+    tracing::info!("{line}");
+}
+```
+
+agent 侧同理（`src/agent/kudus_session.rs`，`rel: Arc<Mutex<RelSend>>`）。
+
+> **执行提示**：两侧 session 结构当前的 tick 挂载点需在执行时确认。
+> 若两侧都没有现成 tick，则在 traffic tick 里遍历活跃 session 采集
+> （参考 `rate_limiters` 的 `lims.iter()` 模式）。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino retx_stats_line`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino retx
+git add src/server/mod.rs src/server/kudus.rs src/agent/kudus_session.rs
+git commit -m "feat: kudus retx per-session 汇总日志接入 tick
+
+spec §15.3：sent/abandoned/full/backlog_max 每分一行，全零跳过。
+这是下次事故能定位「哪条隧道在放大」的关键信号。"
+```
+
+---
+
+### Task 0c-1: journald 留存配置
+
+**Files:**
+- Modify: `deploy/tunnel-server.service`（加注释说明）
+- Create: `deploy/journald-neutrino.conf`（可直接拷贝到 `/etc/systemd/journald.conf.d/`）
+
+- [ ] **Step 1: 写配置片段**
+
+```ini
+# deploy/journald-neutrino.conf
+# 安装：cp deploy/journald-neutrino.conf /etc/systemd/journald.conf.d/
+#       systemctl restart systemd-journald
+#
+# 根因：2026-10-23 事故后排查发现 journal 只保留 2 天（最早一条 10-21），
+# 事故日志差点丢失。journald 默认未配上限，靠磁盘总量自动滚动。
+[Journal]
+SystemMaxUse=500M
+MaxRetentionSec=30day
+```
+
+- [ ] **Step 2: 验证配置语法**
+
+Run: `systemd-analyze verify deploy/journald-neutrino.conf 2>&1 || true`
+Expected: 无语法错误（journald 配置不被 systemd-analyze 校验，允许空输出）
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add deploy/journald-neutrino.conf deploy/tunnel-server.service
+git commit -m "ops(deploy): journald 留存配置 500M/30 天
+
+spec §15.5：事故后 journal 只保 2 天，差点丢失关键日志。"
+```
+
+---
+
+### Task 0c-2: `--log-file` 被忽略时 warn
+
+**Files:**
+- Modify: `src/main.rs`（`Cmd::Server` / `Cmd::Agent` 分支）
+- Test: `src/main.rs`（`main_tests`）
+
+- [ ] **Step 1: 写失败测试（纯判定函数）**
+
+在 `src/main.rs` 的 `mod main_tests` 里加：
+
+```rust
+#[test]
+fn log_file_warns_when_ignored() {
+    assert!(should_warn_log_file_ignored(false, "/tmp/x.log"));
+    assert!(!should_warn_log_file_ignored(true, "/tmp/x.log"), "detach 时生效，不 warn");
+    assert!(!should_warn_log_file_ignored(false, ""), "未传不 warn");
+    assert!(!should_warn_log_file_ignored(true, ""));
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --bin neutrino log_file_warns_when_ignored`
+Expected: FAIL — `cannot find function should_warn_log_file_ignored`
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+/// --log-file 只在 --detach 时生效；systemd 下传了会被忽略 → warn 告知（spec §15.5）。
+fn should_warn_log_file_ignored(detach: bool, log_file: &str) -> bool {
+    !detach && !log_file.is_empty()
+}
+```
+
+在 `Cmd::Server` 与 `Cmd::Agent` 分支里、`if detach { return detach_spawn(...) }` **之前**：
+
+```rust
+if should_warn_log_file_ignored(detach, &log_file) {
+    tracing::warn!(
+        "--log-file 仅在 --detach 时生效，当前已忽略；systemd 场景请用 journalctl -u <unit>"
+    );
+}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cargo test --bin neutrino log_file_warns_when_ignored`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --bin neutrino main
+git add src/main.rs
+git commit -m "fix(main): --log-file 在非 detach 下被忽略时 warn，不再静默
+
+spec §15.5：旧代码 systemd 下传 --log-file 完全无效且无任何提示。"
+```
+
+---
+
+## 阶段 0 验收
+
+```bash
+make build   # 零 warning
+make test    # 全绿（含新增 12 个单测）
+```
+
+**验收标准**：
+1. `cargo test --bin neutrino retx_stats` 全绿（5 个）
+2. `cargo test --bin neutrino tunnel_stats` 全绿（4 个）
+3. `cargo test --bin neutrino accept_log_level` 全绿
+4. `cargo test --bin neutrino log_file_warns_when_ignored` 全绿
+5. 手动跑 server，日志中能看到 `tunnel stats ...` 行，且无 `tcp accept` INFO 刷屏
+
+> 注：`retx` 汇总行（Task 0b-5）依赖阶段 1 完成，不在本阶段验收范围；
+> 其 e2e 断言在阶段 7（Task 18）统一验证。
+
+---
 
 ---
 
@@ -2087,4 +2942,227 @@ git commit -m "docs(agents): 记录 RetxBuf 上限/退避与背压阈值+硬上�
 4. **不要盲等**：所有等待用「轮询可观测状态 + 上限」或参数化物理时间（见 AGENTS.md 测试等待规范）。
 5. **`KCtx` 有两处构造**（生产 + 测试），加字段时都要改，否则编译失败。
 6. **Task 14 若 Step 2 已绿**：说明测试重复，删掉该测试，靠 e2e（Task 16）覆盖。
+
+
+---
+
+## 阶段 7：可观测性 e2e（对应 spec §15.6）
+
+> **前置**：阶段 0 全部完成 + 阶段 1 完成（retx e2e 需要真实的 `take_stats` 行为）。
+> 现有 e2e 用 `Stdio::null()` 丢弃子进程输出，**无法断言日志**。
+> 本阶段先加一个「捕获 server stdout 到文件」的 boot 变体，再写 3 个断言。
+
+---
+
+### Task 18: e2e —— 日志可观测性
+
+**Files:**
+- Modify: `tests/e2e.rs`
+- Test: `tests/e2e.rs`
+
+- [ ] **Step 1: 加 boot 变体（捕获 server 日志）**
+
+在 `tests/e2e.rs` 的 `boot_with_desired` **之后**新增：
+
+```rust
+/// 同 boot_with_desired，但把 server 的 stdout 重定向到文件，
+/// 供「日志可观测性」类 e2e 断言（spec §15.6）。
+/// tracing 默认写 stdout，故只需重定向 stdout。
+async fn boot_with_logfile(proxies_toml: &str, desired_toml: Option<&str>) -> (Env, std::path::PathBuf) {
+    let ws_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(
+        &cfg_path,
+        format!("hostname = \"e2e\"\ntoken = \"s3cret\"\n{proxies_toml}"),
+    )
+    .await
+    .unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    if let Some(d) = desired_toml {
+        tokio::fs::write(&desired_path, d).await.unwrap();
+    }
+    let log_path = dir.join("server.log");
+    let log_f = std::fs::File::create(&log_path).unwrap();
+    let log_f2 = log_f.try_clone().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(std::process::Stdio::from(log_f))
+        .stderr(std::process::Stdio::from(log_f2))
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+            "--live-tick-ms",
+            "50",
+            "--traffic-tick-ms",
+            "50",
+            "--limiter-tick-ms",
+            "50",
+            "--persist-tick-ms",
+            "50",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // 等就绪（轮询，不盲等）
+    let web_base = format!("http://127.0.0.1:{ws_port}");
+    settle(&web_base).await;
+    // agent 侧沿用普通 boot 的启动逻辑（agent 日志不参与断言）
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent",
+            "--server",
+            &format!("ws://127.0.0.1:{ws_port}/ws"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let ag_pid = ag.id().unwrap();
+    let env = Env {
+        http_port: ws_port,
+        web_base,
+        data_dir: data,
+        desired_path,
+        _srv: srv,
+        _ag: ag,
+        ag_pid,
+    };
+    (env, log_path)
+}
+
+/// 读日志文件全文（日志可能还没 flush，稍等重试）。
+fn read_log(p: &std::path::Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_default()
+}
+```
+
+- [ ] **Step 2: 写 3 个失败测试**
+
+在 `tests/e2e.rs` 末尾加：
+
+```rust
+/// spec §15.4：per-tunnel 汇总行必须出现在 INFO 日志里。
+/// 旧代码：根本没有这一行（只有每连接 accept/close 刷屏）。
+#[tokio::test]
+async fn e2e_tunnel_stats_line_emitted() {
+    let proxies = r#"
+[[proxies]]
+name = "bt"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 59999
+remote_port = 0
+"#;
+    let (env, log) = boot_with_logfile(proxies, None).await;
+    wait_agents_count(&env.web_base, 1).await;
+    std::mem::forget(env); // 保持子进程存活到断言结束
+    // 轮询等汇总行出现（traffic tick 50ms，给足上限但不用固定 sleep）
+    let mut found = false;
+    for _ in 0..60 {
+        if read_log(&log).contains("tunnel stats ") {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(found, "缺少 per-tunnel 汇总行 `tunnel stats ...`\n--- log ---\n{}", read_log(&log));
+}
+
+/// spec §15.4：accept/close 明细必须不再是 INFO（降噪生效）。
+/// 旧代码：每次连接两行 INFO，BT 场景 800 条/分。
+#[tokio::test]
+async fn e2e_no_per_conn_info_flood() {
+    let proxies = r#"
+[[proxies]]
+name = "bt"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 59999
+remote_port = 0
+"#;
+    let (env, log) = boot_with_logfile(proxies, None).await;
+    wait_agents_count(&env.web_base, 1).await;
+    std::mem::forget(env);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let text = read_log(&log);
+    let info_accepts = text.lines()
+        .filter(|l| l.contains(" INFO") && l.contains("tcp accept"))
+        .count();
+    assert_eq!(info_accepts, 0, "tcp accept 不应再打 INFO，实际 {info_accepts} 行");
+}
+
+/// spec §15.3：retx 统计行必须可观测。
+/// 旧代码：`grep -icE "retx" = 0`，重传风暴完全不可见。
+/// 本用例在无丢包的干净环境下断言「格式正确 + 有活动时才打」，
+/// 真丢包场景由单测覆盖（e2e 造跨境丢包不现实）。
+#[tokio::test]
+async fn e2e_retx_stats_visible_in_log() {
+    let proxies = r#"
+[[proxies]]
+name = "bt"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 59999
+remote_port = 0
+"#;
+    let (env, log) = boot_with_logfile(proxies, None).await;
+    wait_agents_count(&env.web_base, 1).await;
+    std::mem::forget(env);
+    // 干净环境下 retx 可能为 0（不打日志）——这是正确行为。
+    // 断言：要么没有该行，要么格式正确（不能出现半截/错字段）。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let text = read_log(&log);
+    for line in text.lines().filter(|l| l.contains("kudus retx session=")) {
+        assert!(line.contains(" sent="), "格式缺 sent: {line}");
+        assert!(line.contains(" alive=") || line.contains(" abandoned="), "格式缺 abandoned: {line}");
+        assert!(line.contains(" backlog_max="), "格式缺 backlog_max: {line}");
+    }
+}
+```
+
+> **注意**：以上用 `std::mem::forget(env)` 防止 `Env` 的 `kill_on_drop` 提前杀掉子进程。
+> 这是 e2e 里少见的写法，因为需要在测试体内持续读日志。若现有 e2e 有更优雅的
+> 「borrow 不 drop」模式（如把断言放在 `Env` 生命周期内），以现有模式为准。
+
+- [ ] **Step 3: 运行确认失败**
+
+Run: `cargo test --test e2e e2e_tunnel_stats_line_emitted -- --test-threads=1`
+Expected: FAIL — `缺少 per-tunnel 汇总行`（旧代码无此行）
+
+Run: `cargo test --test e2e e2e_no_per_conn_info_flood -- --test-threads=1`
+Expected: FAIL — `tcp accept 不应再打 INFO`
+
+- [ ] **Step 4: 实现通过（阶段 0 完成后应自然通过）**
+
+若阶段 0 已完成，这两个测试应直接 PASS。
+若 FAIL，回到 Task 0b-1 / 0b-4 检查日志级别与 tick 挂载。
+
+Run: `cargo test --test e2e e2e_ -- --test-threads=1`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+make build && cargo test --test e2e -- --test-threads=1
+git add tests/e2e.rs
+git commit -m "test(e2e): 日志可观测性断言（tunnel stats 行 / 无 INFO 刷屏 / retx 格式）
+
+spec §15.6：新增 boot_with_logfile 变体捕获 server stdout。
+e2e_tunnel_stats_line_emitted 是核心回归——旧代码根本没有这一行。"
+```
 
