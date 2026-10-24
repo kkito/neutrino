@@ -216,6 +216,7 @@ pub async fn run(
     web_user: &str,
     web_pass: &str,
     udp_idle_secs: u64,
+    udp_pool_max: usize,
 ) -> anyhow::Result<()> {
     let cfg: AgentFileConfig = load_or_default(config_path, url).await?;
     if !cfg.proxies.is_empty() {
@@ -461,7 +462,7 @@ pub async fn run(
         } else if is_kudus {
             let (up2, cfg2, st2, kh) = (up.clone(), cfg.clone(), status.clone(), kudus_egress_out.clone());
             tokio::spawn(async move {
-                kudus_session::session(up2, cfg2, st2, kh, udp_idle_secs).await
+                kudus_session::session(up2, cfg2, st2, kh, udp_idle_secs, udp_pool_max).await
             })
         } else {
             let (up2, cfg2, st2, eh) = (up.clone(), cfg.clone(), status.clone(), egress_out.clone());

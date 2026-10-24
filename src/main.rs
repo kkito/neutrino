@@ -92,6 +92,10 @@ enum Cmd {
         /// BT uTP 长连接在丢包链路上静默可能超过 5s，可按现场放宽（如 60）。
         #[arg(long, default_value_t = 0)]
         udp_idle_secs: u64,
+        /// agent 出站 UDP socket 池上限（默认 2048，0=默认）。
+        /// 池满时按 LRU 踢流：只保留「任一端还有数据流动」的流。
+        #[arg(long, default_value_t = 0)]
+        udp_pool_max: usize,
     },
     /// bcrypt-hash a password for WebUI
     Genhash { password: String },
@@ -255,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
             );
             server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, ticks).await
         }
-        Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file, udp_idle_secs } => {
+        Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file, udp_idle_secs, udp_pool_max } => {
             if should_warn_log_file_ignored(detach, &log_file) {
                 tracing::warn!(
                     "--log-file 仅在 --detach 时生效，当前已忽略；systemd 场景请用 journalctl -u <unit>"
@@ -269,7 +273,7 @@ async fn main() -> anyhow::Result<()> {
             if detach {
                 return detach_spawn(&log, &pid_file);
             }
-            agent::run(&server, &config, &web, &web_user, &web_pass, udp_idle_secs).await
+            agent::run(&server, &config, &web, &web_user, &web_pass, udp_idle_secs, udp_pool_max).await
         }
         Cmd::Genhash { password } => {
             let h = bcrypt::hash(&password, bcrypt::DEFAULT_COST)?;

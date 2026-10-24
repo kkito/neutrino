@@ -270,6 +270,7 @@ pub(crate) async fn session(
     status: Arc<RwLock<super::web::AgentStatus>>,
     kudus_out: super::egress::KudusOutHolder,
     idle_secs_cli: u64,
+    pool_max_cli: usize,
 ) -> anyhow::Result<()> {
     let (host, port) = match crate::common::quic::parse_server_url(&up.server_url) {
         crate::common::quic::Transport::Kudus { host, port } => (host, port),
@@ -347,11 +348,13 @@ pub(crate) async fn session(
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
         streams: RwLock::new(HashMap::new()),
         pending: RwLock::new(HashMap::new()),
-        udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::new(
+        udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::with_max(
             super::udp_pool::PoolKind::Udp,
+            super::udp_pool::resolve_pool_max(pool_max_cli),
         ))),
-        link_udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::new(
+        link_udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::with_max(
             super::udp_pool::PoolKind::LinkUdp,
+            super::udp_pool::resolve_pool_max(pool_max_cli),
         ))),
         udp_idle_secs: resolve_udp_idle_secs(idle_secs_cli),
     });
@@ -829,12 +832,19 @@ async fn open_udp_stream_to(
     // 现每条流收尾打一行：存活时长 + 双向包数字节 + 结束原因。
     let stat = std::sync::Arc::new(UdpStreamStat::default());
     let stat_tx = stat.clone();
+    let pool_touch_tx = pool.clone();
     let ws_to_udp = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(idle_secs), drx.recv()).await {
                 Ok(Some(dg)) => {
                     stat_tx.rx_pkts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     stat_tx.rx_bytes.fetch_add(dg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    // LRU：隧道里还有包下来，说明这条流仍然活着，刷新其位置。
+                    // 根因→修法：旧代码只有 udp_to_ws（本地 socket 收到字节）才 touch，
+                    // 于是「只发不收」的流（DHT announce / 单向推流 / 对端丢包不回）
+                    // 在 LRU 里永远排在队首，池满时被当成最久未用错杀。
+                    // 池于 2026-10-24 实测打满（evicted=871），这个盲区已在真实误杀流。
+                    pool_touch_tx.lock().await.touch(sid);
                     if let Err(e) = w.send(&dg).await {
                         stat_tx.end.store(END_SEND_ERR, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
@@ -961,7 +971,7 @@ mod tests {
     /// 结论：UDP 语义强制「每 sid 一 socket」，connect 反而是防护（内核已过滤
     /// 非目标来源），换成 send_to 会引入跨 sid 串包风险。
     ///
-    /// 池的正确职责因此只是**限制 fd 数量**（POOL_MAX）+ LRU 踢流，
+    /// 池的正确职责因此只是**限制 fd 数量**（AGENT_UDP_POOL_MAX）+ LRU 踢流，
     /// 而非共享 socket。见 udp_pool.rs 模块头注释。
     #[test]
     fn udp_egress_socket_per_stream_is_intentional() {
@@ -1147,16 +1157,74 @@ mod tests {
         assert!(!ctx.streams.read().await.contains_key(&sid), "退出后必须清理 streams 表项，否则通道与 socket 一起漏");
     }
 
+    /// 根因→修法（验证）：LRU 曾经只认「本地 socket 收到回包」为活跃
+    /// （`udp_to_ws` 泵里的 touch），`ws_to_udp` 方向（隧道→本地 socket）
+    /// 一个 touch 都没有。于是「只发不收」的流在 LRU 里永远排在队首，
+    /// 池满时被当成最久未用错杀。2026-10-24 线上实测 evicted=871，
+    /// 这个盲区已在真实误杀流。
+    ///
+    /// 断言抓什么：建两条流 sid=1/2，都在池里；然后只给 sid=1 灌**下行**
+    /// （隧道→本地）数据，不给任何回包。之后往池里 acquire 新 sid ——
+    /// 若 ws_to_udp 有 touch，被踢的应该是 sid=2（真正的队首）；
+    /// 若没 touch（旧代码），sid=1 和 sid=2 都在队首附近，先踢 sid=1。
+    ///
+    /// 用 `with_max(2, ...)` 把小池打满，不必占 2048 个真 socket。
+    #[tokio::test]
+    async fn ws_to_udp_direction_refreshes_lru() {
+        use std::sync::Arc;
+        let pool = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::agent::udp_pool::UdpPool::with_max(crate::agent::udp_pool::PoolKind::Udp, 2),
+        ));
+        // 先占满：sid=1 旧、sid=2 新（队尾）。
+        pool.lock().await.acquire(1);
+        pool.lock().await.acquire(2);
+        assert_eq!(pool.lock().await.in_use_len(), 2);
+
+        // 模拟 ws_to_udp 泵收到下行数据时的刷新动作。
+        // 注意：这里直接调 touch 是为了锁住「泵里必须调它」这一契约的下游效果；
+        // 泵本身是否调用，由下面的源码断言守住。
+        pool.lock().await.touch(1);
+
+        // 池满后新流进来：应踢 sid=2（真正的 LRU 队首）。
+        let out = pool.lock().await.acquire(3);
+        assert_eq!(
+            out,
+            crate::agent::udp_pool::Acquire::Evicted(2),
+            "下行了数据的 sid=1 不该被踢，应踢从未活跃的 sid=2"
+        );
+        assert!(pool.lock().await.contains(1), "有下行数据的流必须保留");
+    }
+
+    /// 源码级契约：`ws_to_udp` 泵里必须存在 touch 调用。
+    /// 根因：上面那个行为用例只能证明「touch 有效」，证明不了「泵里真的调了」。
+    /// 回退验证时删掉泵里的 touch，行为用例依旧全绿 —— 所以必须直接锁源码。
+    /// 这不是理想做法，但 UDP 泵的双向 IO 难以在单测里无 mock 地驱动到
+    /// 「只下行不回包」这个特定状态，故用源码断言兼顾回归强度与成本。
+    #[test]
+    fn ws_to_udp_pump_calls_pool_touch() {
+        let src = include_str!("kudus_session.rs");
+        // 找到 ws_to_udp 泵的起点与 udp_to_ws 泵的起点，只在这段区间里找 touch。
+        let ws_start = src.find("let ws_to_udp = tokio::spawn").expect("ws_to_udp 泵应存在");
+        let udp_start = src.find("let udp_to_ws = tokio::spawn").expect("udp_to_ws 泵应存在");
+        assert!(ws_start < udp_start, "泵的定义顺序变了，请更新本用例");
+        let pump = &src[ws_start..udp_start];
+        assert!(
+            pump.contains(".touch(sid)"),
+            "ws_to_udp 泵（隧道→本地 socket）收到数据时必须 touch(sid) 刷新 LRU，\
+             否则只发不收的流会被池当成最久未用错杀（2026-10-24 evicted=871）"
+        );
+    }
+
     #[test]
     fn udp_concurrency_capped() {
         // snail 2026-10-23：无上限时 DHT flood 每流 1 fd 打满 1024 EMFILE。
         // 旧实现用 Semaphore(256) 打满直接拒；现改为池化 512 上限 + LRU 踢流。
         assert!(
-            crate::agent::udp_pool::POOL_MAX <= 512,
-            "fd 上限仍需可控"
+            crate::agent::udp_pool::resolve_pool_max(0) >= 1024,
+            "默认上限须明显高于 512（2026-10-24 实测 512 打满 evicted=871）"
         );
         assert!(
-            crate::agent::udp_pool::POOL_INIT < crate::agent::udp_pool::POOL_MAX,
+            crate::agent::udp_pool::AGENT_UDP_POOL_INIT < crate::agent::udp_pool::AGENT_UDP_POOL_MAX,
             "初值应小于上限"
         );
     }
