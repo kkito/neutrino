@@ -5,3 +5,5 @@ agent.toml
 agent.toml.webpass
 *.webpass
 neutrino-agent.log
+# 线上事故复盘：本地记录，不进仓库（含真实 IP / token / 内网拓扑）
+docs/incidents/
