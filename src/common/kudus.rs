@@ -24,6 +24,17 @@ pub const KUDUS_RETX_CAP: usize = 4096;
 /// 根因→修法：旧 take_expired 重发时刷新 *sent = now，包永不丢弃（无限复活）。
 pub const KUDUS_MAX_RETX: u32 = 10;
 
+/// 快速重传每分钟硬上限（单会话）。
+///
+/// 根因→修法：2026-10-23 kudus 重传风暴把链路打出 42 倍放大，整机网络瘫痪。
+/// 快速重传是 2026-10-24 新增的重传路径——虽然有三重软约束（每轮只补最小洞、
+/// 每包只补一次、SACK 全零不冒进），但「对端持续回 SACK 时每轮 ACK 都可能
+/// 命中一个新洞」，高丢包 + 高包率下仍可能把重传率推高。
+/// 这里加一道**硬闸**：一分钟内快速重传超过此数就整体退回纯 RTO 退避，
+/// 保证最坏情况也不会自激。200/分钟 ≈ 3.3 包/秒，远低于 RTO 泵的
+/// 20 包/秒（50ms 一拍）节奏，正常链路远够用。
+pub const FAST_RETX_PER_MIN: usize = 200;
+
 /// 发送背压最长等待。根因→修法：旧 30s（3000×10ms）已证明过宽，
 /// 事故中持续近 2 小时；5s 足够正常抖动（窗口 512 包排空远小于 5s）。
 pub const KUDUS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -199,6 +210,9 @@ pub struct RetxBuf {
     cap: usize,
     /// 重传埋点（spec §15.3），take_stats 取走即归零。
     stats: RetxStats,
+    /// 快速重传限流窗口（见 FAST_RETX_PER_MIN）。
+    fast_win_start: u64,
+    fast_win_count: usize,
 }
 
 impl RetxBuf {
@@ -208,6 +222,8 @@ impl RetxBuf {
             seqs: HashMap::new(),
             cap: KUDUS_RETX_CAP,
             stats: RetxStats::default(),
+            fast_win_start: now_ms(),
+            fast_win_count: 0,
         }
     }
     /// 取走本窗口统计并归零（spec §15.3）。
@@ -232,6 +248,18 @@ impl RetxBuf {
             self.stats.backlog_max = self.seqs.len();
         }
         Ok(s)
+    }
+    /// 快速重传限流闸：滚动 60s 窗口内是否还有额度。
+    ///
+    /// 返回 false 表示本轮不许快速重传——调用方退回 RTO 退避路径。
+    /// 窗口用 `now_ms()` 单调推进，跨窗口自动重置；时钟回拨用
+    /// `saturating_sub` 保底（不会因回拨把窗口卡死）。
+    fn fast_retx_budget(&mut self, now: u64) -> bool {
+        if now.saturating_sub(self.fast_win_start) >= 60_000 {
+            self.fast_win_start = now;
+            self.fast_win_count = 0;
+        }
+        self.fast_win_count < FAST_RETX_PER_MIN
     }
     /// 对端 ACK：清累积确认（<=ack）+ SACK 洞外已到包，并返回**应立刻重传的洞**。
     ///
@@ -275,8 +303,17 @@ impl RetxBuf {
         let Some(highest) = highest_sacked else {
             return Vec::new();
         };
+        // 硬闸（先算，避免在 seqs 借用内再借 &mut self）：
+        // 一分钟窗内快速重传超 FAST_RETX_PER_MIN 就整体退回 RTO 退避。
+        let has_budget = self.fast_retx_budget(now_ms());
+        if !has_budget {
+            return Vec::new();
+        }
         // 找 [1, highest) 中第一个仍在 seqs 里（即未被 SACK、未被累积确认）的洞。
-        for d in 1..highest {
+        // 注意上界是 `highest + 1`：`highest` 是最高 SACK 位的偏移，本身也是洞候选
+        // （它没被标记却在 seqs 里 ⇒ 说明是洞）。旧代码 `1..highest` 把它排除在外，
+        // 导致「最后一个洞」永远补不上。
+        for d in 1..=highest {
             let seq = sack_base.wrapping_add(d);
             if let Some(e) = self.seqs.get_mut(&seq) {
                 // 只补「真正丢了的」：上面 retain 已把 SACK 到过的移除，能走到这里
@@ -285,11 +322,17 @@ impl RetxBuf {
                     e.retx = 1;
                     e.last_sent = now_ms();
                     self.stats.sent += 1;
+                    self.fast_win_count += 1;
                     return vec![(seq, e.payload.clone())];
                 }
                 // 已快速重传过（retx>0）则交给 RTO 退避，不在本轮再补，
                 // 否则对端持续回同一份 SACK 会让我们每收一帧就重发一次。
-                return Vec::new();
+                //
+                // 根因→修法（2026-10-24）：旧代码这里 `return Vec::new()` 直接
+                // 退出整个查找，于是**一个还在退避中的洞会永久挡住后面所有新洞**
+                // 的快速重传——实测 hole=1 补过后，hole=2..N 全被挡住，
+                // 快速重传形同虚设。改为继续往后找下一个可补的洞。
+                continue;
             }
         }
         Vec::new()
@@ -682,6 +725,79 @@ fn reorder_window_deadlocks_on_permanent_hole() {
     /// 本用例：发 seq 1..5，对端 SACK 只标了 3,4,5（说明 1,2 丢了）。
     /// 旧代码 on_ack 返回 ()，什么也不补——只能等 RTO。
     /// 新代码必须当场返回洞里的包（seq 1，最小的那个）。
+    /// RED: 快速重传必须有独立速率上限，防 2026-10-23 式自激风暴。
+    ///
+    /// 现场依据：docs/incidents/2026-10-23-kudus-retx-storm.md（42 倍放大）。
+    ///
+    /// 为什么直接测闸而不是构造 200 次重传：SACK 窗只有 256 位且 ack 基不动时
+    /// 窗外的洞不进 SACK，实际能触发的快速重传被窗宽限制在 ~128 次，
+    /// 构造不出自然超限的场景（实测 TOTAL=128 < CAP=200）。
+    /// 闸本身是纯判定逻辑，直接单测才可靠。
+    #[test]
+    fn fast_retx_budget_limits_per_minute() {
+        let mut r = RetxBuf::new(1);
+        let t0 = super::now_ms();
+        r.fast_win_start = t0;
+        r.fast_win_count = 0;
+        // 窗口内前 CAP 次放行
+        for i in 0..super::FAST_RETX_PER_MIN {
+            assert!(r.fast_retx_budget(t0 + i as u64), "第 {i} 次应放行");
+            r.fast_win_count += 1;
+        }
+        // 第 CAP+1 次必须拒绝
+        assert!(!r.fast_retx_budget(t0 + 100), "超上限必须拒绝，否则会自激放大");
+        // 过 60s 后窗口重置，重新放行
+        assert!(r.fast_retx_budget(t0 + 60_001), "跨窗口应重置");
+        assert_eq!(r.fast_win_count, 0, "重置后计数归零");
+    }
+
+    /// 闸必须真的接在 on_ack 上：额度耗尽后 on_ack 不得再返回洞。
+    #[test]
+    fn on_ack_respects_fast_retx_budget() {
+        let mut r = RetxBuf::new(1);
+        r.fast_win_start = super::now_ms(); // 用真实时间，避免被判定跨窗口
+        r.fast_win_count = super::FAST_RETX_PER_MIN; // 额度已耗尽
+        let _s1 = r.on_send(vec![0u8; 10]).unwrap(); // 洞
+        let s2 = r.on_send(vec![1u8; 10]).unwrap(); // 到达
+        let mut sack = [0u8; 32];
+        super::sack_mark(&mut sack, 0, s2);
+        let got = r.on_ack(0, &sack);
+        assert!(got.is_empty(), "额度耗尽后 on_ack 仍返回洞 ⇒ 闸没接上");
+    }
+
+    /// 快速重传送的包不能把后面的新洞永久堵死。
+    ///
+    /// 根因→修法（2026-10-24）：旧代码在 `retx > 0` 时 `return Vec::new()`
+    /// 直接退出查找，一个还在退避的洞会挡住所有后续新洞。
+    #[test]
+    fn fast_retransmit_skips_retrying_hole() {
+        let mut r = RetxBuf::new(1);
+        // seq=1 是洞且已被快速重传过（retx=1）
+        let s1 = r.on_send(vec![0u8; 10]).unwrap();
+        let _s2 = r.on_send(vec![1u8; 10]).unwrap();
+        let _s3 = r.on_send(vec![2u8; 10]).unwrap();
+        let _s4 = r.on_send(vec![3u8; 10]).unwrap();
+        // 先让 seq=1 被快速重传一次（SACK 标 2/3/4）
+        let mut sack = [0u8; 32];
+        super::sack_mark(&mut sack, 0, 2);
+        super::sack_mark(&mut sack, 0, 3);
+        super::sack_mark(&mut sack, 0, 4);
+        assert_eq!(r.on_ack(0, &sack), vec![(s1, vec![0u8; 10])]);
+        // 再发一个包 seq=5，现在让 seq=4 成为新洞（SACK 标 2/3/5，不标 4），
+        // seq=1 仍在退避中 —— 必须能跨过它补 seq=4
+        let s4 = r.on_send(vec![3u8; 10]).unwrap();
+        let s5 = r.on_send(vec![4u8; 10]).unwrap();
+        let mut sack2 = [0u8; 32];
+        super::sack_mark(&mut sack2, 0, 2);
+        super::sack_mark(&mut sack2, 0, 3);
+        super::sack_mark(&mut sack2, 0, s5);
+        let got = r.on_ack(0, &sack2);
+        assert_eq!(
+            got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![s4],
+            "被退避中的洞不能堵住后面的新洞"
+        );
+    }
     #[test]
     fn sack_hole_triggers_fast_retransmit() {
         let mut tx = RetxBuf::new(1);
