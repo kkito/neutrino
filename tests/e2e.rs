@@ -168,6 +168,110 @@ async fn boot(proxies_toml: &str) -> Env {
     boot_with_desired(proxies_toml, None).await
 }
 
+/// 同 `boot_with_desired`，但把 server 的 stdout/stderr 重定向到文件，
+/// 供「日志可观测性」类 e2e 断言（spec §15.6）。
+///
+/// 为什么需要：其余 e2e 都把子进程输出丢进 `Stdio::null()`，
+/// 没法断言"日志里到底有没有这一行"。tracing 默认写 stdout，故两个流都重定向。
+async fn boot_with_logfile(
+    proxies_toml: &str,
+    desired_toml: Option<&str>,
+) -> (Env, std::path::PathBuf) {
+    let ws_port = free_port();
+    let kudus_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-log-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(
+        &cfg_path,
+        format!("hostname = \"e2e\"\ntoken = \"s3cret\"\n{proxies_toml}"),
+    )
+    .await
+    .unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    if let Some(d) = desired_toml {
+        tokio::fs::write(&desired_path, d).await.unwrap();
+    }
+    let log_path = dir.join("server.log");
+    let log_f = std::fs::File::create(&log_path).unwrap();
+    let log_f2 = log_f.try_clone().unwrap();
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(std::process::Stdio::from(log_f))
+        .stderr(std::process::Stdio::from(log_f2))
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--kudus-listen",
+            &format!("127.0.0.1:{kudus_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+            // tick 压到 50ms：日志类断言要等 traffic tick，默认 60s 等不起。
+            "--live-tick-ms",
+            "50",
+            "--traffic-tick-ms",
+            "50",
+            "--limiter-tick-ms",
+            "50",
+            "--persist-tick-ms",
+            "50",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent",
+            "--server",
+            &format!("ws://127.0.0.1:{ws_port}/ws"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ag_pid = ag.id().unwrap_or(0);
+    let env = Env {
+        http_port: ws_port,
+        web_base: format!("http://127.0.0.1:{ws_port}"),
+        data_dir: data,
+        desired_path: desired_path.clone(),
+        _srv: srv,
+        _ag: ag,
+        ag_pid,
+    };
+    (env, log_path)
+}
+
+/// 读日志文件全文（日志可能还没 flush 到磁盘，调用方负责轮询重试）。
+fn read_log(p: &std::path::Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_default()
+}
+
+/// 轮询等日志里出现某子串（命中即返回，未命中耗尽上限）。
+/// 根因→修法：日志类断言不能 `sleep(N)` 赌 flush 时机，也不能死等到上限——
+/// 正常情况下 tick 50ms 内就出现，只有真出问题才等到 3s。
+fn wait_log_contains(p: &std::path::Path, needle: &str, tries: usize) -> bool {
+    for _ in 0..tries {
+        if read_log(p).contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 /// 同 boot，但可指定 `--udp-session-ttl`（UDP socket 泄漏回归要把 TTL 压到秒级）。
 async fn boot_udp_ttl(proxies_toml: &str, ttl_secs: u64) -> Env {
     let ws_port = free_port();
@@ -3237,4 +3341,178 @@ async fn e2e_udp_pool_survives_many_peers() {
         oks >= 280,
         "300 个源端口应几乎全部拿到回声（旧代码 sid>256 会被硬拒，封顶 256）；实际成功 {oks}"
     );
+}
+
+/// spec §15.4：per-tunnel 汇总行必须出现在 INFO 日志里。
+///
+/// 旧代码如何复现：根本没有这一行——只有每连接 `tcp accept`/`tcp close`
+/// 各打一行 INFO（BT 场景 452→824 条/分），排障时看不到"这条隧道总共接了多少"。
+///
+/// 断言抓什么：起一条 tcp 隧道并打一次连接，然后等 `tunnel stats <name>/<host>`
+/// 出现，且同一行里 accepts 计数 >= 1。
+#[tokio::test]
+async fn e2e_tunnel_stats_line_emitted() {
+    // 一个立刻回包的 tcp 后端，保证 accept/close 都会发生（计数非零才不跳过打印）
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = back.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut b = [0u8; 1024];
+                let _ = s.read(&mut b).await;
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await;
+            });
+        }
+    });
+    // 注意：隧道配在 server 的 desired.toml（desired 是唯一源头，agent 本地
+    // proxies 会被忽略）；agent.toml 只放 hostname/token。
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"bt\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\n\
+         domains=[\"stats.e2e.test\"]\n"
+    );
+    let (env, log) = boot_with_logfile("", Some(&desired)).await;
+    // 等 agent 上线（轮询可观测状态，不盲等）
+    let n = wait_agents_count(env.http_port, 1, 40).await;
+    assert_eq!(n, 1, "agent 没上线，日志类断言无意义");
+    // 打一次真实隧道请求（Host 命中 stats.e2e.test -> 透传到后端），
+    // 这样 ingress 才会计 accept/close，汇总行才不为全零（全零按设计跳过）。
+    let mut got = false;
+    for _ in 0..30 {
+        let r = http_get_via(&env, "stats.e2e.test").await;
+        if r.contains("200 OK") {
+            got = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(got, "隧道请求未打通，汇总行不会产生");
+    // 等汇总行出现（traffic tick 50ms；上限 3s 兜底）
+    assert!(
+        wait_log_contains(&log, "tunnel stats ", 60),
+        "缺少 per-tunnel 汇总行 `tunnel stats ...`\n--- log ---\n{}",
+        read_log(&log)
+    );
+    let text = read_log(&log);
+    let line = text
+        .lines()
+        .find(|l| l.contains("tunnel stats e2e/bt"))
+        .unwrap_or_else(|| {
+            panic!(
+                "汇总行必须带 e2e/bt 前缀，实际日志：\n{text}"
+            )
+        });
+    // 关键断言：accepts 必须 >= 1。只断言"有这一行"不够——closes 也会让行出现，
+    // 那样 accepts 埋点缺失（HTTP 路径曾完全没有埋点）照样能过。
+    let accepts = line
+        .split("accepts=")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("汇总行 accepts 字段不可解析: {line}"));
+    assert!(
+        accepts >= 1,
+        "HTTP 隧道必须累计 accepts（旧代码 HTTP 路径完全没有 tunnel_stats 埋点）: {line}"
+    );
+    // closes 成对累加由 HttpConnGuard::drop 负责，可能晚于某个 tick（drain 已清零），
+    // 故这里不强求 >=1：用轮询等 closes 出现一次，最多 2s。这是"观察窗"判据，
+    // 不是死等——正常一个 tick(50ms) 内就会出现。
+    let mut closes_seen = false;
+    for _ in 0..40 {
+        let t = read_log(&log);
+        if t.lines().any(|l| {
+            l.contains("tunnel stats e2e/bt")
+                && l.split("closes=")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|v| v >= 1)
+                    .unwrap_or(false)
+        }) {
+            closes_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(closes_seen, "连接关闭后应出现 closes>=1 的汇总行:\n{}", read_log(&log));
+    drop(env); // 显式 drop 触发 kill_on_drop 清理
+}
+
+/// spec §15.4（降噪）：per-connection 的 accept/close 明细不能再打 INFO。
+///
+/// 旧代码如何复现：`tracing::info!("tcp accept ...")` 每连接一行，
+/// 现场 BT 隧道 452→824 条/分，99% 是这两行，把真正有用的日志淹了。
+/// 现降为 DEBUG（默认 INFO 级不输出），改由 tick 汇总。
+///
+/// 断言抓什么：跑一段时间后，INFO 日志里 `tcp accept` / `tcp close` 行数必须为 0。
+#[tokio::test]
+async fn e2e_no_per_conn_info_flood() {
+    // 必须用 `type="tcp"` + `remote_port`：per-connection 的 accept/close 日志
+    // 在 `ensure_tcp_listener` 里（per remote_port 独立监听器），HTTP 隧道走
+    // fallback 按 Host 路由，根本不经过那段代码——用 http 类型测不到本回归。
+    let rport = free_port();
+    let desired = format!(
+        "[[agents.e2e]]\nname=\"bt\"\ntype=\"tcp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port=59998\nremote_port={rport}\n"
+    );
+    let (env, log) = boot_with_logfile("", Some(&desired)).await;
+    let n = wait_agents_count(env.http_port, 1, 40).await;
+    assert_eq!(n, 1, "agent 没上线");
+    // 打几次到 tcp ingress 端口（若还打 INFO，会立刻出现在日志里）
+    let addr = format!("127.0.0.1:{rport}");
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+    }
+    // 同一个可观测状态判据：等 IMMEDIATELY 可见的日志落盘。
+    // 不用固定 sleep：让 2 个 traffic tick 走完足够（100ms），上限 1s。
+    let _ = wait_log_contains(&log, "tunnel stats ", 20);
+    let text = read_log(&log);
+    let info_accepts = text
+        .lines()
+        .filter(|l| l.contains(" INFO") && l.contains("tcp accept"))
+        .count();
+    let info_closes = text
+        .lines()
+        .filter(|l| l.contains(" INFO") && l.contains("tcp close"))
+        .count();
+    assert_eq!(
+        info_accepts, 0,
+        "tcp accept 不应再打 INFO（应降为 DEBUG），实际 {info_accepts} 行"
+    );
+    assert_eq!(
+        info_closes, 0,
+        "tcp close 不应再打 INFO（应降为 DEBUG），实际 {info_closes} 行"
+    );
+    drop(env);
+}
+
+/// spec §15.3：retx 统计行格式必须自洽（有该行时字段齐全）。
+///
+/// 注意：干净环境里 retx 全为 0，按设计**不打**这一行（全零跳过），
+/// 所以本用例只在"出现了该行"时校验格式——重点是防止将来加字段时
+/// 打出半截/错位的行（比完全没有更难排查）。
+#[tokio::test]
+async fn e2e_retx_stats_line_format() {
+    let desired = "[[agents.e2e]]\nname=\"bt\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port=59997\ndomains=[\"retx.e2e.test\"]\n";
+    let (env, log) = boot_with_logfile("", Some(desired)).await;
+    let n = wait_agents_count(env.http_port, 1, 40).await;
+    assert_eq!(n, 1, "agent 没上线");
+    // 等 tick 走两轮（不给死 sleep，靠"tunnel stats 出现"这个同一 tick 的锚点）
+    let _ = wait_log_contains(&log, "tunnel stats ", 20);
+    let text = read_log(&log);
+    for line in text.lines().filter(|l| l.contains("kudus retx session=")) {
+        assert!(line.contains(" sent="), "格式缺 sent: {line}");
+        assert!(
+            line.contains(" abandoned=") || line.contains(" alive="),
+            "格式缺 abandoned/alive: {line}"
+        );
+        assert!(line.contains("backlog_max="), "格式缺 backlog_max: {line}");
+    }
+    drop(env);
 }

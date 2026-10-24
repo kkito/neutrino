@@ -141,10 +141,22 @@ struct HttpConnGuard {
     aid: String,
     sid: u32,
     ctl: mpsc::UnboundedSender<ServerMsg>,
+    /// spec §15.4：隧道级统计 key（`{hostname}/{pname}`）。
+    /// 根因→修法：HTTP 隧道走 fallback 按 Host 路由，此前**完全没有** tunnel_stats
+    /// 埋点——而 HTTP 才是本项目的主流量。tcp per-port ingress 有埋点（见
+    /// `ensure_tcp_listener`），HTTP 侧漏了，导致日志里只有 tcp 隧道的汇总，
+    /// 主流量隧道在日志中不可见。
+    stats_key: String,
 }
 impl Drop for HttpConnGuard {
     fn drop(&mut self) {
         let (s, aid, sid, ctl) = (self.s.clone(), self.aid.clone(), self.sid, self.ctl.clone());
+        // spec §15.4：连接关闭计数（与建连处的 accepts 成对）。
+        if !self.stats_key.is_empty() {
+            if let Ok(mut m) = s.tunnel_stats.lock() {
+                m.entry(self.stats_key.clone()).or_default().closes += 1;
+            }
+        }
         // 同步路径拿不到锁时起后台任务补删，不阻塞 drop。
         // 借用隔离：try 守卫只活在块内，先算 bool 再 spawn，避免借用跨 move。
         let bg_conns = {
@@ -298,10 +310,23 @@ pub(crate) async fn fallback_http_ingress(
     if let Some(h) = s.agents.read().await.get(&aid) {
         h.incoming.write().await.insert(sid, dtx);
     }
+    // spec §15.4：隧道级累计（accepts 在建连时 +1，closes 在 guard drop 时 +1）。
+    let hostname = s
+        .agents
+        .read()
+        .await
+        .get(&aid)
+        .map(|h| h.info.hostname.clone())
+        .unwrap_or_default();
+    let stats_key = format!("{hostname}/{}", proxy.name);
+    if !stats_key.is_empty() && stats_key != "/" {
+        if let Ok(mut m) = s.tunnel_stats.lock() {
+            m.entry(stats_key.clone()).or_default().accepts += 1;
+        }
+    }
     // 连接快照行（/api/conns 用；流结束/超时处 remove）
     {
         let mut m = s.conns.write().await;
-        let hostname = s.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
         super::state::insert_conn(
             &mut m,
             super::state::ConnInfo {
@@ -321,7 +346,13 @@ pub(crate) async fn fallback_http_ingress(
     }
     // 守卫活过两个阶段：①首包等待期 handler future 被取消→drop 清理；
     // ②响应建成后 move 进 Body 流，中途断开流被 drop→清理。正常走完也经此路径。
-    let guard = std::sync::Arc::new(HttpConnGuard { s: s.clone(), aid: aid.clone(), sid, ctl: ctl.clone() });
+    let guard = std::sync::Arc::new(HttpConnGuard {
+        s: s.clone(),
+        aid: aid.clone(),
+        sid,
+        ctl: ctl.clone(),
+        stats_key,
+    });
     let _ = ctl.send(ServerMsg::Open {
         stream: sid,
         kind: "http".into(),
