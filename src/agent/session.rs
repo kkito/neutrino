@@ -502,7 +502,17 @@ async fn open_udp_stream_sock(ctx: Arc<Ctx>, sid: u32, sock: tokio::net::UdpSock
             }
         }
     });
-    let _ = tokio::join!(ws_to_udp, udp_to_ws);
+    // 根因→修法：旧 `join!` 要两侧都结束，而 udp→ws 侧阻塞在 `sock.recv()` 上
+    // 无超时（对端不回包就永等），ws→udp 侧 120s idle 到了也推不动 join! 返回
+    // → `streams.remove(&sid)` 与 socket drop 永不发生，每流漏 1 fd（与 kudus
+    // 同一 bug，见 kudus_session::tests::udp_stream_frees_socket_when_server_goes_idle）。
+    // 改 select!：任一侧结束即 abort 另一侧。
+    let mut ws_to_udp = ws_to_udp;
+    let mut udp_to_ws = udp_to_ws;
+    tokio::select! {
+        _ = &mut ws_to_udp => { udp_to_ws.abort(); }
+        _ = &mut udp_to_ws => { ws_to_udp.abort(); }
+    }
     ctx.streams.write().await.remove(&sid);
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = ctx.out.send(Message::Text(serde_json::to_string(&e).unwrap().into()));

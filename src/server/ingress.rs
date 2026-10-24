@@ -732,6 +732,26 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
 }
 
 // ================= udp ingress (per remote_port, session per peer) =================
+
+/// 过期 session 的 sid 列表（纯函数，无 IO）。
+///
+/// 根因→修法：旧 `sessions.retain(...)` 只删 server 本地表项，从不告诉 agent。
+/// agent 那条 udp 流的 socket 因此只能等它自己的 idle 超时才回收，而两边的超时
+/// 时长不一致（server TTL 5s vs agent 30s/120s），中间整段时间 server 已经把 sid
+/// 忘了、agent 还挂着 fd —— DHT 扫描器不停造新 session，fd 只增不减。
+/// 现在把「哪些 sid 因静默过期」算出来，由调用方逐个发 Close 让 agent 立刻关 socket。
+pub(crate) fn expired_sids(
+    sessions: &[(std::net::SocketAddr, u32, Instant)],
+    now: Instant,
+    ttl: Duration,
+) -> Vec<u32> {
+    sessions
+        .iter()
+        .filter(|(_, _, t)| now.saturating_duration_since(*t) >= ttl)
+        .map(|(_, sid, _)| *sid)
+        .collect()
+}
+
 pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
     if s.udp_listening.read().await.contains(&port) {
         return;
@@ -779,29 +799,53 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         // 包边界不变），WSS/QUIC 沿用 outbox（整帧直达）。判定一次缓存在 session 里，
         // 包循环零分支：UDP 整包直达 outbox 会被 kudus 写泵按 TCP 切片拆碎。
         use crate::server::ratelimit::RateLimiter;
-        let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>)> = HashMap::new();
+        let mut sessions: HashMap<std::net::SocketAddr, (u32, Instant, mpsc::UnboundedSender<(u32, Vec<u8>)>, Option<std::sync::Arc<RateLimiter>>, mpsc::UnboundedSender<ServerMsg>)> = HashMap::new();
         let mut buf = vec![0u8; 65535];
         // TTL 语义：该 peer 静默多久就回收。每收一包都刷新 t（见下方 get_mut 分支），
         // 所以活跃 uTP 长连接永不过期，DHT 一问一答 / 扫描器发一次就走 → 秒级清掉。
         let ttl = Duration::from_secs(s2.udp_session_ttl_secs.max(1));
         loop {
             // expire old sessions（conns 表 UDP 行同步删）
-            let n_before = sessions.len();
-            sessions.retain(|_, (_, t, _, _)| t.elapsed() < ttl);
-            let n_exp = n_before.saturating_sub(sessions.len());
+            // 根因→修法：旧代码只 `retain` 删本地表就不管了，agent 侧那条 udp 流的
+            // socket 只能等它自己的 idle 超时（30s/120s）回收，而 server TTL 只有 5s——
+            // 中间整段时间 server 已忘掉 sid、agent 还挂着 fd。DHT 扫描器不停造新
+            // session 时 fd 只增不减（HK 2026-10-23：5min 158 个 session，snail socket
+            // 一路涨到 100+）。现在过期即发 Close，agent 立刻关 socket 还槽位。
+            let now = Instant::now();
+            let snapshot: Vec<(std::net::SocketAddr, u32, Instant)> =
+                sessions.iter().map(|(p, (id, t, _, _, _))| (*p, *id, *t)).collect();
+            let dead = expired_sids(&snapshot, now, ttl);
+            let n_exp = dead.len();
+            if n_exp > 0 {
+                // Close 让 agent 删 streams 表项 + abort 双向泵 + drop socket。
+                // send 失败（agent 已断）忽略：表项照样删。
+                let dead_set: std::collections::HashSet<u32> = dead.into_iter().collect();
+                for (id, _, _, _, ctl) in sessions.values() {
+                    if dead_set.contains(id) {
+                        let _ = ctl.send(ServerMsg::Close { stream: *id, reason: "udp idle".into() });
+                    }
+                }
+            }
+            sessions.retain(|_, (_, t, _, _, _)| t.elapsed() < ttl);
             if n_exp > 0 {
                 tracing::debug!("udp :{port} expired {n_exp} sessions ({} alive)", sessions.len());
             }
             {
-                let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _, _, _)| *id).collect();
+                let live: std::collections::HashSet<u32> = sessions.values().map(|(id, _, _, _, _)| *id).collect();
                 s2.conns.write().await.retain(|_, c| c.proto != "udp" || live.contains(&(c.id as u32)));
             }
-            let (n, peer) = match sock.recv_from(&mut buf).await {
-                Ok(x) => x,
+            // recv_from 必须带超时：过期检查在循环顶部，旧代码不带超时就会一直
+            // 阻塞在这里——只要对端不发新包，过期检查永远轮不到执行，TTL 形同虚设
+            // （HK 现场：5s TTL 下 session 数依旧涨，因为回收只在“来下一个包”时发生）。
+            // 超时取 min(ttl, 1s)：保证至少每秒扫一次过期表。
+            let (n, peer) = match tokio::time::timeout(ttl.min(Duration::from_secs(1)), sock.recv_from(&mut buf)).await {
+                Ok(Ok(x)) => x,
+                Ok(Err(_)) => continue,
+                // 超时 = 刚好回到循环顶部做一次过期回收，然后继续等包
                 Err(_) => continue,
             };
             let sid = match sessions.get_mut(&peer) {
-                Some((id, t, _, _)) => {
+                Some((id, t, _, _, _)) => {
                     *t = Instant::now();
                     *id
                 }
@@ -877,7 +921,7 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
                     // session 级日志（建时一次，包循环不打）：UDP flood 排查看 session 数，
                     // 每包日志会把盘打爆。
                     tracing::info!("udp session {peer} -> sid={id} tunnel={_sess_pname} host={_sess_host}");
-                    sessions.insert(peer, (id, Instant::now(), out_cached, sess_limiter));
+                    sessions.insert(peer, (id, Instant::now(), out_cached, sess_limiter, ctl.clone()));
                     // UDP 连接行（peer 一行；since 每次收包刷新见下）
                     {
                         let ag = s2.agents.read().await;
@@ -916,7 +960,7 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
             // 每包只 take（Mutex 临界区极短，零 agents/rate_limiters 锁）。
             // 窗口按映射共享（sess 建时同 key 同 limiter，见 limiter_for 同 key 复用）。
             {
-                let lim = sessions.get(&peer).and_then(|(_, _, _, l)| l.clone());
+                let lim = sessions.get(&peer).and_then(|(_, _, _, l, _)| l.clone());
                 if let Some(l) = lim {
                     let d = l.take(payload.len()).await;
                     if !d.is_zero() {
@@ -939,7 +983,7 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
             // sessions 表建时已缓存 (sid -> outbox sender)，包循环只碰 sessions+conns。
             // agent 级 rx 由 persist 循环批量刷（conns 行 rx 为准）。
             let owner: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>> = {
-                sessions.get(&peer).and_then(|(id, _, o, _)| {
+                sessions.get(&peer).and_then(|(id, _, o, _, _)| {
                     if *id == sid {
                         Some(o.clone())
                     } else {
@@ -969,6 +1013,35 @@ mod tests {
         // 字段类型为 u64，可经 --udp-session-ttl 覆盖；0 在 run() 里回退默认值。
         let s = crate::server::state::Shared::default();
         assert_eq!(s.udp_session_ttl_secs, 0, "derive(Default) 给 0，必须在 run() 显式赋值");
+    }
+
+    /// RED：session 过期时必须产出「要通知 agent 关掉」的 sid 列表。
+    /// 根因→修法：旧代码 `sessions.retain(...)` 只删本地表项，从不发 Close，
+    /// 于是 agent 侧那条 udp 流的 socket 只能靠自己的 idle 超时回收——
+    /// server 5s 就忘了这个 sid，agent 却还挂着 fd（HK 2026-10-23 现场：
+    /// 5min 建 158 个 session，snail 侧 socket 只增不减）。
+    /// 修法：过期回收时把 sid 收集出来，逐个 ctl.send(Close)，让 agent 立刻关 socket。
+    /// 纯函数：只吃 (now, ttl, 表) 吐 sid 列表，无 IO 可单测。
+    #[test]
+    fn expired_sessions_yield_close_list() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mk = |p: u16| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, p));
+        // (peer, sid, 上次收包时刻)：20000 刚活跃；20001/20002 已静默超 5s。
+        let sessions = vec![
+            (mk(20000), 7u32, now - Duration::from_millis(100)),
+            (mk(20001), 8, now - Duration::from_secs(9)),
+            (mk(20002), 9, now - Duration::from_secs(6)),
+        ];
+        let mut got = super::expired_sids(&sessions, now, Duration::from_secs(5));
+        got.sort_unstable();
+        assert_eq!(got, vec![8, 9], "静默超 ttl 的都该被回收");
+        // 活跃的（刚收过包）绝不能回收：否则 uTP 长连接每包重建 socket。
+        assert!(!got.contains(&7));
+        // 全活跃 -> 空列表（不产生任何 Close）
+        let live = vec![(mk(20000), 7u32, now)];
+        assert!(super::expired_sids(&live, now, Duration::from_secs(5)).is_empty());
     }
 
     /// RED：UDP session 目标解析必须是纯函数（不碰 agents 锁）。

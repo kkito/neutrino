@@ -706,7 +706,20 @@ async fn open_udp_stream_to(
             }
         }
     });
-    let _ = tokio::join!(ws_to_udp, udp_to_ws);
+    // 根因→修法：旧 `tokio::join!(ws_to_udp, udp_to_ws)` 要求两侧都结束。
+    // ws_to_udp 到了 UDP_STREAM_IDLE_SECS 会 break，但 udp_to_ws 阻塞在 `sock.recv()`
+    // 上（对端一直没回包就等于永等），join! 于是永不返回——下面两行永远执行不到：
+    // `ctx.streams.remove(&sid)` 不执行、`Arc<UdpSocket>` 最后一个引用不 drop。
+    // 每条 udp 流漏 1 fd + 2 task，DHT 扫描器持续造流即 EMFILE。
+    // 现改为 select!：任一侧结束就 abort 另一侧，主干必定往下走到收尾。
+    // 注意不能干脆不给 udp_to_ws 超时——它本身是“目标回包”的正向路径，
+    // 只能被另一侧取消，否则会把活跃流的回包也误杀。
+    let mut ws_to_udp = ws_to_udp;
+    let mut udp_to_ws = udp_to_ws;
+    tokio::select! {
+        _ = &mut ws_to_udp => { udp_to_ws.abort(); }
+        _ = &mut udp_to_ws => { ws_to_udp.abort(); }
+    }
     ctx.streams.write().await.remove(&sid);
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = pkt.send_ctrl(&e);
@@ -734,6 +747,57 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use tokio::sync::{mpsc, RwLock};
+    /// RED：udp 流在 server 不再发数据后，必须自己活不下来——
+    /// 既要从 ctx.streams 里消失，也要把 socket drop 掉（fd 归还）。
+    ///
+    /// 根因→修法：旧实现两条 pump 用 `tokio::join!` 且 udp→ws 侧 `r.recv()`
+    /// 没有任何超时。ws→udp 侧 UDP_STREAM_IDLE_SECS 到了会 break，但 udp→ws
+    /// 永远阻塞在 recv 上，于是 `join!` 永不返回 → 下面两行永不执行：
+    /// `ctx.streams.remove(&sid)` / socket `Arc` 的最后一个引用不 drop。
+    /// 每条 udp 流一路漏 1 fd + 2 task，24h 就是 EMFILE（HK 2026-10-23 现场：
+    /// server 5s 就回收了 session，snail 侧 socket 只增不减）。
+    /// 修法：join! → select!，任一侧结束即 abort 另一侧，确保走到收尾。
+    #[tokio::test]
+    async fn udp_stream_frees_socket_when_server_goes_idle() {
+        use std::sync::Arc;
+        let (otx, mut orx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // 排空写泵输出，避免 channel 积压影响断言
+        tokio::spawn(async move { while orx.recv().await.is_some() {} });
+        let pkt = super::Pkt {
+            out: otx,
+            key: [0u8; 32],
+            session: 1,
+            rel: Arc::new(std::sync::Mutex::new(super::RelSend::new())),
+        };
+        let ctx = Arc::new(super::KCtx {
+            proxies: RwLock::new(vec![]),
+            link_tasks: tokio::sync::Mutex::new(HashMap::new()),
+            streams: RwLock::new(HashMap::new()),
+            pending: RwLock::new(HashMap::new()),
+            udp_slots: Arc::new(tokio::sync::Semaphore::new(super::KUDUS_MAX_UDP_STREAMS)),
+        });
+        // 目标 socket：绑本地，永不回包（模拟黑洞目标）。
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sid = 42u32;
+        let c2 = ctx.clone();
+        let t = tokio::spawn(async move { super::open_udp_stream_to(c2, pkt, sid, sock).await });
+        // 等流注册完成
+        for _ in 0..100 {
+            if ctx.streams.read().await.contains_key(&sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ctx.streams.read().await.contains_key(&sid), "流应已注册");
+        // 不给任何下行数据：等过 idle 超时 + 宽限。
+        let idle = std::time::Duration::from_secs(super::UDP_STREAM_IDLE_SECS);
+        let done = tokio::time::timeout(idle + std::time::Duration::from_secs(5), t).await;
+        assert!(done.is_ok(), "udp 流在 server 静默后仍不退出：join! 卡在无超时的 udp->ws recv 上");
+        assert!(!ctx.streams.read().await.contains_key(&sid), "退出后必须清理 streams 表项，否则通道与 socket 一起漏");
+    }
+
     #[test]
     fn udp_concurrency_capped() {
         // snail 2026-10-23：无上限时 DHT flood 每流 1 fd 打满 1024 EMFILE。

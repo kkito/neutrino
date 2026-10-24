@@ -72,6 +72,8 @@ struct Env {
     desired_path: std::path::PathBuf,
     _srv: tokio::process::Child, // kill_on_drop -> cleaned up at test end
     _ag: tokio::process::Child,
+    /// agent 子进程 pid：UDP socket 泄漏回归需要观测它的 fd 数。
+    ag_pid: u32,
 }
 
 /// e2e 子进程输出策略：负向用例（非法 TOML reload 等）会故意触发 server
@@ -150,6 +152,7 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
     // 故缩短到 100ms：不会改变任何用例的正确性（它们都有自己的轮询兜底），
     // 但把每个用例的无谓等待从 1s 降到 0.1s。
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let ag_pid = ag.id().unwrap_or(0);
     Env {
         http_port: ws_port, // HTTP 入站与 ws+WebUI 同端口（Host 路由）
         web_base: format!("http://127.0.0.1:{ws_port}"),
@@ -157,11 +160,78 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
         desired_path: desired_path.clone(),
         _srv: srv,
         _ag: ag,
+        ag_pid,
     }
 }
 
 async fn boot(proxies_toml: &str) -> Env {
     boot_with_desired(proxies_toml, None).await
+}
+
+/// 同 boot，但可指定 `--udp-session-ttl`（UDP socket 泄漏回归要把 TTL 压到秒级）。
+async fn boot_udp_ttl(proxies_toml: &str, ttl_secs: u64) -> Env {
+    let ws_port = free_port();
+    let dir = std::env::temp_dir().join(format!("nt-e2e-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let cfg_path = dir.join("agent.toml");
+    tokio::fs::write(
+        &cfg_path,
+        format!("hostname = \"e2e\"\ntoken = \"s3cret\"\n{proxies_toml}"),
+    )
+    .await
+    .unwrap();
+    let data = dir.join("data");
+    tokio::fs::create_dir_all(&data).await.unwrap();
+    let desired_path = dir.join("desired.toml");
+    let bin = env!("CARGO_BIN_EXE_neutrino").to_string();
+    let srv = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{ws_port}"),
+            "--data",
+            data.to_str().unwrap(),
+            "--desired",
+            desired_path.to_str().unwrap(),
+            "--token",
+            "s3cret",
+            "--udp-session-ttl",
+            &ttl_secs.to_string(),
+            "--live-tick-ms", "50",
+            "--traffic-tick-ms", "50",
+            "--limiter-tick-ms", "50",
+            "--persist-tick-ms", "50",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let ag = tokio::process::Command::new(&bin)
+        .stdout(e2e_stdio())
+        .stderr(e2e_stdio())
+        .args([
+            "agent",
+            "--server",
+            &format!("ws://127.0.0.1:{ws_port}/ws"),
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ag_pid = ag.id().unwrap_or(0);
+    Env {
+        http_port: ws_port,
+        web_base: format!("http://127.0.0.1:{ws_port}"),
+        data_dir: data,
+        desired_path: desired_path.clone(),
+        _srv: srv,
+        _ag: ag,
+        ag_pid,
+    }
 }
 
 /// 生 HTTP GET（裸 TCP 组装），可指定任意 Host/路径：覆盖浏览器打 IP、
@@ -690,13 +760,16 @@ async fn boot_quic(proxies_toml: &str) -> Env {
         .spawn()
         .unwrap();
         // boot 变体：同 boot_with_desired，粗同步从 1s 降到 100ms（真收敛由用例自证）。
-    tokio::time::sleep(Duration::from_millis(100)).await; Env {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ag_pid = ag.id().unwrap_or(0);
+    Env {
         http_port: ws_port,
         web_base: format!("http://127.0.0.1:{ws_port}"),
         data_dir: data,
         desired_path: desired_path.clone(),
         _srv: srv,
         _ag: ag,
+        ag_pid,
     }
 }
 
@@ -912,13 +985,16 @@ async fn boot_kudus(proxies_toml: &str) -> Env {
         .spawn()
         .unwrap();
         // boot 变体：同 boot_with_desired，粗同步从 1s 降到 100ms（真收敛由用例自证）。
-    tokio::time::sleep(Duration::from_millis(100)).await; Env {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ag_pid = ag.id().unwrap_or(0);
+    Env {
         http_port: ws_port,
         web_base: format!("http://127.0.0.1:{ws_port}"),
         data_dir: data,
         desired_path: desired_path.clone(),
         _srv: srv,
         _ag: ag,
+        ag_pid,
     }
 }
 
@@ -1263,6 +1339,7 @@ async fn kudus_many_proxies_ctrl_frag_converges() {
     // 原 `sleep(1s)`：盲等 agent/配置就绪。改为“短轮询+短兜底”——
     // 已收敛的场景秒过，真正需要时间的负向场景仍在 1s 内交回给用例自己断言。
     settle().await;
+    let ag_pid = ag.id().unwrap_or(0);
     let env = Env {
         http_port: ws_port,
         web_base: format!("http://127.0.0.1:{ws_port}"),
@@ -1270,6 +1347,7 @@ async fn kudus_many_proxies_ctrl_frag_converges() {
         desired_path: desired_path.clone(),
         _srv: srv,
         _ag: ag,
+        ag_pid,
     };
     let mut ok = false;
     for _ in 0..75 {
@@ -2985,5 +3063,80 @@ async fn e2e_tcp_ratelimit_throttles_uplink() {
     eprintln!("[uplink-limited] up={dt:?}");
     // 理论下限 256KB/0.5MB/s=0.5s，留余量防计时抖动
     assert!(dt >= Duration::from_millis(400), "上行限速未生效：{dt:?}");
+    let _ = env;
+}
+
+/// 回归：UDP session 过期后，agent 侧 socket（fd）必须被释放。
+///
+/// 旧代码两个独立缺陷叠加，缺任一都不会漏：
+/// 1. server `sessions.retain(..)` 只删本地表项，**从不发 Close**；
+/// 2. agent 的 udp 泵用 `join!(ws_to_udp, udp_to_ws)`，而 udp→ws 侧阻塞在
+///    `sock.recv()` 上无超时 —— 只有 ws→udp 侧 idle 到期，join! 永不返回，
+///    `ctx.streams.remove(&sid)` 与 socket drop 都执行不到。
+///
+/// 复现：把 server TTL 压到 1s，用大量**不同源端口**的 UDP 包造 session
+/// （DHT 扫描器语义：一问一答后不再说话），然后看 agent 的 fd 数。
+/// 旧代码：每个 peer 漏 1 fd + 2 task，fd 单调上涨；新代码：session 过期即
+/// 收到 Close → agent 关 socket → fd 回落到基线附近。
+#[tokio::test]
+async fn e2e_udp_session_expiry_frees_agent_sockets() {
+    fn fd_count(pid: u32) -> usize {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    // 后端黑洞：收到也不回包（扫描器目标 DHT 节点的典型行为）
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            if back.recv_from(&mut b).await.is_err() {
+                break;
+            }
+        }
+    });
+    let rport = free_port();
+    let env = boot_udp_ttl(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\nremote_port={rport}\n"
+    ), 1)
+    .await;
+    settle().await;
+    let base = fd_count(env.ag_pid);
+    eprintln!("[udp-fd] baseline={base}");
+
+    // 造 120 个不同源端口的 peer：每个发 1 包就走（不复用 = 每个都是新 session）
+    for _ in 0..120 {
+        let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = cli.send_to(&[0xAAu8; 64], format!("127.0.0.1:{rport}")).await;
+        // 一点点间隔，避免 server 收包缓冲溢出丢包（丢了就不建 session）
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    // 等 server 建成 session + agent 开 socket：轮询 fd 是否明显上涨。
+    let mut peak = base;
+    for _ in 0..40 {
+        peak = peak.max(fd_count(env.ag_pid));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!("[udp-fd] peak={peak} (delta={})", peak as i64 - base as i64);
+
+    // TTL=1s，等 2.5s（>=2 轮过期 + Close 传播）后 fd 必须回落。
+    // 旧代码此时 fd 仍停留在峰值附近（socket 靠 agent 自身 30s idle 才回收，
+    // 且 join! 死锁下 30s 后也回收不了），断言即红。
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let after = fd_count(env.ag_pid);
+    eprintln!("[udp-fd] after-expiry={after} (delta={})", after as i64 - base as i64);
+
+    assert!(
+        after < peak,
+        "UDP session 过期后 agent fd 未回落（peak={peak} after={after}）：\
+         server 没发 Close 或 agent join! 卡死导致 socket 不释放"
+    );
+    // 收敛到基线附近：允许少量抖动（tokio fd/日志文件等），但不能是 120 量级残留。
+    assert!(
+        after <= base + 20,
+        "UDP session 过期后 agent fd 残留过多（base={base} after={after}）：socket 泄漏"
+    );
     let _ = env;
 }

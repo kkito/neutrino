@@ -436,7 +436,15 @@ async fn open_udp_stream_sock(ctx: Arc<QCtx>, sid: u32, sock: tokio::net::UdpSoc
             }
         }
     });
-    let _ = tokio::join!(ws_to_udp, udp_to_ws);
+    // 根因→修法：同 kudus / WSS 的 udp 流泄漏——旧 `join!` 卡在无超时的
+    // udp→ws `recv` 上，ws→udp 侧 idle 到期也推不动收尾，streams 表项与
+    // socket 双双漏掉。改 select!，任一侧结束即 abort 另一侧。
+    let mut ws_to_udp = ws_to_udp;
+    let mut udp_to_ws = udp_to_ws;
+    tokio::select! {
+        _ = &mut ws_to_udp => { udp_to_ws.abort(); }
+        _ = &mut udp_to_ws => { ws_to_udp.abort(); }
+    }
     ctx.streams.write().await.remove(&sid);
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = send_ctrl(&ctx.out, &e);
