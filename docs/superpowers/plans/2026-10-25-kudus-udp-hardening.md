@@ -2946,7 +2946,7 @@ git commit -m "docs(agents): 记录 RetxBuf 上限/退避与背压阈值+硬上�
 | §10.3 session 单测 | Task 8, 13, 15 | ✅ |
 | §10.4 e2e | Task 16 | ✅ |
 | §10.5 核心回归 | Task 5 | ✅ |
-| §15 可观测性（日志补强） | Task 0a/0b/0c, 18 | ✅（Task 18 待做） |
+| §15 可观测性（日志补强） | Task 0a/0b/0c, 18 | ✅ |
 
 **§7.4 偏离说明**：原 spec 设想池共享 socket 用 `send_to`。实施时发现同目标
 （如 transmission 51413）多条流回包源地址完全相同，unconnected socket 无法

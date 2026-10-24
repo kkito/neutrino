@@ -22,8 +22,8 @@ cargo test --test e2e <name>       # 跑单个 e2e
 
 ## 测试现状（2026-10-24）
 - 单测 178（`src/server/*::tests`、`src/agent*::tests`、`src/common/kudus.rs::tests`、`src/main.rs::main_tests`）。
-- e2e 37（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link/udp 多 peer 并发。
-- 全量串行：单测 ~13s + e2e ~46s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
+- e2e 40（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link/udp 多 peer 并发/日志可观测性（tunnel stats 行、无 INFO 刷屏、retx 格式）。
+- 全量串行：单测 ~13s + e2e ~48s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
 
 ### 测试等待规范（必读，已优化过一轮）
 禁止盲等 `sleep(Ns)` 来“等某状态就绪”。两类正确做法：
@@ -74,3 +74,9 @@ cargo test --test e2e <name>       # 跑单个 e2e
 - server UDP ingress 把 `SO_RCVBUF` 钳到 64KB（刻意的丢包限速）。突发灌包会先溢出内核缓冲：
   实测 160/200/240/256 个包**恒定只进 137 个**，丢包发生在 ingress 之前、与 sid 上限无关。
   写 UDP e2e 压测必须错峰发，否则测的是内核缓冲而不是业务逻辑。
+- per-connection 日志（`tcp accept`/`tcp close`）只在 `ensure_tcp_listener`（per remote_port
+  的 tcp ingress）里，**HTTP 隧道走 fallback 按 Host 路由，不经过那里**——写"日志降噪"类
+  测试必须用 `type="tcp"` + `remote_port`，用 `type="http"` 测不到。反过来，`tunnel_stats`
+  现在两条路径都埋点（HTTP 由 `HttpConnGuard` 的 Drop 累加 closes）。
+- e2e 隧道配置必须写 server 的 `desired.toml`（desired 是唯一源头），写进 agent 本地
+  `proxies` 会被忽略；且 `type="tcp"` 忽略 `domains`，用 `domains` 必须 `type="http"`。
