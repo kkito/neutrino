@@ -44,6 +44,73 @@ async fn api_access_log(
 }
 
 pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool, udp_session_ttl: u64) -> anyhow::Result<()> {
+    run_with_ticks(listen, _http_in, data, token, desired, quic_listen, kudus_listen, allow_agent_admin, udp_session_ttl, TickPeriods::default()).await
+}
+
+/// 后台 tick 周期（可配）。
+///
+/// 根因→修法：这四个周期原本硬编码在各个 `interval(Duration::from_secs(..))` 里，
+/// e2e 无法压缩时间——/api/live 要等两个 5s tick（建基线 + 出增量）才见到数据，
+/// 单用例就得真等 ~10s（实测稳定在 7.96s 命中，改轮询间隔无效，因为瓶颈是 tick 本身）。
+/// 抽成参数后：生产默认值与旧硬编码完全一致（行为零变化，见 tick_tests），
+/// 测试传几十毫秒即可把这类用例从秒级降到毫秒级。
+#[derive(Debug, Clone, Copy)]
+pub struct TickPeriods {
+    /// live 速率快照（/api/live 的数据源）
+    pub live: Duration,
+    /// 流量归集 + traffic.json 落盘
+    pub traffic: Duration,
+    /// 限速器窗口计数
+    pub limiter: Duration,
+    /// periodic persist（state 定期落盘）
+    pub persist: Duration,
+}
+
+impl Default for TickPeriods {
+    fn default() -> Self {
+        Self {
+            live: Duration::from_secs(5),
+            traffic: Duration::from_secs(60),
+            limiter: Duration::from_secs(300),
+            persist: Duration::from_secs(30),
+        }
+    }
+}
+
+impl TickPeriods {
+    /// 从毫秒构造；任一项为 0 则回退该项默认值
+    /// （interval(0) 是忙等/panic，绝不能放行）。
+    pub fn from_millis(live: u64, traffic: u64, limiter: u64, persist: u64) -> Self {
+        let d = Self::default();
+        let pick = |ms: u64, def: Duration| {
+            if ms == 0 {
+                def
+            } else {
+                Duration::from_millis(ms)
+            }
+        };
+        Self {
+            live: pick(live, d.live),
+            traffic: pick(traffic, d.traffic),
+            limiter: pick(limiter, d.limiter),
+            persist: pick(persist, d.persist),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_ticks(
+    listen: &str,
+    _http_in: &str,
+    data: &str,
+    token: &str,
+    desired: &str,
+    quic_listen: &str,
+    kudus_listen: &str,
+    allow_agent_admin: bool,
+    udp_session_ttl: u64,
+    ticks: TickPeriods,
+) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
     if !_http_in.is_empty() {
         tracing::warn!("--http-in is deprecated and ignored: HTTP ingress now shares --listen (Host routing)");
@@ -101,7 +168,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     {
         let s = shared.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(5));
+            let mut iv = tokio::time::interval(ticks.live);
             loop {
                 iv.tick().await;
                 let cur = { let g = s.conns.read().await; state::aggregate_conns(&*g) };
@@ -170,7 +237,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
         let s = shared.clone();
         let data = data.to_string();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(60));
+            let mut iv = tokio::time::interval(ticks.traffic);
             loop {
                 iv.tick().await;
                 let (nconns, ntun) = {
@@ -224,7 +291,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     {
         let s = shared.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(300));
+            let mut iv = tokio::time::interval(ticks.limiter);
             loop {
                 iv.tick().await;
                 let lims = s.rate_limiters.read().await;
@@ -244,7 +311,7 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     {
         let s = shared.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(30));
+            let mut iv = tokio::time::interval(ticks.persist);
             loop {
                 iv.tick().await;
                 // fold live counters into totals
@@ -322,3 +389,42 @@ pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired:
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    /// 默认值必须与改造前的硬编码一致：5s / 60s / 300s / 30s。
+    /// 根因：这些周期原本写死在 interval(...) 里，测试无法压缩时间，
+    /// 导致 e2e 必须真等 2 个 live tick（约 10s）。抽成可配参数后，
+    /// 生产默认行为不变（此测试锁死），测试可传极短值加速。
+    #[test]
+    fn defaults_match_legacy_hardcoded() {
+        let p = TickPeriods::default();
+        assert_eq!(p.live, Duration::from_secs(5));
+        assert_eq!(p.traffic, Duration::from_secs(60));
+        assert_eq!(p.limiter, Duration::from_secs(300));
+        assert_eq!(p.persist, Duration::from_secs(30));
+    }
+
+    /// 传 0 或未设置（=0）时回退到默认，避免 interval(0) panic / 忙等。
+    #[test]
+    fn zero_falls_back_to_default() {
+        let p = TickPeriods::from_millis(0, 0, 0, 0);
+        let d = TickPeriods::default();
+        assert_eq!(p.live, d.live);
+        assert_eq!(p.traffic, d.traffic);
+        assert_eq!(p.limiter, d.limiter);
+        assert_eq!(p.persist, d.persist);
+    }
+
+    /// 显式传入时逐项生效（测试提速的关键路径）。
+    #[test]
+    fn explicit_millis_are_applied() {
+        let p = TickPeriods::from_millis(20, 40, 80, 160);
+        assert_eq!(p.live, Duration::from_millis(20));
+        assert_eq!(p.traffic, Duration::from_millis(40));
+        assert_eq!(p.limiter, Duration::from_millis(80));
+        assert_eq!(p.persist, Duration::from_millis(160));
+    }
+}

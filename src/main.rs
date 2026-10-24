@@ -52,6 +52,18 @@ enum Cmd {
         /// optional pid file for --detach
         #[arg(long, default_value = "")]
         pid_file: String,
+        /// live 速率快照 tick 周期（毫秒）0=默认 5000。仅调试/测试用，生产勿改。
+        #[arg(long, default_value_t = 0)]
+        live_tick_ms: u64,
+        /// 流量归集/落盘 tick 周期（毫秒）0=默认 60000。仅调试/测试用。
+        #[arg(long, default_value_t = 0)]
+        traffic_tick_ms: u64,
+        /// 限速器窗口计数 tick 周期（毫秒）0=默认 300000。仅调试/测试用。
+        #[arg(long, default_value_t = 0)]
+        limiter_tick_ms: u64,
+        /// 定期落盘 tick 周期（毫秒）0=默认 30000。仅调试/测试用。
+        #[arg(long, default_value_t = 0)]
+        persist_tick_ms: u64,
     },
     /// Run as agent (snail side)
     Agent {
@@ -180,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
             detach,
             log_file,
             pid_file,
+            live_tick_ms,
+            traffic_tick_ms,
+            limiter_tick_ms,
+            persist_tick_ms,
         } => {
             let log = if log_file.is_empty() {
                 format!("{data}/neutrino.log")
@@ -191,7 +207,13 @@ async fn main() -> anyhow::Result<()> {
             }
             let token =
                 std::env::var("NEUTRINO_TOKEN").unwrap_or(token);
-            server::run(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl).await
+            let ticks = server::TickPeriods::from_millis(
+                live_tick_ms,
+                traffic_tick_ms,
+                limiter_tick_ms,
+                persist_tick_ms,
+            );
+            server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, ticks).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
             let log = if log_file.is_empty() {
