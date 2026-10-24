@@ -429,9 +429,49 @@ fn format_tunnel_stats_line(
     lines.join("\n")
 }
 
+/// 格式化单会话重传统计行（spec §15.3）。全零跳过（干净链路不刷屏）。
+///
+/// 例：`kudus retx session=3f2a1b8c hostname=minipc7s sent=4821 abandoned=0 full=0 backlog_max=1024`
+fn format_retx_stats_line(
+    session: &str,
+    hostname: &str,
+    s: &crate::common::kudus::RetxStats,
+) -> String {
+    if s.sent + s.abandoned + s.full == 0 && s.backlog_max == 0 {
+        return String::new();
+    }
+    format!(
+        "kudus retx session={session} hostname={hostname} sent={} abandoned={} full={} backlog_max={}",
+        s.sent, s.abandoned, s.full, s.backlog_max
+    )
+}
+
 #[cfg(test)]
 mod tick_tests {
     use super::*;
+
+    /// spec §15.3：单会话重传统计行格式。
+    #[test]
+    fn retx_stats_line_format() {
+        let st = crate::common::kudus::RetxStats {
+            sent: 4821,
+            abandoned: 0,
+            full: 0,
+            backlog_max: 1024,
+        };
+        let line = format_retx_stats_line("3f2a1b8c", "minipc7s", &st);
+        assert_eq!(
+            line,
+            "kudus retx session=3f2a1b8c hostname=minipc7s sent=4821 abandoned=0 full=0 backlog_max=1024"
+        );
+    }
+
+    /// spec §15.3：全零统计不产生日志（干净链路不刷屏）。
+    #[test]
+    fn retx_stats_skips_idle() {
+        let st = crate::common::kudus::RetxStats::default();
+        assert!(format_retx_stats_line("a", "h", &st).is_empty());
+    }
 
     /// 默认值必须与改造前的硬编码一致：5s / 60s / 300s / 30s。
     /// 根因：这些周期原本写死在 interval(...) 里，测试无法压缩时间，

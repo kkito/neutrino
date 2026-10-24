@@ -215,6 +215,10 @@ pub(crate) async fn session(
     let retx_task = {
         use std::sync::TryLockError;
         let p = pkt.clone();
+        // spec §15.3：agent 侧重传埋点，60s 节流打一次汇总（与 server 侧对称）。
+        let sess_hex = format!("{:08x}", pkt.session);
+        let host_name = up.hostname.clone();
+        let mut last_stats_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
             loop {
@@ -222,6 +226,16 @@ pub(crate) async fn session(
                 let due = match p.rel.try_lock() {
                     Ok(mut r) => {
                         let d = r.retx.take_expired(crate::common::kudus::KUDUS_RTO, crate::common::kudus::now_ms());
+                        if last_stats_at.elapsed() >= std::time::Duration::from_secs(60) {
+                            last_stats_at = std::time::Instant::now();
+                            let st = r.retx.take_stats();
+                            if st.sent + st.abandoned + st.full > 0 || st.backlog_max > 0 {
+                                tracing::info!(
+                                    "kudus retx session={} hostname={} sent={} abandoned={} full={} backlog_max={}",
+                                    sess_hex, host_name, st.sent, st.abandoned, st.full, st.backlog_max
+                                );
+                            }
+                        }
                         let snap = (r.ack, r.sack);
                         drop(r);
                         d.into_iter().map(|(s, b)| (s, b, snap)).collect::<Vec<_>>()

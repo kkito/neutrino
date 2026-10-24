@@ -118,6 +118,8 @@ async fn handle_conn(
     // 注意：超时/错 token 一律静默返回（黑洞，无回包无事件，见 design §2）；
     // 仅 debug 留痕（默认 info 不可见），方便 RUST_LOG=debug 排错。
     let (mut hostname, mut version) = (String::new(), String::new());
+    // spec §15.3：重传泵要打 hostname，但它在握手时才确定，用共享槽传递。
+    let hn_shared = Arc::new(std::sync::RwLock::new(String::new()));
     // 握手收包同样做 ACK/去重（SYN 重传去重靠 ReorderBuf 之前置的 win 即可，此处轻量处理）。
     let hello_ok = loop {
         match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
@@ -132,8 +134,11 @@ async fn handle_conn(
                             tracing::debug!("kudus hello bad token from {p}");
                             return; // 黑洞：不回包
                         }
-                        hostname = hn;
+                        hostname = hn.clone();
                         version = v;
+                        if let Ok(mut w) = hn_shared.write() {
+                            *w = hn;
+                        }
                         break true;
                     }
                     _ => {
@@ -377,12 +382,29 @@ async fn handle_conn(
     let retx_task = {
         let txr = tx.clone();
         let relr = rel.clone();
+        // spec §15.3：重传埋点采集。泵 50ms 一拍，但汇总行 60s 一次就够——
+        // 这里用「距上次打印 >= 60s」节流，不额外开 tick。
+        let sess_hex = format!("{session:08x}");
+        let host_shared = hn_shared.clone();
+        let mut last_stats_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(50));
             loop {
                 iv.tick().await;
                 let Ok(mut guard) = relr.try_lock() else { continue };
                 let due = guard.retx.take_expired(crate::common::kudus::KUDUS_RTO, now_ms());
+                // spec §15.3：汇总行（60s 节流），取走即归零打增量。
+                let quiet = guard.retx.is_empty();
+                if last_stats_at.elapsed() >= Duration::from_secs(60) {
+                    last_stats_at = std::time::Instant::now();
+                    let st = guard.retx.take_stats();
+                    let hn = host_shared.read().map(|h| h.clone()).unwrap_or_default();
+                    let line = crate::server::format_retx_stats_line(&sess_hex, &hn, &st);
+                    if !line.is_empty() {
+                        tracing::info!("{line}");
+                    }
+                }
+                let _ = quiet;
                 let (ack, sack) = (guard.ack, guard.sack);
                 drop(guard);
                 if due.is_empty() {
