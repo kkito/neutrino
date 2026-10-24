@@ -3,6 +3,9 @@ Description=neutrino tunnel server
 After=network-online.target
 Wants=network-online.target
 
+# 日志留存：journald 默认不设上限，2026-10-23 事故后仅剩 2 天日志差点丢失。
+# 安装 deploy/journald-neutrino.conf 到 /etc/systemd/journald.conf.d/ 后
+# 重启 systemd-journald（500M / 30 天）。查日志：journalctl -u tunnel-server
 [Service]
 ExecStart=/root/nastools/tunnel/neutrino server --listen 127.0.0.1:7440 --data /root/nastools/tunnel/data
 Environment=NEUTRINO_TOKEN=welcome2neutrino
