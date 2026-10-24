@@ -203,6 +203,50 @@ SACK 状态全部不可信，重建是唯一能干净恢复的方式。agent 侧
 从 30s 降到 **5s**。30s 已证明过于宽松（事故持续近 2 小时）；5s 足够正常抖动
 （窗口 512 包排空通常远小于 5s）。
 
+### 5.5 agent 侧上行超时（对称修复）
+
+**与 server 侧是两个不同位置，不要混。**
+
+| 位置 | "发不出去"的含义 | 旧行为 | 新行为 |
+| ---- | ---------------- | ------ | ------ |
+| **server 侧**（本层） | server → 公网 peer 窗口满 | 30s 后静默继续发 | **5s 后 `bail!` 关会话** |
+| **agent 侧**（本节） | agent → HK 隧道窗口满 | **无限等待**（`wait_window` 无超时） | **5s 后丢弃该回包** |
+
+#### 问题
+
+`agent/kudus_session.rs:124` 的 `wait_window` 当前无超时：窗口满就 sleep 后重试，
+永远等下去。上行数据的来源是 transmission 的回包，虽然量小于下行，
+但若 HK 长期不腾窗口，回包会在内存里**持续积压**。
+
+#### 修复：超时后丢包（而非关会话）
+
+```rust
+pub const KUDUS_AGENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+match tokio::time::timeout(KUDUS_AGENT_SEND_TIMEOUT, wait_window()).await {
+    Ok(()) => { /* 正常发送 */ }
+    Err(_) => {
+        // 隧道拥堵：丢弃这个 UDP 回包。UDP 语义允许丢包，
+        // 对端会重传或放弃，不会造成协议错误。
+        stats.udp_send_dropped += 1;
+        warn_sampled("kudus agent send timeout, dropping udp reply (sid={sid})");
+    }
+}
+```
+
+#### 为何两侧策略不同
+
+| 侧 | 策略 | 理由 |
+| -- | ---- | ---- |
+| server | `bail!` 关会话 | server 是流量**入口**，卡住会积压大量数据（事故中 22.4MB/s 持续两小时） |
+| agent | 丢包 | agent 只是转发**回包**，丢一个 UDP 包是合法语义，且不会放大流量 |
+
+**关键对比（回答"现在发不出去怎么办"）**：
+
+- 旧代码：发不出去就**无限重发/无限等待** → 缓冲积压 → 内存膨胀 → 仍继续发
+- 新代码：server 侧**关会话重置状态**，agent 侧**丢包不再积压**
+- 两侧都保证：**任何情况下都不会无限堆积**
+
 ## 6. 层 3a：接收 buffer 改 2048 + 截断检测
 
 ### 6.1 改动
@@ -349,6 +393,7 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | RetxBuf 满 | 拒绝新包，返回 `RetxFull` | `retx_full` |
 | 重传超上限 | 丢弃 + 通知上层 | `retx_abandoned` |
 | 背压超时 | `bail!` 关会话 | `backpressure_timeout` |
+| agent 上行超时 | 丢弃该回包（UDP 合法语义） | `udp_send_dropped` |
 | UDP 可能截断 | 限频 warn | `udp_truncated` |
 | 池满踢流 | Close + 归还 socket | `pool_evicted` |
 | 池扩容 | debug 日志 | `pool_grown` |
@@ -380,6 +425,7 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | --- | --- |
 | `udp_recv_buf_is_small` | `UDP_RECV_BUF <= 2048` |
 | `udp_idle_timeout_is_5s` | `UDP_STREAM_IDLE_SECS == 5` |
+| `agent_send_timeout_drops_without_hang` | 窗口堵死时发送 5s 后丢弃并计数，不永久阻塞 |
 
 ### 10.4 e2e：`tests/e2e.rs`
 
@@ -402,7 +448,7 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
 | 1 | `RetxBuf` 重构（cap/退避/放弃） | 无 |
-| 2 | 背压 `bail!` | 阶段 1 |
+| 2 | 背压 `bail!` + agent 上行超时丢包 | 阶段 1 |
 | 3 | buffer 2048 + 截断检测 | 无 |
 | 4 | `udp_pool.rs` 新模块 | 无 |
 | 5 | 池接入 + 超时 5s | 阶段 4 |
@@ -422,6 +468,7 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | buffer 大小 | 2048 + 截断检测 | 覆盖 MTU 1500，静默丢数据需可发现 |
 | idle 超时 | 两端统一 5s | 用户决定 |
 | 背压超时 | 30s → 5s 且 `bail!` | 30s 已证明过宽；静默继续是根本问题 |
+| agent 上行超时 | 5s 后丢包（非关会话） | agent 只转发回包，丢 UDP 包是合法语义；两侧策略差异已在 §5.5 论证 |
 
 ## 13. 预期效果
 
@@ -431,6 +478,7 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | 最坏发送速率 | ≈39MB/s（无上限） | ≈25MB/s 理论上界，退避后实际远低 |
 | 永不丢弃的包 | 存在 | 不存在（10 次后放弃） |
 | 背压失效 | 30s 后静默继续 | 5s 后 `bail!` |
+| agent 上行堆积 | 无限等待 | 5s 后丢包，不积压 |
 | UDP 并发 peer | 256（超限全拒） | 512（超限踢 LRU） |
 | 每流 buffer | 64KB | 2KB |
 | 512 流总堆内存 | 32MB | 1MB |
@@ -445,3 +493,6 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
    措辞已用 `possibly`，可接受。
 3. **背压 bail 导致会话重建**：重建期 1~2s 断流。相比持续恶化，这是更优取舍，但需在
    上线后观察重建频率是否异常（埋点 `backpressure_timeout`）。
+4. **agent 丢包可能影响 BT 回包送达率**：隧道拥堵时会丢 UDP 回包。对 DHT 无影响
+   （本来就可丢），对 uTP 会触发对端重传。若上线后 `udp_send_dropped` 计数上升明显，
+   说明限速/窗口需要重新调，需纳入观查。
