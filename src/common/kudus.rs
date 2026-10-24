@@ -576,6 +576,45 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
 
+    /// 核心回归（2026-10-23 事故）：无 ACK 时，N 个包的累计发送次数必须有上界。
+    ///
+    /// 旧代码如何复现：take_expired 每次都刷新时间戳且无退避、无放弃、
+    /// 无容量上限，所以只要一直不 ACK，调用 1200 次 take_expired
+    /// 就会重发约 1200 次/包 —— 放大倍数 = 调用次数，无上界。
+    ///
+    /// 断言抓什么：模拟 60 秒、50ms 一拍（1200 拍），统计总重发次数。
+    /// 新代码因为退避 + 最大 10 次放弃，总重发次数必须 <= 单包上限 x 包数。
+    #[test]
+    fn retx_storm_does_not_amplify() {
+        let mut tx = super::RetxBuf::new(1);
+        const PKTS: usize = 256;
+        for i in 0..PKTS {
+            tx.on_send(vec![i as u8]).unwrap();
+        }
+
+        // 模拟 60s，每 50ms 调一次 take_expired（与 server 重传泵 interval 一致）
+        let mut sent_total = PKTS; // 首次发送也算
+        let mut t = super::now_ms();
+        let mut abandoned_seen = 0;
+        for _ in 0..1200 {
+            t += 50;
+            let due = tx.take_expired(Duration::from_millis(200), t);
+            sent_total += due.len();
+            // take_stats 取走即归零，故累加而不是覆盖
+            abandoned_seen += tx.take_stats().abandoned;
+        }
+
+        // 上界：每个包最多被重发 KUDUS_MAX_RETX 次
+        let upper = PKTS * (1 + super::KUDUS_MAX_RETX as usize);
+        assert!(
+            sent_total <= upper,
+            "重传放大失控：共发送 {sent_total} 次，上界 {upper}（每包 1 首发 + {} 重发）",
+            super::KUDUS_MAX_RETX
+        );
+        // 且必须有包被真正放弃（否则说明还在无限复活）
+        assert!(abandoned_seen > 0, "60s 无 ACK 应触发放弃，否则包永不丢弃");
+    }
+
     /// spec §15.3：RetxFull 拒收次数必须可见。
     #[test]
     fn retx_stats_counts_full() {
