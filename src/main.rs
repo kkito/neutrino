@@ -44,6 +44,10 @@ enum Cmd {
         /// 每包刷新 TTL，故活跃 uTP 长连接不会被回收，扫描器一问一答即清。
         #[arg(long, default_value_t = 5)]
         udp_session_ttl: u64,
+        /// UDP ingress socket 接收缓冲（KB，默认 256，0=默认）。
+        /// 太小会在用户态泵积压前就被内核丢包（丢包时打 ERROR 日志）。
+        #[arg(long, default_value_t = 0)]
+        udp_rcvbuf_kb: usize,
         /// detach to background (log to file, print pid and exit)
         #[arg(long)]
         detach: bool,
@@ -228,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
             kudus_listen,
             allow_agent_admin,
             udp_session_ttl,
+            udp_rcvbuf_kb,
             detach,
             log_file,
             pid_file,
@@ -257,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
                 limiter_tick_ms,
                 persist_tick_ms,
             );
-            server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, ticks).await
+            server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, udp_rcvbuf_kb, ticks).await
         }
         Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file, udp_idle_secs, udp_pool_max } => {
             if should_warn_log_file_ignored(detach, &log_file) {

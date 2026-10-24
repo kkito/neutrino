@@ -785,6 +785,77 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
 
 // ================= udp ingress (per remote_port, session per peer) =================
 
+/// UDP ingress socket 接收缓冲默认值（KB）。
+///
+/// 根因→修法：旧值 64KB（默认内核 ~6MB 的百分之一），注释里的意图是
+/// “用内核丢包当拥塞信号，让对端 uTP 感知丢包后降速”。但 64KB ÷ 1500B
+/// 只能容约 43 个包（内核 `rb` 记账是 setsockopt 的 2 倍，实测 rb=131072），
+/// 任何持续突发都会在用户态泵积压前就被内核丢掉——属于“为了限速牺牲正常吞吐”。
+///
+/// 2026-10-24 线上实测 51413 socket：`r0=0`（无积压）、`d0`（本 socket 丢包）=0，
+/// 说明当前负载下还没撞上，但余量已薄到只能容 85 个包。
+/// 256KB ≈ 340 个包，既保留丢包信号的语义，又给突发留出真余量。
+pub(crate) const UDP_RCVBUF_KB_DEFAULT: usize = 256;
+
+/// 解析 `--udp-rcvbuf-kb`：`0` = 未传 → 回退默认，
+/// 避免 0 被当成“缓冲 0”（内核会退到最小值，几乎全丢）。
+pub(crate) fn resolve_udp_rcvbuf_kb(cli: usize) -> usize {
+    if cli == 0 {
+        UDP_RCVBUF_KB_DEFAULT
+    } else {
+        cli
+    }
+}
+
+/// 判定本周期是否发生了新的 UDP 收包丢包（纯函数）。
+/// 返回 `Some(增量)` 表示要报 ERROR，`None` 表示静默。
+///
+/// 根因：旧代码只判 `setsockopt() != 0`（即“钳制失败”才 warn）。
+/// 但真正的危机是“钳制成功、然后一直在丢包”——这在日志里完全不可见。
+/// 线上整机 `RcvbufErrors / InDatagrams ≈ 17%`、而 neutrino 自己一行日志都没有，
+/// 就是这个盲区（同 2026-10-23 事故“日志 grep retx 全零”的翻版）。
+///
+/// `prev > cur`（进程重启后计数器归零 / u32 回绕）时不报，避免负数噪声。
+pub(crate) fn classify_udp_drops(prev: u64, cur: u64) -> Option<u64> {
+    if cur > prev { Some(cur - prev) } else { None }
+}
+
+/// 读 51413 这类 socket 的累计丢包数（`SO_MEMINFO` 的 `SK_MEMINFO_DROPS`）。
+/// 失败返回 None（内核老 / 不支持），调用方应静默跳过而不是炸。
+///
+/// 为何用 SO_MEMINFO 而不是解析 /proc/net/snmp：后者是**整机** UDP 统计，
+/// 混了 DNS/STUN/其它进程，无法回答“这个隧道丢了多少”。
+#[cfg(target_os = "linux")]
+fn socket_drops(fd: std::os::fd::RawFd) -> Option<u64> {
+    // SK_MEMINFO_DROPS = 10（linux/sock_diag.h）
+    const SK_MEMINFO_DROPS: usize = 10;
+    let mut meminfo = [0u32; 16];
+    let mut len = std::mem::size_of_val(&meminfo) as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            meminfo.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let n = len as usize / std::mem::size_of::<u32>();
+    if n > SK_MEMINFO_DROPS {
+        Some(meminfo[SK_MEMINFO_DROPS] as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_drops(_fd: std::os::fd::RawFd) -> Option<u64> {
+    None
+}
+
 /// 过期 session 的 sid 列表（纯函数，无 IO）。
 ///
 /// 根因→修法：旧 `sessions.retain(...)` 只删 server 本地表项，从不告诉 agent。
@@ -824,21 +895,30 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         // 唯一用户态能干的是让内核缓冲变小——超了内核直接丢包，对端 uTP 感知丢包
         // 后降速（类拥塞语义）。buffer 小 = 丢得早 = 对端发得少 = 网卡数字下来。
         // 失败只记 warn 不炸（钳不住就退化成旧行为）。
-        {
+        //
+        // 2026-10-24：默认从 64KB 提到 256KB（`--udp-rcvbuf-kb` 可调）。
+        // 64KB 只容内约 43 个包（内核 rb 记账翻倍，实测 rb=131072），
+        // 余量太薄；线上 51413 实测 r0=0/d0=0 尚未撞上，但没空间吃突发。
+        let fd = {
             use std::os::fd::AsRawFd;
-            let fd = sock.as_raw_fd();
-            let small: libc::c_int = 64 * 1024;
+            sock.as_raw_fd()
+        };
+        {
+            let kb = resolve_udp_rcvbuf_kb(s2.udp_rcvbuf_kb);
+            let bytes: libc::c_int = (kb * 1024) as libc::c_int;
             let r = unsafe {
                 libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
-                    &small as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&small) as libc::socklen_t,
+                    &bytes as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&bytes) as libc::socklen_t,
                 )
             };
             if r != 0 {
-                tracing::warn!("udp :{port} SO_RCVBUF clamp failed, unlimited buffer");
+                tracing::warn!("udp :{port} SO_RCVBUF set to {kb}KB failed, keeping kernel default");
+            } else {
+                tracing::info!("udp :{port} SO_RCVBUF set to {kb}KB");
             }
         }
         tracing::info!("udp ingress on 0.0.0.0:{port}");
@@ -859,10 +939,25 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
         // （池满踢流、断线）这些不走 TTL 的路径会让它无限增长。
         let mut sid_stats: HashMap<u32, String> = HashMap::new();
         let mut buf = vec![0u8; 65535];
+        // 丢包监控基线（socket 累计丢包数）。旧代码只判 setsockopt 失败，
+        // “钳制成功但一直丢包”在日志里完全不可见——见 classify_udp_drops 注释。
+        let mut prev_drops = socket_drops(fd);
         // TTL 语义：该 peer 静默多久就回收。每收一包都刷新 t（见下方 get_mut 分支），
         // 所以活跃 uTP 长连接永不过期，DHT 一问一答 / 扫描器发一次就走 → 秒级清掉。
         let ttl = Duration::from_secs(s2.udp_session_ttl_secs.max(1));
         loop {
+            // 丢包检测：与 TTL 扫描同频（每轮循环一次）。
+            // 只在“新增丢包”时报 ERROR，不丢就不吭声，避免刷屏。
+            if let (Some(prev), Some(cur)) = (prev_drops, socket_drops(fd)) {
+                if let Some(delta) = classify_udp_drops(prev, cur) {
+                    tracing::error!(
+                        "udp :{port} kernel dropped {delta} packets (total={cur}, rcvbuf={}KB) — \
+                         incoming burst exceeded socket buffer; raise --udp-rcvbuf-kb if sustained",
+                        resolve_udp_rcvbuf_kb(s2.udp_rcvbuf_kb)
+                    );
+                }
+                prev_drops = Some(cur);
+            }
             // expire old sessions（conns 表 UDP 行同步删）
             // 根因→修法：旧代码只 `retain` 删本地表就不管了，agent 侧那条 udp 流的
             // socket 只能等它自己的 idle 超时（30s/120s）回收，而 server TTL 只有 5s——
@@ -1101,6 +1196,41 @@ pub(crate) async fn ensure_udp_listener(s: &S, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 根因→修法：旧值 64KB 是故意钳小、用内核丢包当拥塞信号（对端 uTP 感知
+    /// 丢包后降速）。但 64KB ÷ 1500B ≈ 43 个包，任何持续突发都会在池积压前
+    /// 就被内核丢掉，属于“为了限速牺牲正常吞吐”。2026-10-24 实测 51413
+    /// 的 socket 级 `d0`（丢包）为 0、`r0` 为 0，说明当前负载下还没撞上，
+    /// 但余量已薄到只能容 85 个包（内核 rb 是 setsockopt 的 2 倍）。
+    /// 提到 256KB（≈340 个包）保留丢包信号语义，同时给突发留真余量。
+    #[test]
+    fn udp_rcvbuf_defaults_to_256k() {
+        assert_eq!(super::UDP_RCVBUF_KB_DEFAULT, 256);
+    }
+
+    /// `--udp-rcvbuf-kb` 的解析约定与其它参数一致：0 = 未传 → 回退默认，
+    /// 避免 0 被当成“缓冲 0”这种灾难值（内核会退到最小值，几乎全丢）。
+    #[test]
+    fn udp_rcvbuf_resolves_cli_override() {
+        assert_eq!(super::resolve_udp_rcvbuf_kb(0), super::UDP_RCVBUF_KB_DEFAULT);
+        assert_eq!(super::resolve_udp_rcvbuf_kb(64), 64);
+        assert_eq!(super::resolve_udp_rcvbuf_kb(1024), 1024);
+    }
+
+    /// 超限告警的纯判定：只要对方分丢失数增加就要报 ERROR。
+    /// 根因：旧代码只判 `setsockopt != 0`（即“钳制失败”才 warn），
+    /// 但真正的危机是“钳制成功、然后一直在丢包”——这在日志里完全不可见。
+    /// 线上整机 `RcvbufErrors / InDatagrams ≈ 17%` 却无任何 neutrino 侧日志，
+    /// 就是这个盲区。
+    #[test]
+    fn drop_delta_triggers_error() {
+        // 无新增丢包：不报。
+        assert_eq!(super::classify_udp_drops(100, 100), None);
+        // 有新增丢包：报，且带上增量。
+        assert_eq!(super::classify_udp_drops(100, 105), Some(5));
+        // 计数器回绕/重置（进程重启后 getsockopt 归零）：不报负数。
+        assert_eq!(super::classify_udp_drops(105, 3), None);
+    }
     /// UDP session TTL 默认 5s 且可配。根因→修法：旧值写死 120s（照抄 conntrack
     /// stream 超时），DHT 扫描器每个新源端口建一条 session，120s 内同 IP 堆几十条
     /// → snail 侧 256 槽位瞬间打满（too many udp streams）。

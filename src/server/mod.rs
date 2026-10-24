@@ -43,8 +43,8 @@ async fn api_access_log(
     resp
 }
 
-pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool, udp_session_ttl: u64) -> anyhow::Result<()> {
-    run_with_ticks(listen, _http_in, data, token, desired, quic_listen, kudus_listen, allow_agent_admin, udp_session_ttl, TickPeriods::default()).await
+pub async fn run(listen: &str, _http_in: &str, data: &str, token: &str, desired: &str, quic_listen: &str, kudus_listen: &str, allow_agent_admin: bool, udp_session_ttl: u64, udp_rcvbuf_kb: usize) -> anyhow::Result<()> {
+    run_with_ticks(listen, _http_in, data, token, desired, quic_listen, kudus_listen, allow_agent_admin, udp_session_ttl, udp_rcvbuf_kb, TickPeriods::default()).await
 }
 
 /// 后台 tick 周期（可配）。
@@ -109,6 +109,7 @@ pub async fn run_with_ticks(
     kudus_listen: &str,
     allow_agent_admin: bool,
     udp_session_ttl: u64,
+    udp_rcvbuf_kb: usize,
     ticks: TickPeriods,
 ) -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(data).await;
@@ -142,6 +143,7 @@ pub async fn run_with_ticks(
         } else {
             udp_session_ttl
         },
+        udp_rcvbuf_kb,
         ..Default::default()
     });
     if allow_agent_admin && token.len() < 16 {

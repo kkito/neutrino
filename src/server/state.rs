@@ -135,6 +135,11 @@ pub(crate) struct Shared {
     /// 根因→修法：旧值写死 120s（照抄 conntrack stream 超时），DHT 扫描器
     /// 每个新源端口建一条 session，120s 内堆积几十条/IP → 256 槽位瞬间打满。
     pub(crate) udp_session_ttl_secs: u64,
+    /// UDP ingress socket 接收缓冲（KB，默认 256，--udp-rcvbuf-kb 可配）。
+    /// 0 = 未传 → run() 里回退 UDP_RCVBUF_KB_DEFAULT。
+    /// 根因→修法：旧值写死 64KB，只容约 43 个包，突发必丢；
+    /// 且旧代码只判 setsockopt 失败，真丢包时日志完全静默。
+    pub(crate) udp_rcvbuf_kb: usize,
 }
 
 /// UDP session 空闲回收默认秒数（--udp-session-ttl 未传时）。
