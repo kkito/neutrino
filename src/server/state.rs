@@ -48,6 +48,7 @@ pub(crate) struct TunnelStats {
 }
 
 /// 取走并清空（tick 汇总用）。取走即归零，下轮重新累计。
+#[allow(dead_code)] // 使用者：Task 0b-4（traffic tick 汇总）
 pub(crate) fn drain_tunnel_stats(
     m: &mut HashMap<String, TunnelStats>,
 ) -> HashMap<String, TunnelStats> {
@@ -55,6 +56,7 @@ pub(crate) fn drain_tunnel_stats(
 }
 
 /// 人类可读字节数（日志用）。
+#[allow(dead_code)] // 使用者：Task 0b-4（traffic tick 汇总）
 pub(crate) fn fmt_bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -119,6 +121,7 @@ pub(crate) struct Shared {
     pub(crate) drop_warn: std::sync::Mutex<HashMap<String, i64>>,
     /// 隧道级累计（spec §15.4），key = tunnel 名（如 "minipc7s/trans-bt"）。
     /// 在 accept/close/first-chunk timeout 三处累加，traffic tick 取走即归零。
+    #[allow(dead_code)] // 累加点：Task 0b-3；取走点：Task 0b-4
     pub(crate) tunnel_stats: std::sync::Mutex<HashMap<String, TunnelStats>>,
     /// 当前连接快照：key = conn id
     pub(crate) conns: RwLock<HashMap<u64, ConnInfo>>,
