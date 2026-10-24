@@ -283,6 +283,20 @@ pub async fn run_with_ticks(
                 let p = state::traffic_path(&data);
                 state::save_traffic(&s, &p).await;
                 tracing::info!("{}", state::tick_heartbeat("traffic", &[("conns", nconns), ("tunnels", ntun)]));
+                // spec §15.4：per-tunnel 汇总（取走即归零，下轮重新累计）。
+                // accept/close 明细已降 DEBUG，这里是一分钟内唯一的一行隧道级全貌。
+                {
+                    let drained = {
+                        let mut m = s
+                            .tunnel_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        state::drain_tunnel_stats(&mut m)
+                    };
+                    for line in format_tunnel_stats_line(&drained).lines() {
+                        tracing::info!("{line}");
+                    }
+                }
             }
         });
     }
@@ -390,6 +404,31 @@ pub async fn run_with_ticks(
 }
 
 
+/// 格式化 per-tunnel 汇总行（spec §15.4）。全零隧道跳过，按 key 排序输出。
+///
+/// 每条隧道一行，例：
+/// `tunnel stats minipc7s/trans-bt accepts=523 closes=521 stick=2 rx=12.3MB tx=88.1MB`
+fn format_tunnel_stats_line(
+    m: &std::collections::HashMap<String, state::TunnelStats>,
+) -> String {
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort();
+    let mut lines: Vec<String> = Vec::new();
+    for k in keys {
+        let s = &m[k];
+        if s.accepts + s.closes + s.stick + s.rx + s.tx == 0 {
+            continue;
+        }
+        let rx = state::fmt_bytes(s.rx);
+        let tx = state::fmt_bytes(s.tx);
+        lines.push(format!(
+            "tunnel stats {k} accepts={} closes={} stick={} rx={rx} tx={tx}",
+            s.accepts, s.closes, s.stick
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tick_tests {
     use super::*;
@@ -426,5 +465,50 @@ mod tick_tests {
         assert_eq!(p.traffic, Duration::from_millis(40));
         assert_eq!(p.limiter, Duration::from_millis(80));
         assert_eq!(p.persist, Duration::from_millis(160));
+    }
+
+    /// spec §15.4：per-tunnel 汇总行格式。
+    #[test]
+    fn tunnel_stats_line_format() {
+        use crate::server::state::TunnelStats;
+        let mut m: HashMap<String, TunnelStats> = HashMap::new();
+        let e = m.entry("minipc7s/trans-bt".into()).or_default();
+        e.accepts = 523;
+        e.closes = 521;
+        e.stick = 2;
+        e.rx = 1024 * 1024 * 12 + 1024 * 300;
+        e.tx = 1024 * 1024 * 88 + 1024 * 100;
+        let line = format_tunnel_stats_line(&m);
+        assert!(
+            line.contains("tunnel stats minipc7s/trans-bt accepts=523 closes=521 stick=2"),
+            "got: {line}"
+        );
+        assert!(line.contains("rx=12.3MB"), "got: {line}");
+        assert!(line.contains("tx=88.1MB"), "got: {line}");
+    }
+
+    /// spec §15.4：全零隧道不应产生日志（否则空闲隧道每分刷一行，回到噪音）。
+    #[test]
+    fn tunnel_stats_absent_tunnel_not_emitted() {
+        use crate::server::state::TunnelStats;
+        let mut m: HashMap<String, TunnelStats> = HashMap::new();
+        m.entry("idle/tun".into()).or_default(); // 全零
+        assert!(
+            format_tunnel_stats_line(&m).is_empty(),
+            "全零隧道不应产生日志"
+        );
+    }
+
+    /// spec §15.4：多条隧道按 key 排序输出，结果稳定可 diff。
+    #[test]
+    fn tunnel_stats_sorted_by_key() {
+        use crate::server::state::TunnelStats;
+        let mut m: HashMap<String, TunnelStats> = HashMap::new();
+        m.entry("b/t".into()).or_default().accepts = 1;
+        m.entry("a/t".into()).or_default().accepts = 1;
+        let line = format_tunnel_stats_line(&m);
+        let a = line.find("a/t").unwrap();
+        let b = line.find("b/t").unwrap();
+        assert!(a < b, "必须按 key 排序，got: {line}");
     }
 }

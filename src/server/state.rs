@@ -48,7 +48,6 @@ pub(crate) struct TunnelStats {
 }
 
 /// 取走并清空（tick 汇总用）。取走即归零，下轮重新累计。
-#[allow(dead_code)] // 使用者：Task 0b-4（traffic tick 汇总）
 pub(crate) fn drain_tunnel_stats(
     m: &mut HashMap<String, TunnelStats>,
 ) -> HashMap<String, TunnelStats> {
@@ -56,7 +55,6 @@ pub(crate) fn drain_tunnel_stats(
 }
 
 /// 人类可读字节数（日志用）。
-#[allow(dead_code)] // 使用者：Task 0b-4（traffic tick 汇总）
 pub(crate) fn fmt_bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
