@@ -227,7 +227,22 @@ impl RetxBuf {
     /// 退避：按每包自身 `retx` 算出的 RTO 判断到期（`_rto` 参数保留仅为
     /// 签名兼容两个调用方，实际 RTO 由 `rto_for(e.retx)` 决定）。
     /// 命中即 `retx += 1` 并刷新 `last_sent`——下次到期自然延后一倍。
+    /// 超过 `KUDUS_MAX_RETX` 次的包**放弃并移除**，计入 `stats.abandoned`。
     pub fn take_expired(&mut self, _rto: Duration, now: u64) -> Vec<(u32, Vec<u8>)> {
+        // 先清理：重传次数已用尽的直接丢弃（不再发），计入 abandoned 埋点。
+        // 根因→修法：旧实现无「放弃」概念，未 ACK 的包无限复活，
+        // 既是内存泄漏（表只增不减）也是持续流量放大。
+        let mut give_up = 0u64;
+        self.seqs.retain(|_, e| {
+            if e.retx >= KUDUS_MAX_RETX {
+                give_up += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.stats.abandoned += give_up;
+
         let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
         for (seq, e) in self.seqs.iter_mut() {
             if now.wrapping_sub(e.last_sent) >= rto_for(e.retx).as_millis() as u64 {
@@ -560,6 +575,40 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// spec §15.3：RetxFull 拒收次数必须可见。
+    #[test]
+    fn retx_stats_counts_full() {
+        let mut b = super::RetxBuf::new(0);
+        for _ in 0..super::KUDUS_RETX_CAP {
+            b.on_send(vec![1u8; 10]).unwrap();
+        }
+        assert!(b.on_send(vec![1u8; 10]).is_err(), "满 cap 后应拒绝");
+        let s = b.take_stats();
+        assert_eq!(s.full, 1);
+    }
+
+    /// 超过 KUDUS_MAX_RETX 次重传后必须从上表移除（真丢弃），不能永远留着。
+    /// 旧代码没有「放弃」概念，包无限复活，这是内存与流量的双重泄漏。
+    #[test]
+    fn retx_counts_and_abandons() {
+        let mut tx = super::RetxBuf::new(1);
+        tx.on_send(b"x".to_vec()).unwrap();
+        let mut t = super::now_ms();
+        // 每次推进足够久，保证一定到期；跑 KUDUS_MAX_RETX 次
+        for i in 0..super::KUDUS_MAX_RETX {
+            t += 20_000; // 20s，远超任何退避 RTO
+            let due = tx.take_expired(Duration::from_millis(200), t);
+            assert_eq!(due.len(), 1, "第 {i} 次重传应到期");
+        }
+        // 再扫一次：此时 retx 已等于 MAX_RETX，应被清除
+        t += 20_000;
+        let due = tx.take_expired(Duration::from_millis(200), t);
+        assert!(due.is_empty(), "超限后不应再重发");
+        assert!(tx.is_empty(), "超过 MAX_RETX 必须放弃并移除，否则包永不丢弃");
+        let st = tx.take_stats();
+        assert_eq!(st.abandoned, 1, "放弃次数要有埋点可观测");
+    }
 
     /// 指数退避序列：200 → 400 → 800 → 1.6s → 3.2s → 6.4s → 8s(封顶)。
     /// 旧代码固定 200ms 线性重传，每秒重发 5 次，包越多放大越猛。
