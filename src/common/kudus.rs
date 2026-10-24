@@ -171,6 +171,7 @@ impl RetxBuf {
         for (seq, (p, sent)) in self.seqs.iter_mut() {
             if now.wrapping_sub(*sent) >= rto.as_millis() as u64 {
                 *sent = now;
+                self.stats.sent += 1; // spec §15.3：每重发一包 +1
                 due.push((*seq, p.clone()));
             }
         }
@@ -766,5 +767,22 @@ mod tests {
         assert_eq!(first.backlog_max, 5);
         let second = b.take_stats();
         assert_eq!(second, super::RetxStats::default(), "取走后必须归零");
+    }
+
+    #[test]
+    fn retx_stats_counts_resends() {
+        let mut b = super::RetxBuf::new(0);
+        b.on_send(vec![1u8; 10]);
+        let rto = std::time::Duration::from_millis(200);
+        // 每次推进 now —— take_expired 会把 *sent 刷成 now，
+        // 用同一个 now 再扫不会到期（这也是旧代码「包永不丢弃」的根源）。
+        let mut now = super::now_ms() + 10_000;
+        let due1 = b.take_expired(rto, now);
+        assert_eq!(due1.len(), 1, "首轮应有 1 包到期");
+        now += 10_000;
+        let due2 = b.take_expired(rto, now);
+        assert_eq!(due2.len(), 1, "时间推进后再次到期");
+        let s = b.take_stats();
+        assert_eq!(s.sent, 2, "重发 2 次应记 sent=2");
     }
 }
