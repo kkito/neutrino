@@ -106,6 +106,26 @@ impl ReorderBuf {
         if seq.wrapping_sub(self.next) >= 0x8000_0000 || self.buf.contains_key(&seq) {
             return out;
         }
+        // 根因→修法（2026-10-24 会话死锁）：旧代码先查 `buf.len() >= KUDUS_WINDOW`
+        // 再插入，**连 `seq == next` 的包也被挡住**。一旦某个包彻底丢失
+        // （重传达 KUDUS_MAX_RETX 被发送方 abandoned），后续包把 buf 填到 512，
+        // 此时**连补上那个洞的包都收不进来**，`next` 永卡 ⇒ `ack()` 不动 ⇒
+        // 发送方继续重传→接收方窗口恒满⇒双向死锁，只能重连。
+        // 现场：本机→HK 链路 15-20% 丢包，egress 代理跑一阵就全超时，
+        // server 日志 `tx=0B`、`sent=3950`（重传泵空转），agent 侧
+        // `backlog_max=16` 看着很健康——两边指标都正常却完全不通。
+        //
+        // 修法：`seq == next` 是唯一能推进窗口的包，**不受窗口上限约束**——
+        // 先消费它（以及因此连带的已缓存后续包），再看是否超窗。
+        if seq == self.next {
+            out.push(payload);
+            self.next = self.next.wrapping_add(1);
+            while let Some(p) = self.buf.remove(&self.next) {
+                out.push(p);
+                self.next = self.next.wrapping_add(1);
+            }
+            return out;
+        }
         if self.buf.len() >= KUDUS_WINDOW {
             return out; // 超窗丢新包（对端重传会补）
         }
@@ -627,6 +647,28 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+#[test]
+fn reorder_window_deadlocks_on_permanent_hole() {
+    // 现场：15% 丢包下某个包 10 次重传全丢 → 发送方 abandoned 放弃。
+    // 接收方 buf 充满 KUDUS_WINDOW 个乱序包后再也收不进新包，
+    // next 永远卡在洞上 ⇒ ack() 不动 ⇒ 双向死锁，只能重连。
+    let mut rb = ReorderBuf::new(1);
+    // seq=1 永久丢失，2..=1+KUDUS_WINDOW 全到
+    for s in 2..=(super::KUDUS_WINDOW as u32 + 1) {
+        let out = rb.push(s, vec![s as u8]);
+        assert!(out.is_empty(), "洞未补时不应投递");
+    }
+    // 窗口已满：再来新包全部被静默丢弃
+    let deep = rb.push(super::KUDUS_WINDOW as u32 + 2, vec![9]);
+    assert!(deep.is_empty());
+    // ack 永远停在 0（洞在 1）
+    assert_eq!(rb.ack(), 0, "ack 卡死在洞前");
+    // 即使丢的那个包后来到了，窗口满时 buf.len()>=WINDOW 分支也不收——
+    // 但 seq==next 会被 while 循环消费… 验证洞到货能否解锁
+    let recovered = rb.push(1, vec![1]);
+    assert!(!recovered.is_empty(), "洞补上后应能投递一大批");
+}
 
     /// RED: 快速重传——SACK 显示"后面的包到了、但前面的洞没到"时，必须立刻补洞，
     /// 不等 RTO 超时。
