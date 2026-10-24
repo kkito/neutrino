@@ -578,6 +578,14 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         };
                         let hostname = s3.agents.read().await.get(&aid).map(|h| h.info.hostname.clone()).unwrap_or_default();
                         let sid = next_sid();
+                        // spec §15.4：隧道级累计 key。必须在 hostname/pname 被 move 进
+                        // ConnInfo 之前算好，close/stick 两处在 spawn 闭包内复用它。
+                        let stats_key = format!("{hostname}/{pname}");
+                        {
+                            if let Ok(mut m) = s3.tunnel_stats.lock() {
+                                m.entry(stats_key.clone()).or_default().accepts += 1;
+                            }
+                        }
                         // 建连日志：降 DEBUG（spec §15.4）。2026-10-23 BT flood 时
                         // 这里 800 条/分把 INFO 层刷屏，事故信号全被淹没；
                         // INFO 层改由 per-tunnel 每分钟汇总承担（Task 0b-4），
@@ -675,6 +683,10 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                                     Ok(Some(c)) => Some(c),
                                     _ => {
                                         tracing::warn!("tcp :{port} sid={sid} first-chunk timeout (reorder hole?), close early");
+                                        // spec §15.4：粘包/乱序洞计数，与 accepts 对比可看出隧道健康度
+                                        if let Ok(mut m) = s3.tunnel_stats.lock() {
+                                            m.entry(stats_key.clone()).or_default().stick += 1;
+                                        }
                                         None
                                     }
                                 };
@@ -717,6 +729,13 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         // 断开日志：降 DEBUG（spec §15.4），汇总由 per-tunnel tick 承担。
                         if let Some(c) = s3.conns.write().await.remove(&(sid as u64)) {
                             tracing::debug!("tcp close :{port} peer={peer} sid={sid} rx={} tx={}", c.rx, c.tx);
+                            // spec §15.4：关闭时刻累加（conns 已 remove，扫表看不到了）
+                            if let Ok(mut m) = s3.tunnel_stats.lock() {
+                                let e = m.entry(stats_key.clone()).or_default();
+                                e.closes += 1;
+                                e.rx += c.rx;
+                                e.tx += c.tx;
+                            }
                         }
                         let _ = ctl.send(ServerMsg::Close {
                             stream: sid,
@@ -1158,6 +1177,31 @@ mod tests {
         assert!(
             !src.contains(&format!("{inf}{clo}")),
             "tcp close 不能是 info（回归）"
+        );
+    }
+
+    /// spec §15.4：accept/close/first-chunk timeout 三处必须累加 TunnelStats。
+    /// 源码断言：三者任一缺失，per-tunnel 汇总就会偏低或漏项。
+    #[test]
+    fn ingress_accumulates_tunnel_stats() {
+        let src = include_str!("ingress.rs");
+        // 只统计测试之外的代码：测试自身含 "tunnel_stats" 字面量。
+        let prod = src.split("mod tests").next().unwrap();
+        assert!(
+            prod.contains("tunnel_stats"),
+            "accept/close/stick 必须累加 TunnelStats"
+        );
+        assert!(
+            prod.contains(".accepts += 1"),
+            "accept 处必须累加 accepts"
+        );
+        assert!(
+            prod.contains(".closes += 1"),
+            "close 处必须累加 closes"
+        );
+        assert!(
+            prod.contains(".stick += 1"),
+            "first-chunk timeout 必须累加 stick"
         );
     }
 }
