@@ -1,6 +1,12 @@
 # kudus 重传放大止血 + agent UDP 资源池化设计
 
-日期：2026-10-25 · 状态：brainstorming 已确认（A~J 全部项，只动 neutrino）。
+日期：2026-10-25（§15 于 2026-10-26 追加）· 状态：brainstorming 已确认
+（A~J 全部项 + 可观测性三层，只动 neutrino）。
+
+> **2026-10-26 追加**：本文已合并「可观测性补强」（§15，含层 4a/4b/4c）。
+> 起因是 2026-10-25 对 HK 线上 journal 全量排查发现：**本次事故在日志里几乎不可见**
+> （`grep -icE "retx|retrans|backpressure"` = 0 条），修完也无法证明修复有效。
+> 故埋点与止血同一批实施，见 §15。
 
 ## 1. 背景与目标
 
@@ -49,11 +55,14 @@
 
 ## 2. 范围
 
-- 改：`src/common/kudus.rs`（RetxBuf 重构）、`src/server/kudus.rs`（背压 bail）、
-  `src/agent/kudus_session.rs`（buffer / 池接入 / 超时）、
-  `src/agent/udp_pool.rs`（**新模块**）
+- 改：`src/common/kudus.rs`（RetxBuf 重构 + RetxStats）、`src/server/kudus.rs`（背压 bail + retx 汇总）、
+  `src/agent/kudus_session.rs`（buffer / 池接入 / 超时 + retx 汇总）、
+  `src/agent/udp_pool.rs`（**新模块**）、`src/server/state.rs`（TunnelStats）、
+  `src/server/ingress.rs`（日志降级 + per-tunnel 汇总）、`src/main.rs`（`--log-file` 对 systemd 生效）,
+  `deploy/*.service`（RUST_LOG 与 journald 留存）
 - 不动：kudus 加密与帧格式、`ClientMsg`/`ServerMsg` 协议字段、WSS/QUIC 传输、
   限速器语义、egress 出口选择逻辑、server 侧 UDP session 表（TTL 逻辑已修）
+- 新增范围（§15 可观测性）：只做**埋点/日志**，不改任何转发语义与限速行为
 
 ## 3. 架构总览
 
@@ -479,6 +488,9 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 
 ### 10.4 e2e：`tests/e2e.rs`
 
+> **可观测性相关测试见 §15.6**（`e2e_tunnel_stats_line_emitted` 等），
+> 与本节测试同批实施。
+
 | 测试名 | 验证 |
 | --- | --- |
 | `e2e_udp_pool_survives_many_peers` | 1000 个不同源端口 UDP 流全部能通（旧代码 256 起拒绝） |
@@ -497,12 +509,19 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
-| 1 | `RetxBuf` 重构（cap/退避/放弃） | 无 |
+| 0a | **§15.3 RetxStats 结构 + 埋点**（先有计数器） | 无 |
+| 0b | **§15.4 accept/close 降 DEBUG + per-tunnel 汇总** | 无 |
+| 0c | **§15.5 journald 留存配置** | 无 |
+| 1 | `RetxBuf` 重构（cap/退避/放弃） | **阶段 0a** |
 | 2 | 背压 `bail!` + agent 上行超时丢包 | 阶段 1 |
 | 3 | buffer 2048 + 截断检测 | 无 |
 | 4 | `udp_pool.rs` 新模块 | 无 |
 | 5 | 池接入 + 超时 5s | 阶段 4 |
 | 6 | e2e + 回归 | 阶段 1-5 |
+| 7 | **§15.3 汇总日志接入 tick**（验证放大是否被封住） | 阶段 1, 0a |
+
+> **阶段 0a 必须先于阶段 1**：先有 `RetxStats` 计数器，阶段 1 改完才能直接用真实
+> 计数验证“放大被封住”，而不是只靠单测。这是两个层合并同一个 spec 的核心收益。
 
 每阶段独立 TDD 红→绿、独立提交，每次 `make build` + `make test` 全绿。
 
@@ -533,6 +552,11 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 | 每流 buffer | 64KB | 2KB |
 | 512 流总堆内存 | 32MB | 1MB |
 | `udp`/`link_udp` | 互相饿死 | 独立池 |
+| **重传放大可见性** | **零（日志查不到）** | 见 §15.10 |
+| **INFO 日志量** | 800 条/分 | ~50 条/分（§15.10） |
+| **日志留存** | 2 天 | 30 天（§15.5） |
+
+> 本表只列本节（§4–§8）的效果；可观测性三层的预期效果见 **§15.10**。
 
 ## 14. 风险与未决项
 
@@ -546,3 +570,300 @@ const UDP_STREAM_IDLE_SECS: u64 = 5;   // 30 → 5
 4. **agent 丢包可能影响 BT 回包送达率**：隧道拥堵时会丢 UDP 回包。对 DHT 无影响
    （本来就可丢），对 uTP 会触发对端重传。若上线后 `udp_send_dropped` 计数上升明显，
    说明限速/窗口需要重新调，需纳入观查。
+
+---
+
+## 15. 层 4：可观测性补强（2026-10-26 追加）
+
+### 15.1 动机：为什么必须和止血一起做
+
+2026-10-25 对 HK 线上（`ssh hk`，机器 `cloudserver`）154,132 行 journal 全量排查，
+结论是**本次事故在日志里几乎不可见**，且日志本身有三个独立问题：
+
+**① 核心盲区：整个重传风暴，日志里一条都没有**
+
+```
+$ journalctl -u neutrino-server | grep -icE "retx|retrans|backpressure|window"
+0
+```
+
+`src/common/kudus.rs` —— kudus 可靠传输核心（`RetxBuf`/`ReorderBuf`/SACK）**零日志、
+零计数器**。事后唯一线索是：
+
+```
+ratelimit stats: minipc7s/trans-bt limit=524288B/s thru=22396311B sleep=5204ms
+```
+
+而 `thru` 是 `RateLimiter::take()` 累加的**限速器经手字节**（`ratelimit.rs:71`），
+重传包走 `send_pkt` **绕过限速器**，因此**重传放大在限速统计里根本不可见**。
+`thru=22396311B` 只能说"限速器放行了 22MB"，无法回答"其中多少是被放大出来的"。
+
+**② 噪音淹没：800 条/分钟里 99% 是无意义 INFO**
+
+事故窗口逐分钟日志量：`12:00 452 条/分 → 13:30 824 条/分`（+82%），
+其中几乎全是 `tcp accept` / `tcp close` **每连接各一行 INFO**（BT 短连接）。
+
+**③ 留存不足：journal 只保 2 天**
+
+`journalctl --disk-usage` = 4.0G，最早一条 `2026-10-21T06:05`。
+`/etc/systemd/journald.conf` 未配 `SystemMaxUse`/`MaxRetentionSec`。
+事故 10-23，再跑一天日志就没了。
+
+**④ 附带发现：`Error: Address not available (os error 99)` 崩溃循环 1505 次**
+（`Started` 1527 次）—— 独立问题，见 §15.6 遗留项。
+
+**结论**：§4 的 RetxBuf 重构**必须配套埋点**，否则修完也无法证明"放大被封住了"，
+下次再出问题依然查不出来。这正是本层与 §4 合并同一个 spec 的原因。
+
+### 15.2 范围与边界
+
+| 层 | 内容 | 是否改代码 |
+| -- | ---- | ---------- |
+| 4a | `RetxBuf` 加 `RetxStats` 计数器 + per-session 汇总 | Rust |
+| 4b | `tcp accept/close` 降 DEBUG + per-tunnel 汇总行 | Rust |
+| 4c | journald 留存配置 + `--log-file` 对 systemd 生效 | 配置 + 少量 Rust |
+
+**不改**：任何转发语义、限速行为、协议字段、`RetxBuf` 的算法逻辑
+（4a 只**加计数**，不改变重传/放弃的判定）。
+
+### 15.3 层 4a：RetxStats 埋点
+
+#### 数据结构
+
+```rust
+// src/common/kudus.rs
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetxStats {
+    pub sent: u64,          // take_expired 实际重发的包数
+    pub abandoned: u64,     // 重传超上限被真丢弃的包数（§4.5）
+    pub full: u64,          // RetxFull 拒收次数（§4.2）
+    pub backlog_max: usize, // 本窗口内未确认包峰值
+}
+
+pub struct RetxBuf {
+    next: u32,
+    seqs: HashMap<u32, RetxEntry>,
+    stats: RetxStats,       // 新增
+}
+```
+
+#### 采集与归零
+
+```rust
+/// 取走本窗口统计并归零。
+/// 峰值由 on_send 维护，这里只负责取走与重置。
+pub fn take_stats(&mut self) -> RetxStats {
+    std::mem::take(&mut self.stats)
+}
+// 注：len() 已存在（kudus.rs:159），不重复定义，埋点直接用它。
+```
+
+**峰值维护职责单一**：`backlog_max` 只在**会改变 `seqs.len()` 的三处**更新
+（`on_send` 插入后、`take_expired` 放弃删除后保持不降、`on_ack` 不更新）。
+`take_stats` 不参与峰值计算，避免两处重复跟踪导致语义歧义。
+
+**为什么打增量而非累计**：累计值单调爬升没有诊断价值——事故里的 `thru` 就是累计值，
+爬到 22.4MB 仍看不出"这一分钟发生了什么"。归零后每行日志都是**本分钟真实发生的事**。
+
+**为什么 `backlog_max` 用峰值**：事故中积压达 8192 包，只有峰值记录才能回答
+"积压到多严重"。当前瞬时值在 tick 采样时刻可能恰好是低点，会漏掉峰值。
+
+#### 埋点位置
+
+| 位置 | 计数 | 说明 |
+| ---- | ---- | ---- |
+| `on_send` 满 cap 拒绝 | `full += 1` | 对应 §4.2 的 `RetxFull` |
+| `on_send` 成功插入后 | `backlog_max = max(backlog_max, seqs.len())` | 峰值唯一来源 |
+| `take_expired` 每重发一包 | `sent += 1` | §4.3 的 `retx += 1` 同处 |
+| 超过 `KUDUS_MAX_RETX` 丢弃 | `abandoned += 1` | §4.5 |
+
+#### 汇总日志
+
+挂在**现有 `traffic` tick（60s）**上，不新开 tick（`server/mod.rs:285` 附近）。
+**per-session** 采集，格式：
+
+```
+kudus retx session=3f2a1b8c hostname=minipc7s sent=4821 abandoned=0 full=0 backlog_max=1024
+```
+
+**只在非零时打**（`sent+abandoned+full+backlog_max > 0`），空闲 session 零噪音。
+
+**为什么 per-session 而非进程级全局**：破案时要回答"**哪条隧道在放大**"。
+全局计数只能说"整机在放大"，依然定位不到具体隧道——而 §1.1 现场恰恰需要
+区分 `trans-bt`（风暴源）与其它 19 条隧道。
+
+### 15.4 层 4b：降噪 + per-tunnel 汇总
+
+#### ① accept/close 降级
+
+```rust
+// src/server/ingress.rs:583 / :717
+tracing::info!("tcp accept ...") → tracing::debug!("tcp accept ...")
+tracing::info!("tcp close ...")  → tracing::debug!("tcp close ...")
+```
+
+单连接细节保留在 DEBUG，需要时 `RUST_LOG=neutrino=debug` 临时开。
+
+#### ② per-tunnel 汇总（新增）
+
+**关键设计：累加必须在"关闭时刻"做，不能 tick 扫表。**
+`conns` 表在连接 close 时即 `remove`（`ingress.rs:715`），tick 时扫表只能看到
+仍存活的连接。BT 短连接大量快开快关，扫表统计会**严重偏低**。
+
+```rust
+// src/server/state.rs
+#[derive(Default)]
+pub(crate) struct TunnelStats {
+    pub accepts: u64,
+    pub closes: u64,
+    pub rx: u64,
+    pub tx: u64,
+    pub stick: u64,   // first-chunk timeout 次数
+}
+
+// Shared 新增字段：key = tunnel name
+pub(crate) tunnel_stats: RwLock<HashMap<String, TunnelStats>>,
+```
+
+埋点：
+
+| 位置 | 动作 |
+| ---- | ---- |
+| `ingress.rs:583` accept | `accepts += 1` |
+| `ingress.rs:717` close | `closes += 1; rx += c.rx; tx += c.tx` |
+| `ingress.rs:675` first-chunk timeout | `stick += 1` |
+
+tick 时取走归零，打一行：
+
+```
+tunnel stats minipc7s/trans-bt accepts=523 closes=521 stick=2 rx=12.3MB tx=88.1MB
+```
+
+- `stick` = first-chunk timeout 次数：现场那条 `first-chunk timeout (reorder hole?)`
+  高频告警，汇总成计数比刷屏更有用。
+- `rx`/`tx` 用人类可读单位（`12.3MB`），日志是给人看的。
+- 同样只在该隧道本窗口有活动时打。
+
+#### ③ 预期效果
+
+| 指标 | 事故时 | 改后 |
+| ---- | ------ | ---- |
+| INFO 日志量 | 800 条/分 | ~50 条/分 |
+| 单连接明细 | INFO 刷屏 | DEBUG 按需 |
+| 隧道级吞吐 | 无 | 每分一行 |
+| 重传放大 | **不可见** | `sent`/`abandoned`/`backlog_max` 直接可读 |
+
+### 15.5 层 4c：日志留存
+
+#### ① journald 配置（运维，不改代码）
+
+`/etc/systemd/journald.conf`：
+
+```ini
+[Journal]
+SystemMaxUse=500M
+MaxRetentionSec=30day
+```
+
+**为什么不引入 `tracing-appender` 写文件**：日志"只剩 2 天"的根因是
+journald 未配上限，而非没有文件。journald 本身就是成熟的滚动+保留方案，
+配好即解决。引新依赖会带来"stdout 与文件双写重复"的新问题，反而更复杂。
+
+#### ② `--log-file` 对 systemd 生效（**本次不实现**）
+
+现状：`--log-file` **只在 `--detach` 时被使用**（`main.rs:200` / `:219`），
+systemd 下传 `--log-file` 会**静默忽略**。
+
+**决定：本次不实现，仅修复“静默”问题**——在 systemd 模式（非 `--detach`）下
+传了 `--log-file` 时打一条 `warn!` 告知“未启用，请用 journald”，避免误解。
+
+理由：journald 已能满足留存需求（①），而真正按需写文件需要滚动/保留/双写去重，
+不是 30 行内能干净做完的事。**不为假需求引复杂度。**
+
+若将来确实需要文件日志，单独立项（引入 `tracing-appender` + 明确双写策略）。
+
+### 15.6 测试计划（TDD，先红后绿）
+
+#### 单测 `common/kudus.rs`
+
+| 测试名 | 断言 |
+| ------ | ---- |
+| `retx_stats_counts_resends` | 连续 `take_expired` N 次，`take_stats().sent == N` |
+| `retx_stats_tracks_backlog_peak` | 灌 100 包后全 ACK，`backlog_max == 100` 而非 0 |
+| `retx_stats_take_resets` | 第二次 `take_stats()` 全零（含 `backlog_max`） |
+| `retx_stats_counts_full` | cap 满后 `on_send` 失败，`full == 1` |
+| `retx_stats_counts_abandoned` | 超 `KUDUS_MAX_RETX` 丢弃，`abandoned == 1` |
+
+#### 单测 `server/state.rs`
+
+| 测试名 | 断言 |
+| ------ | ---- |
+| `tunnel_stats_accumulate_and_drain` | 累加后 `drain` 取走得值且归零 |
+| `tunnel_stats_absent_tunnel_not_emitted` | 无活动隧道不产生行 |
+
+#### 单测 `ingress` 日志级别（纯判定）
+
+将"该不该打 accept 日志"抽成无 IO 纯函数再测（沿用项目既有风格）：
+
+| 测试名 | 断言 |
+| ------ | ---- |
+| `accept_log_level_is_debug` | 级别常量 == DEBUG（防回归被改回 INFO） |
+| `log_file_warns_when_ignored` | 非 detach + 非空 log_file ⇒ 打 warn（纯判定函数 `should_warn_log_file_ignored`） |
+
+#### e2e
+
+| 测试名 | 验证 |
+| ------ | ---- |
+| `e2e_tunnel_stats_line_emitted` | 建一条隧道跑若干连接，tick 后 journal/stdout 出现 `tunnel stats <name> accepts=>0` |
+| `e2e_retx_stats_visible_in_log` | 制造丢包场景，日志出现 `kudus retx ... sent=>0` |
+| `e2e_no_per_conn_info_flood` | 100 次短连接，INFO 行数 < 阈值（旧代码 200 行，新代码 ~1 行汇总） |
+
+**注意**：e2e 断言日志需读子进程 stdout，沿用现有 e2e 的子进程捕获方式；
+tick 用 `boot_with_desired` 的 50ms 参数化，不盲目 `sleep`。
+
+### 15.7 实施顺序（本层内）
+
+| 阶段 | 内容 | 依赖 |
+| ---- | ---- | ---- |
+| 4a-1 | `RetxStats` 结构 + `take_stats` + 单测 | 无 |
+| 4a-2 | 四处埋点接入 + 单测 | 4a-1 |
+| 4a-3 | server/agent tick 汇总日志 | 4a-2, §4 完成 |
+| 4b-1 | accept/close 降 DEBUG | 无 |
+| 4b-2 | `TunnelStats` + 累加 + tick 汇总 | 4b-1 |
+| 4c | journald 配置 + deploy 文件注释 | 无 |
+
+**与 §11 的关系**：4a-1/4a-2 **必须在 §4（RetxBuf 重构）之前**完成，
+这样 §4 改完后能**直接用真实计数器验证**放大是否被封住，而非只靠单测。
+4b/4c 与本层之外无依赖，可并行。
+
+### 15.8 关键决策记录（本层）
+
+| 决策项 | 结论 | 理由 |
+| ------ | ---- | ---- |
+| 范围 | 三层全做（A+B+C） | 用户决定 |
+| 与主 spec 关系 | **合并进本 spec**，一起做 | 用户决定：原 spec 尚未实施，一次做完 |
+| 计数器归属 | `RetxBuf` 内部（方案 A） | per-session 精确，能定位"哪条隧道"；避免全局状态污染单测 |
+| 统计语义 | 取走即归零，打增量 | 累计值无诊断价值（`thru` 即反例） |
+| `backlog_max` | 记峰值不记当前值 | tick 采样可能落在低点，峰值才反映真实严重程度 |
+| accept/close | 降 DEBUG + per-tunnel 汇总 | 保留可见性（汇总）又去掉刷屏（明细） |
+| 汇总累加点 | **关闭时刻累加**，非 tick 扫表 | close 即 remove，扫表会严重偏低 |
+| 汇总挂载点 | 现有 `traffic` tick（60s） | 不新开 tick，与 retx 汇总同一落点 |
+| 留存方案 | 只配 journald，不引 `tracing-appender` | 根因是配置缺失，非缺文件；避免双写与依赖 |
+| `--log-file` systemd 生效 | 可选低优先级，>30 行则放弃 | journald 已满足留存 |
+
+### 15.9 遗留项（不在本 spec 范围）
+
+1. **`Error: Address not available (os error 99)` 崩溃循环 1505 次**
+   （`Started` 1527 次）。独立问题，需单独排查（疑似端口未释放/绑定冲突）。
+   **建议作为下一个独立 spec。**
+2. **`kudus drop unknown_session` 采样日志**频率偏高，是否降级待观察。
+
+### 15.10 预期效果（本层）
+
+| 问题 | 现状 | 改后 |
+| ---- | ---- | ---- |
+| 重传放大可见性 | **零** | `sent/abandoned/full/backlog_max` per-session |
+| 隧道级吞吐 | 无 | 每分一行 `accepts/closes/stick/rx/tx` |
+| INFO 日志量 | 800 条/分 | ~50 条/分 |
+| 日志留存 | 2 天 | 30 天 |
+| 下次事故破案 | 几乎不可能 | 可定位到具体隧道与放大倍数 |
