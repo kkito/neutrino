@@ -94,6 +94,24 @@ pub fn frame_feeds_watchdog(flags: u8) -> bool {
     flags & FLAG_DATA != 0
 }
 
+/// 看门狗剩余预算（纯函数）。
+///
+/// 根因→修法（2026-10-25）：旧代码把 `timeout(75s, recv())` 写在循环体内，
+/// 纯 ACK 走 `continue` 后**重建 timeout，把计时器重置掉**。server 重传泵
+/// 每 50ms 发一个纯 ACK ⇒ 永远到不了 75s ⇒ 会话永不 bail。
+/// 改为「循环外存最后一个活帧时刻，每轮算剩余预算」。
+///
+/// `last_alive_elapsed_ms` 是距最后一个 DATA/FIN 帧的毫秒数。
+/// 返回 `None` 表示已超时（调用方应 bail）。
+pub fn watchdog_budget_ms(last_alive_elapsed_ms: u64) -> Option<u64> {
+    let kick = KUDUS_IDLE_KICK_SECS as u64 * 1000;
+    if last_alive_elapsed_ms >= kick {
+        None
+    } else {
+        Some(kick - last_alive_elapsed_ms)
+    }
+}
+
 /// 纯判定：now-last_seen 超 75s 即僵尸（kudus 版；WSS 用 state::is_idle_stale 45s，不动）。
 pub fn kudus_idle_stale(last_seen_unix: i64, now_unix: i64) -> bool {
     now_unix - last_seen_unix > KUDUS_IDLE_KICK_SECS
@@ -1009,6 +1027,34 @@ fn reorder_window_deadlocks_on_permanent_hole() {
         hb.next_interval(false);
         assert!(!hb.is_fast()); // 3 连好回慢档
     }
+
+        /// RED（2026-10-25 现场）：看门狗预算必须随「距最后活帧时间」递减，
+        /// 纯 ACK 不得让预算回满。
+        ///
+        /// 旧实现 `timeout(75s, recv())` 在循环体内，纯 ACK 的 `continue`
+        /// 会重建 timeout。现实后果：server 重启后不认旧会话（tx=0B），
+        /// 但 agent 每 50ms 收到一个纯 ACK，75s 永不触发，会话卡死 7 小时。
+        #[test]
+        fn watchdog_budget_drains_under_pure_ack() {
+            use super::watchdog_budget_ms;
+            assert_eq!(watchdog_budget_ms(0), Some(75_000));
+            assert_eq!(watchdog_budget_ms(50_000), Some(25_000));
+            assert_eq!(watchdog_budget_ms(75_000), None);
+            assert_eq!(watchdog_budget_ms(200_000), None);
+        }
+
+        /// 纯 ACK 永远不能把预算拉回满值（旧实现的核心缺陷）。
+        #[test]
+        fn pure_ack_never_refills_watchdog() {
+            use super::{watchdog_budget_ms};
+            let mut prev = 75_000u64;
+            for i in 1..=900u64 {
+                let elapsed = i * 50;
+                let b = watchdog_budget_ms(elapsed).expect("45s 未超时");
+                assert!(b < prev, "{elapsed}ms 时预算未下降: {b} >= {prev}");
+                prev = b;
+            }
+        }
 
     #[test]
     fn only_data_frames_feed_watchdog() {

@@ -536,22 +536,36 @@ pub(crate) async fn session(
     let mut ctrl_reasm = crate::common::kudus::CtrlReasm::new();
     // 下行 UDP 分片重组槽（server udp_outbox 大包分片，攒齐后整包交付）。
     let mut udp_reasm = crate::common::kudus::UdpReasm::new();
+    // 看门狗基准：**绝对时刻**，只有 DATA/FIN 推进它。
+    //
+    // 根因→修法（2026-10-25 现场）：旧代码把 `timeout(75s, recv())` 写在
+    // 循环体内，纯 ACK 走 `continue` 后**重建了一个全新 timeout，把计时器
+    // 重置掉**。server 重传泵每 50ms 发一个纯 ACK ⇒ timeout 永远在 50ms
+    // 返回、永远到不了 75s ⇒ 会话永不 bail。旧注释「看门狗照常计时」是错的。
+    //
+    // 现场：server 重启后不认旧会话（`tx=0B`、日志无该会话），agent 却
+    // `welcomed` 之后 7 小时零重连；抓包 In=27（server 纯 ACK）/ Out=3，
+    // 链路上同期 **0% 丢包**——不是丢包问题，是看门狗失效。
+    //
+    // 修法：基准用 `Instant` 存在循环外，每次循环算出**剩余预算**给 timeout；
+    // 只有喂看门狗的帧才刷新基准。这样连续纯 ACK 会把预算耗光。
+    let mut last_alive = std::time::Instant::now();
     loop {
-        let (h, body) = match tokio::time::timeout(
-            std::time::Duration::from_secs(crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64),
-            dec_rx.recv(),
+        let budget = std::time::Duration::from_secs(
+            crate::common::kudus::KUDUS_IDLE_KICK_SECS as u64,
         )
-        .await
-        {
+        .saturating_sub(last_alive.elapsed());
+        let (h, body) = match tokio::time::timeout(budget, dec_rx.recv()).await {
             Ok(Some((h, body))) => {
                 // 看门狗只认 DATA 帧：泄漏的 server 重传泵每 50ms 发纯 ACK 探活，
                 // 若算活则 75s 超时永不到、session 永不 bail（2026-10-23 现场）。
-                // 纯 ACK 只清重传（读泵已做），此处直接等下一帧，看门狗照常计时。
+                // 纯 ACK 只清重传（读泵已做），此处直接等下一帧，**不刷新基准**。
                 // FIN 例外必须穿透：server 踢会话的 FIN 本身就是非 DATA 帧，
                 // 若一起过滤则踢人通知永远到不了关闭分支（与下 `FLAG_FIN` 对应）。
                 if !crate::common::kudus::frame_feeds_watchdog(h.flags) && h.flags & FLAG_FIN == 0 {
                     continue;
                 }
+                last_alive = std::time::Instant::now();
                 (h, body)
             }
             _ => anyhow::bail!("kudus heartbeat timeout: no server frame"),
