@@ -959,3 +959,43 @@ pkill -f 'neutrino agent' ; sleep 1
 | §16.7 用例 4（UDP e2e） | Task 2 |
 | §16.7 用例 6-8（log_level） | Task 4 |
 | §16.10 已知风险（会话数上限） | 不在本计划，见 spec |
+
+
+---
+
+## 执行结果（2026-10-24）
+
+全部 7 个 Task 完成，两端已部署验证。
+
+| Task | commit | 结果 |
+| ---- | ------ | ---- |
+| 1 提交 5a 改动 | `0f76bd2` | UDP 流生命周期日志 + `--udp-idle-secs` |
+| 2-3 UDP tunnel_stats | `99456e5` | e2e RED→GREEN→回退验证 |
+| 4-5 动态日志级别 | `4f804aa` | 3 单测 + 手工冒烟 |
+| 6 journald 留存 | `ca71026` | 配置 + 运维文档 |
+
+测试：单测 **183 passed**（180+3）、e2e **41 passed**（40+1），`make build` 零 warning。
+
+### 现场实测（HK + 本机）
+
+1. **UDP tunnel_stats 落地**（此前完全空白的数据）：
+   ```
+   tunnel stats minipc7s/trans-bt-udp accepts=88 closes=45 stick=0 rx=28.8KB tx=32.3KB
+   ```
+2. **降噪生效**：新进程 `tcp accept` / `udp session` 从 541 条/2min → **0 条 INFO**
+3. **SIGUSR1/USR2**：
+   - `log level -> debug for 60s (SIGUSR1)`
+   - `15:57:00.949 → 15:58:00.951`，**60.002s 精确自动恢复**
+   - `log level restored to info early (SIGUSR2)`
+4. **journald**：456M / max 500M，43.9M free，`MaxRetentionSec=30day`
+
+### 执行中的两个坑（已记在测试注释里）
+
+1. e2e `remote_port` 必须用 `free_port()` 另取，复用后端端口会 `Address already in use`
+2. tick 每轮 drain 归零，`accepts` 只出现在「建 session 那一轮」的汇总行，
+   断言必须扫所有行取最大值
+
+### 部署备注
+
+本机 glibc 2.35 < HK 2.39，可直接 `scp target/release/neutrino`（向下兼容）。
+AGENTS.md 里「别 scp」的警告针对的是 macOS arm64 二进制，不适用本场景。
