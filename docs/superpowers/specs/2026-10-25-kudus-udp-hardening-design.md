@@ -88,17 +88,20 @@
 ```rust
 struct RetxEntry {
     bytes: Vec<u8>,
-    first_sent: Instant,   // 首发时刻，退避计算基准
-    last_sent: Instant,    // 实际发送时刻
-    retx: u32,             // 已重传次数
+    first_sent: u64,   // 首发 ms（退避计算基准，沿用现有 now_ms()）
+    last_sent: u64,    // 实际发送 ms
+    retx: u32,         // 已重传次数
 }
 
 struct RetxBuf {
-    map: BTreeMap<u64, RetxEntry>,   // seq → entry
+    next: u32,
+    seqs: HashMap<u32, RetxEntry>,   // seq(u32) → entry，沿用现有 HashMap
     cap: usize,                       // 新增：容量上限
-    next_expiry: Option<Instant>,
 }
 ```
+
+> 注：现有实现用 `HashMap<u32, (Vec<u8>, u64)>` 且用 `now_ms()`（相对 ms u64）
+> 而非 `Instant`。计划保持这两个现有选择不改（避免无关重构）。
 
 ### 4.2 容量上限
 
@@ -154,7 +157,22 @@ if entry.retx >= KUDUS_MAX_RETX {
 }
 ```
 
-### 4.6 效果对比
+### 4.6 附带常量澄清
+
+现有代码里背压阈值是硬编码魔数 `256`（`agent/kudus_session.rs:126`、
+`server/kudus.rs:301/338`）。本次抽成常量，三处共用：
+
+```rust
+/// retx 未确认包数达到此值即认为窗口积压，需退让等 ACK。
+pub const KUDUS_RETX_BACKLOG: usize = 256;
+/// 背压轮询间隔。
+pub const BACKPRESSURE_POLL: Duration = Duration::from_millis(10);
+```
+
+**注意区分**：`KUDUS_RETX_BACKLOG = 256`（背压阈值，滞回线）与
+`KUDUS_RETX_CAP = 4096`（硬容量上限）是**两个不同的数**，不要混淆。
+
+### 4.7 效果对比
 
 | 场景 | 旧行为 | 新行为 |
 | --- | --- | --- |
@@ -172,6 +190,13 @@ if entry.retx >= KUDUS_MAX_RETX {
 重传又加剧拥塞，正反馈。
 
 ### 5.2 修复
+
+**实际存在两处同样缺陷**，都要改：
+
+| 位置 | 现状 |
+| ---- | ---- |
+| `src/server/kudus.rs:299` | 下行写泵，3000×10ms 后继续发 |
+| `src/server/kudus.rs:336` | 另一条写泵路径，同样 |
 
 ```rust
 pub const KUDUS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -210,27 +235,52 @@ SACK 状态全部不可信，重建是唯一能干净恢复的方式。agent 侧
 | 位置 | "发不出去"的含义 | 旧行为 | 新行为 |
 | ---- | ---------------- | ------ | ------ |
 | **server 侧**（本层） | server → 公网 peer 窗口满 | 30s 后静默继续发 | **5s 后 `bail!` 关会话** |
-| **agent 侧**（本节） | agent → HK 隧道窗口满 | **无限等待**（`wait_window` 无超时） | **5s 后丢弃该回包** |
+| **agent 侧**（本节） | agent → HK 隧道窗口满 | **30s 后照样继续发** | **5s 后丢弃该回包** |
 
 #### 问题
 
-`agent/kudus_session.rs:124` 的 `wait_window` 当前无超时：窗口满就 sleep 后重试，
-永远等下去。上行数据的来源是 transmission 的回包，虽然量小于下行，
-但若 HK 长期不腾窗口，回包会在内存里**持续积压**。
+`agent/kudus_session.rs:124` 的 `wait_window` 当前是：
+
+```rust
+pub(crate) async fn wait_window(&self) {
+    for _ in 0..3000 {                                  // 3000 × 10ms = 30s
+        let n = self.rel.lock().map(|r| r.retx.len()).unwrap_or(0);
+        if n < 256 { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // ⭐ 循环耗尽后直接返回，调用方照样继续发送
+}
+```
+
+**与 server 侧完全同构的缺陷**：等待 30s 后**不报错、不丢包，照样继续发**。
+所谓"背压"在超时后形同虚设。
 
 #### 修复：超时后丢包（而非关会话）
+
+`wait_window` 改为返回是否等到窗口：
 
 ```rust
 pub const KUDUS_AGENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-match tokio::time::timeout(KUDUS_AGENT_SEND_TIMEOUT, wait_window()).await {
-    Ok(()) => { /* 正常发送 */ }
-    Err(_) => {
-        // 隧道拥堵：丢弃这个 UDP 回包。UDP 语义允许丢包，
-        // 对端会重传或放弃，不会造成协议错误。
-        stats.udp_send_dropped += 1;
-        warn_sampled("kudus agent send timeout, dropping udp reply (sid={sid})");
+/// 返回 true = 已有空间可发；false = 超时。
+pub(crate) async fn wait_window(&self) -> bool {
+    let mut waited = Duration::ZERO;
+    while self.rel.lock().map(|r| r.retx.len()).unwrap_or(0) >= KUDUS_RETX_BACKLOG {
+        if waited >= KUDUS_AGENT_SEND_TIMEOUT { return false; }
+        tokio::time::sleep(BACKPRESSURE_POLL).await;
+        waited += BACKPRESSURE_POLL;
     }
+    true
+}
+```
+
+调用方（`agent/kudus_session.rs:628` / `:643`）改为：
+
+```rust
+if !pktw.wait_window().await {
+    stats.udp_send_dropped += 1;
+    warn_sampled("kudus agent send timeout, dropping (sid={sid})");
+    return;   // 丢弃本次数据，不再发
 }
 ```
 
