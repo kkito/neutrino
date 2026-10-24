@@ -136,3 +136,46 @@ sequenceDiagram
 管理员在 WebUI 隧道页增删改（`GET/POST /api/desired/:hostname` 落盘期望态），在线即下发，
 离线等 register 时覆盖；`POST /api/config` 保留为高级直推；
 `POST /api/tunnels/:agent/:name/enabled` 即时启停单个隧道。
+
+## 日志留存与动态调级
+
+### 留存
+
+日志「只剩 2 天」的根因是 journald 未配上限导致滚动过快，不是没有文件。用
+`deploy/journald-neutrino.conf` 落到 `/etc/systemd/journald.conf.d/`：
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo cp deploy/journald-neutrino.conf /etc/systemd/journald.conf.d/neutrino.conf
+sudo systemctl restart systemd-journald
+journalctl --disk-usage      # 应 <= 500M
+```
+
+**为什么不引入 `tracing-appender` 写文件**：引新依赖会带来「stdout 与文件
+双写重复」的新问题，而 journald 本身就是成熟的滚动+保留方案。
+
+### 动态调级（不用重启）
+
+单连接明细、UDP 流收尾等排查日志是 DEBUG 级，默认看不到。开 60 秒：
+
+```bash
+kill -USR1 $(pgrep -x neutrino)    # DEBUG 60s，到点自动恢复
+kill -USR2 $(pgrep -x neutrino)    # 立即恢复
+```
+
+启动 banner 里会打印当前级别和这两条命令（`log level : ...`）。
+
+**为什么不改 `RUST_LOG` 重启**：重启会掐掉所有正在进行的 UDP 会话，
+等于把要观测的现象消灭掉。
+
+**注意**：`SIGUSR1` 的默认行为是**终止进程**。若启动日志里有
+`signal-based log level unavailable`，说明 `signal()` 注册失败，
+此时发 `SIGUSR1` 会打死服务——只能改用环境变量。
+
+### 常见排查入口
+
+| 想知道 | 看什么 |
+| ------ | ------ |
+| 每条隧道的连接数/流量 | `tunnel stats <host>/<proxy> accepts= closes= stick= rx= tx=`（每分钟一行，INFO） |
+| UDP 流为什么断、活了多久 | `kudus udp stream closed sid= lived= reason= rx_pkts= pool=`（DEBUG，`kill -USR1` 开） |
+| 重传放大是否被控住 | `kudus retx sent= abandoned= full= backlog_max=`（每分钟一行，INFO） |
