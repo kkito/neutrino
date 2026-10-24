@@ -545,14 +545,19 @@ Expected: FAIL
 
 - [ ] **Step 3: 最小实现**
 
-accept 处（`ingress.rs:583` 那行日志之后）：
+**关键**：close 处位于 `tokio::spawn(async move { ... })` 闭包内（`:633` 开始），
+`hostname`/`pname` 的捕获情况不确定。**在 accept 处一次性算好 key，移入闭包复用**，
+避免 close 处依赖 move 语义：
+
+accept 处（`ingress.rs:583` 那行日志**之前**，与 `sid` 同级）：
 
 ```rust
+let sid = next_sid();
+// spec §15.4：隧道级累计 key，close 处在 spawn 闭包内复用（不依赖 hostname 捕获）
+let stats_key = format!("{hostname}/{pname}");
 {
-    let key = format!("{hostname}/{pname}");
     if let Ok(mut m) = s3.tunnel_stats.lock() {
-        let e = m.entry(key).or_default();
-        e.accepts += 1;
+        m.entry(stats_key.clone()).or_default().accepts += 1;
     }
 }
 ```
@@ -560,31 +565,27 @@ accept 处（`ingress.rs:583` 那行日志之后）：
 close 处（`ingress.rs:717` 的 `if let Some(c) = ...` 块内）：
 
 ```rust
-{
-    let key = format!("{hostname}/{pname}");
-    if let Ok(mut m) = s3.tunnel_stats.lock() {
-        let e = m.entry(key).or_default();
-        e.closes += 1;
-        e.rx += c.rx;
-        e.tx += c.tx;
-    }
+if let Ok(mut m) = s3.tunnel_stats.lock() {
+    let e = m.entry(stats_key).or_default();
+    e.closes += 1;
+    e.rx += c.rx;
+    e.tx += c.tx;
 }
 ```
 
-first-chunk timeout 处（`ingress.rs:675` 的 warn 之后）：
+> `stats_key` 在闭包外定义、被 `async move` 闭包捕获使用（close / stick 都读它）。
+> `accepts` 块用 `clone()` 以免提前消耗所有权。
+
+first-chunk timeout 处（`ingress.rs:675` 的 warn 之后，同在闭包内）：
 
 ```rust
-{
-    let key = format!("{hostname}/{pname}");
-    if let Ok(mut m) = s3.tunnel_stats.lock() {
-        m.entry(key).or_default().stick += 1;
-    }
+if let Ok(mut m) = s3.tunnel_stats.lock() {
+    m.entry(stats_key.clone()).or_default().stick += 1;
 }
 ```
 
-> 若 `hostname`/`pname` 在该作用域不可用，用已有的 `traffic_key` 或
-> 从 `p` 取到的 tunnel 名替代——**执行时以实际变量为准**，保持 key 与
-> `ratelimit stats` 行一致（`hostname/proxy名`）。
+> 注：first-chunk timeout 分支与 close 可能同时发生，故这里用 `clone()`。
+> key 格式与 `ratelimit stats` 行一致（`hostname/proxy名`）。
 
 - [ ] **Step 4: 运行确认通过**
 
