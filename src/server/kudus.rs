@@ -62,7 +62,15 @@ fn rel_emit(tx: &Tx, rel: &std::sync::Mutex<ServerRel>, flags: u8, body: &[u8]) 
     // 串成 4000 次加锁，重传泵 try_lock 永远抢不到，RTO 形同虚设（blob 219608/2M 即此）。
     let (seq, ack, sack) = if flags & FLAG_DATA != 0 {
         let mut r = rel.lock().unwrap();
-        let s = r.retx.on_send(body.to_vec());
+        // retx 缓冲满（KUDUS_RETX_CAP）：丢弃本帧，不登记也不发。
+        // UDP 语义允许丢，重传/上层重试兜底；关键是别让缓冲无界增长。
+        let s = match r.retx.on_send(body.to_vec()) {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!("kudus retx buf full ({}), dropping DATA frame", KUDUS_RETX_CAP);
+                return false;
+            }
+        };
         (s, r.ack, r.sack)
     } else {
         let r = rel.lock().unwrap();

@@ -137,34 +137,62 @@ pub struct RetxStats {
     pub backlog_max: usize,
 }
 
-/// 发送重传缓冲：on_send 记 seq→(payload, sent_ms)；on_ack 按累积+SACK 清；
-/// take_expired 吐超时未确认包（调用方原样重发并刷新计时）。
+/// RetxBuf 已满（达到 KUDUS_RETX_CAP）。调用方据此丢弃新包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetxFull;
+
+/// 单个待确认包：载荷 + 最后发送时间 + 已重传次数。
+struct RetxEntry {
+    payload: Vec<u8>,
+    last_sent: u64,
+    #[allow(dead_code)] // 使用者：Task 3（指数退避）
+    retx: u32,
+}
+
+/// 发送重传缓冲：on_send 记 seq→entry；on_ack 按累积+SACK 清；
+/// take_expired 吐超时未确认包。
+/// 根因→修法：旧实现 seqs 无容量上限，无 ACK 时无限积压（事故实测 8192 包），
+/// 叠加固定 200ms 重发使流量自我放大到 39MB/s。现加硬上限 KUDUS_RETX_CAP，
+/// 满了返回 Err 让调用方决定丢弃（UDP 语义允许丢）。
 pub struct RetxBuf {
     next: u32,
-    seqs: HashMap<u32, (Vec<u8>, u64)>,
+    seqs: HashMap<u32, RetxEntry>,
+    cap: usize,
     /// 重传埋点（spec §15.3），take_stats 取走即归零。
     stats: RetxStats,
 }
 
 impl RetxBuf {
     pub fn new(start: u32) -> Self {
-        Self { next: start, seqs: HashMap::new(), stats: RetxStats::default() }
+        Self {
+            next: start,
+            seqs: HashMap::new(),
+            cap: KUDUS_RETX_CAP,
+            stats: RetxStats::default(),
+        }
     }
     /// 取走本窗口统计并归零（spec §15.3）。
     /// 峰值由 on_send 维护，这里只取走与重置。
     pub fn take_stats(&mut self) -> RetxStats {
         std::mem::take(&mut self.stats)
     }
-    /// 登记一次发送，返回分配的 seq。
-    pub fn on_send(&mut self, payload: Vec<u8>) -> u32 {
+    /// 登记一次发送，返回分配的 seq；超出容量上限返回 Err（不插入）。
+    pub fn on_send(&mut self, payload: Vec<u8>) -> Result<u32, RetxFull> {
+        if self.seqs.len() >= self.cap {
+            self.stats.full += 1; // spec §15.3
+            return Err(RetxFull);
+        }
         let s = self.next;
         self.next = self.next.wrapping_add(1);
-        self.seqs.insert(s, (payload, now_ms()));
+        self.seqs.insert(
+            s,
+            RetxEntry { payload, last_sent: now_ms(), retx: 0 },
+        );
         // spec §15.3：峰值唯一来源——只在插入后更新，on_ack 不抹平。
         if self.seqs.len() > self.stats.backlog_max {
             self.stats.backlog_max = self.seqs.len();
         }
-        s
+        Ok(s)
     }
     /// 对端 ACK：清累积确认（<=ack）+ SACK 洞外已到包。
     pub fn on_ack(&mut self, ack: u32, sack: &[u8; 32]) {
@@ -182,14 +210,14 @@ impl RetxBuf {
             true
         });
     }
-    /// 取出超时未确认包（刷新其计时防连爆），按 seq 排序。
+    /// 取出超时未确认包，按 seq 排序。
     pub fn take_expired(&mut self, rto: Duration, now: u64) -> Vec<(u32, Vec<u8>)> {
         let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
-        for (seq, (p, sent)) in self.seqs.iter_mut() {
-            if now.wrapping_sub(*sent) >= rto.as_millis() as u64 {
-                *sent = now;
+        for (seq, e) in self.seqs.iter_mut() {
+            if now.wrapping_sub(e.last_sent) >= rto.as_millis() as u64 {
+                e.last_sent = now;
                 self.stats.sent += 1; // spec §15.3：每重发一包 +1
-                due.push((*seq, p.clone()));
+                due.push((*seq, e.payload.clone()));
             }
         }
         due.sort_by_key(|(s, _)| *s);
@@ -516,6 +544,19 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
 
+    /// 容量上限：满 4096 后 on_send 必须拒绝，不能无限增长。
+    /// 旧代码：seqs 是裸 HashMap，无上限，无 ACK 时无限涨（事故 8192 包）。
+    #[test]
+    fn retx_buf_respects_capacity() {
+        let mut tx = super::RetxBuf::new(1);
+        for i in 0..super::KUDUS_RETX_CAP {
+            assert!(tx.on_send(vec![i as u8]).is_ok(), "第 {i} 个应能登记");
+        }
+        assert_eq!(tx.len(), super::KUDUS_RETX_CAP);
+        assert!(tx.on_send(vec![0]).is_err(), "超过 cap 必须拒绝，否则缓冲无界");
+        assert_eq!(tx.len(), super::KUDUS_RETX_CAP, "被拒后长度不能变");
+    }
+
     /// 背压阈值与硬容量上限是两个不同的数，不能混用。
     /// 根因→修法：旧代码把 256 硬编码在 server/kudus.rs 两处 + agent 一处，
     /// 且没有硬上限，retx 表可无限增长（事故实测积压 8192 包 → 39MB/s）。
@@ -655,9 +696,9 @@ mod tests {
     #[test]
     fn retx_expires_and_acks() {
         let mut tx = RetxBuf::new(1);
-        let s1 = tx.on_send(b"a".to_vec());
-        let s2 = tx.on_send(b"b".to_vec());
-        let _s3 = tx.on_send(b"c".to_vec());
+        let s1 = tx.on_send(b"a".to_vec()).unwrap();
+        let s2 = tx.on_send(b"b".to_vec()).unwrap();
+        let _s3 = tx.on_send(b"c".to_vec()).unwrap();
         assert_eq!((s1, s2), (1, 2));
         tx.on_ack(1, &[0u8; 32]);
         let due = tx.take_expired(Duration::from_millis(200), now_ms() + 1000);

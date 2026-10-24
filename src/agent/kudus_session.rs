@@ -91,7 +91,17 @@ impl Pkt {
             // （blob 219608/2M 即此）。
             let (seq, ack, sack) = {
                 let mut r = self.rel.lock().unwrap();
-                let s = r.retx.on_send(body.to_vec());
+                // retx 缓冲满（KUDUS_RETX_CAP）：丢弃本帧。UDP 语义允许丢。
+                let s = match r.retx.on_send(body.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::warn!(
+                            "kudus retx buf full ({}), dropping DATA frame",
+                            crate::common::kudus::KUDUS_RETX_CAP
+                        );
+                        return Ok(());
+                    }
+                };
                 (s, r.ack, r.sack)
             };
             self.emit(flags, seq, ack, sack, body)
