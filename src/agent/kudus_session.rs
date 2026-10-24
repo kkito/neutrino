@@ -26,6 +26,11 @@ pub(crate) const KUDUS_MAX_UDP_STREAMS: usize = 256;
 /// UDP 流 server 侧无数据空闲超时（旧 120s：DHT 下 fd 空占太久）。
 const UDP_STREAM_IDLE_SECS: u64 = 30;
 
+/// agent 侧等待隧道窗口的最长时间；超时即丢弃本次数据（UDP 语义允许丢）。
+/// 根因→修法：旧实现 3000×10ms(30s) 循环耗尽后照样发送，
+/// 与 server 侧同构——背压在超时后形同虚设。
+const KUDUS_AGENT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 发包器：hdr + proto_frame 封包（mpsc 发 bytes，写泵统一 send_to 保序）。
 #[derive(Clone)]
 pub(crate) struct Pkt {
@@ -131,14 +136,23 @@ impl Pkt {
     /// 丢包雪崩后重传泵+写泵双双 100% 空转（blob 首传 ok、次传 hang 即此）。
     /// 注意：旧 `std::thread::sleep` 版会卡死单线程 reactor 上所有同 task 的流
     /// （单连接的 2000 帧没发完，同 task 第二个连接的 Open 永不到——次传 hang 即此）。
-    pub(crate) async fn wait_window(&self) {
-        for _ in 0..3000 {
-            let n = self.rel.lock().map(|r| r.retx.len()).unwrap_or(0);
-            if n < 256 {
-                break;
+    /// 等待 retx 未确认包数降到背压阈值以下。
+    /// 返回 `true` = 有空间可发；`false` = 等了 `KUDUS_AGENT_SEND_TIMEOUT` 仍积压。
+    /// 根因→修法：旧实现超时后直接返回 `()`、调用方照样发，背压失效；
+    /// 现改为返回 bool，调用方据此**丢弃**本次数据（UDP 可丢，不会放大）。
+    /// 注意：用异步 sleep，不占 reactor（旧 `thread::sleep` 版会卡死同 task 其他流）。
+    pub(crate) async fn wait_window(&self) -> bool {
+        let mut waited = std::time::Duration::ZERO;
+        while self.rel.lock().map(|r| r.retx.len()).unwrap_or(0)
+            >= crate::common::kudus::KUDUS_RETX_BACKLOG
+        {
+            if waited >= KUDUS_AGENT_SEND_TIMEOUT {
+                return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(crate::common::kudus::BACKPRESSURE_POLL).await;
+            waited += crate::common::kudus::BACKPRESSURE_POLL;
         }
+        true
     }
     pub(crate) fn send_data_stream(&self, sid: u32, chunk: &[u8]) {
         if chunk.is_empty() {
@@ -649,7 +663,10 @@ async fn pump_tcp(
         // 根因→修法：旧无界发送，大文件切 2000 帧灌满对端重排窗→丢包雪崩→次传 hang。
         let pktw = pkt.clone();
         let local_to_ws = tokio::spawn(async move {
-            pktw.wait_window().await;
+            if !pktw.wait_window().await {
+                tracing::warn!("kudus agent send timeout, dropping http response (sid={sid})");
+                return;
+            }
             http_response_pump(super::stream::KudusSender(pktw.clone()), sid, lr).await
         });
         let _ = local_to_ws.await;
@@ -664,7 +681,10 @@ async fn pump_tcp(
                 match lr.read(&mut b).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        pkt2.wait_window().await;
+                        if !pkt2.wait_window().await {
+                            tracing::warn!("kudus agent send timeout, dropping chunk (sid={sid})");
+                            break;
+                        }
                         send_data(&pkt2, sid, &b[..n], false);
                     }
                 }
@@ -773,6 +793,40 @@ use std::time::Duration;
 mod tests {
     use std::collections::HashMap;
     use tokio::sync::{mpsc, RwLock};
+
+    /// agent 侧背压超时后必须放弃本次发送，不能像旧代码那样照样发。
+    /// 根因：旧 wait_window 是 3000x10ms 循环，耗尽后直接返回 ()，
+    /// 调用方照样 send_data —— 与 server 侧同构的"背压形同虚设"。
+    #[test]
+    fn agent_send_timeout_drops_without_hang() {
+        use std::sync::Arc;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (otx, mut orx) = mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(async move { while orx.recv().await.is_some() {} });
+            let pkt = super::Pkt {
+                out: otx,
+                key: [0u8; 32],
+                session: 1,
+                rel: Arc::new(std::sync::Mutex::new(super::RelSend::new())),
+            };
+            // 塞满 retx 表，模拟窗口积压（超过 KUDUS_RETX_BACKLOG）
+            {
+                let mut g = pkt.rel.lock().unwrap();
+                for i in 0..crate::common::kudus::KUDUS_RETX_BACKLOG + 10 {
+                    let _ = g.retx.on_send(vec![i as u8]);
+                }
+            }
+            // wait_window 必须返回 false（超时），且不能永久阻塞
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                pkt.wait_window(),
+            )
+            .await;
+            assert!(r.is_ok(), "wait_window 不能永久挂住");
+            assert!(!r.unwrap(), "窗口积压时应返回 false（超时），调用方据此丢包");
+        });
+    }
     /// RED：udp 流在 server 不再发数据后，必须自己活不下来——
     /// 既要从 ctx.streams 里消失，也要把 socket drop 掉（fd 归还）。
     ///
