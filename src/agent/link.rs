@@ -639,8 +639,11 @@ mod tests {
             link_tasks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             streams: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             pending: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            udp_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
-                super::super::kudus_session::KUDUS_MAX_UDP_STREAMS,
+            udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::Udp),
+            )),
+            link_udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::LinkUdp),
             )),
         };
         // 第一个 session 建监听

@@ -74,6 +74,10 @@ impl UdpPool {
     pub fn idle_len(&self) -> usize {
         self.idle.len()
     }
+    /// 该 sid 当前占用的槽位号。
+    pub fn slot_of(&self, sid: u32) -> Option<usize> {
+        self.in_use.get(&sid).copied()
+    }
     /// sid 是否在池中。
     pub fn contains(&self, sid: u32) -> bool {
         self.in_use.contains_key(&sid)

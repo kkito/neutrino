@@ -14,17 +14,20 @@ pub(crate) struct KCtx {
     pub(crate) link_tasks: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
     pub(crate) streams: RwLock<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
     pub(crate) pending: RwLock<HashMap<u32, Vec<Vec<u8>>>>,
-    /// UDP egress 并发上限：每条 udp/link_udp 流占一个 connected socket（1 fd），
-    /// DHT flood 下无上限即 1024 fd 打满 EMFILE（snail 2026-10-23 现场）。
-    /// 注意不能跨 sid 复用一个 socket：同目标（transmission 51413）的多流回包
-    /// 全来自同一对端地址，无协议层解析就无法 demux 到 sid，只能限并发不能合 socket。
-    pub(crate) udp_slots: Arc<tokio::sync::Semaphore>,
+    /// udp 类流的 socket 池（与 link_udp 独立，互不抢占）。
+    /// 根因→修法：旧 `udp_slots: Semaphore(256)` 打满即拒（snail 实测 3608 条
+    /// "too many udp streams"）；现改为池化 + LRU 踢流，socket 数只与「同时在
+    /// 等回包的会话数」相关，与「累计会话数」无关。
+    pub(crate) udp_pool: Arc<tokio::sync::Mutex<super::udp_pool::UdpPool>>,
+    /// link_udp 类流的 socket 池。独立实例，BT 洪峰不会饿死 link 功能。
+    pub(crate) link_udp_pool: Arc<tokio::sync::Mutex<super::udp_pool::UdpPool>>,
 }
 
-/// 单 agent UDP egress 最大并发（udp + link_udp 共用）。256 fd 预留给 TCP/控制面。
-pub(crate) const KUDUS_MAX_UDP_STREAMS: usize = 256;
-/// UDP 流 server 侧无数据空闲超时（旧 120s：DHT 下 fd 空占太久）。
-const UDP_STREAM_IDLE_SECS: u64 = 30;
+/// UDP 流空闲超时（agent 侧兜底）。根因→修法：曾 120s、后 30s，均与
+/// server 侧 UDP_SESSION_TTL_SECS_DEFAULT=5 相差过大——server 5s 就回收
+/// session 并发 Close，agent 却还挂着 fd。现对齐 5s；主路径仍是 server
+/// 主动 Close，此值只作 server 异常（崩溃/断网）时的兜底。
+const UDP_STREAM_IDLE_SECS: u64 = 5;
 
 /// UDP 出站 socket 的接收缓冲大小（每条流一份，池化后每个 socket 一份）。
 /// 根因→修法：旧值 65535，256 流即 16MB 纯堆内存；池化到 512 流是 32MB。
@@ -282,7 +285,12 @@ pub(crate) async fn session(
         link_tasks: tokio::sync::Mutex::new(HashMap::new()),
         streams: RwLock::new(HashMap::new()),
         pending: RwLock::new(HashMap::new()),
-        udp_slots: Arc::new(tokio::sync::Semaphore::new(KUDUS_MAX_UDP_STREAMS)),
+        udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::new(
+            super::udp_pool::PoolKind::Udp,
+        ))),
+        link_udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::new(
+            super::udp_pool::PoolKind::LinkUdp,
+        ))),
     });
     let kudus_link_holder = kudus_out.clone();
     super::link::sync_link_listeners_kudus(&ctx, &cfg.proxies, &up.hostname, &kudus_link_holder).await;
@@ -583,7 +591,14 @@ async fn open_stream(
             return Ok(());
         }
         tracing::debug!("kudus link_udp egress stream {sid} -> {host}:{port}");
-        return open_udp_stream_to(ctx, pkt, sid, local).await;
+        return open_udp_stream_to(
+            ctx,
+            pkt,
+            sid,
+            local,
+            super::udp_pool::PoolKind::LinkUdp,
+        )
+        .await;
     }
     if kind == "egress_dial" {
         // kudus 版反向拨号：dial 真实目标 + pump_tcp（与 open_tcp_stream 出口段同构）。
@@ -712,18 +727,28 @@ async fn open_udp_stream_to(
     pkt: Pkt,
     sid: u32,
     sock: tokio::net::UdpSocket,
+    kind: super::udp_pool::PoolKind,
 ) -> anyhow::Result<()> {
-    // 并发上限：DHT flood 下每流 1 fd 无上限即 EMFILE。占不到槽位直接拒（server 侧
-    // session 随对端超时自然过期），不挂起——挂起会把 Open task 堆成内存泄漏。
-    let _slot = match ctx.udp_slots.clone().try_acquire_owned() {
-        Ok(g) => g,
-        Err(_) => {
-            tracing::warn!("kudus udp stream {sid} rejected: too many udp streams");
-            let e = ClientMsg::Close { stream: sid, reason: "udp busy".into() };
-            let _ = pkt.send_ctrl(&e);
-            return Ok(());
-        }
+    // 从对应池借槽位；池满则踢最久未活跃的 sid（发 Close 并复用它的槽位），新流总能进。
+    // 根因→修法：旧实现 Semaphore(256) 拿不到 permit 就 warn + Close + return，
+    // DHT 扫描下所有新 peer 全断（snail 实测 3608 条 too many udp streams）。
+    //
+    // 注意：UdpPool::acquire 在池满时**内部已经完成**「移除 victim + 把新 sid
+    // 放进 victim 的槽位」，返回 Evicted(victim) 只是告知调用方该给谁发 Close。
+    // 因此这里**不要**再 acquire 一次（会打乱 LRU），槽位号由池内部账本保证。
+    let pool = match kind {
+        super::udp_pool::PoolKind::Udp => ctx.udp_pool.clone(),
+        super::udp_pool::PoolKind::LinkUdp => ctx.link_udp_pool.clone(),
     };
+    {
+        let mut p = pool.lock().await;
+        if let super::udp_pool::Acquire::Evicted(victim) = p.acquire(sid) {
+            // 通知被踢的 sid：server 侧会随 TTL 自然过期，agent 主动 Close 更快。
+            tracing::warn!("kudus udp pool full, evicting sid={victim} (new sid={sid})");
+            let e = ClientMsg::Close { stream: victim, reason: "pool evicted".into() };
+            let _ = pkt.send_ctrl(&e);
+        }
+    }
     let sock = Arc::new(sock);
     let (dtx, mut drx) = mpsc::unbounded_channel::<Vec<u8>>();
     let early = ctx.pending.write().await.remove(&sid).unwrap_or_default();
@@ -746,12 +771,15 @@ async fn open_udp_stream_to(
     });
     let pkt3 = pkt.clone();
     let r = sock.clone();
+    let pool_touch = pool.clone();
     let udp_to_ws = tokio::spawn(async move {
         let mut b = vec![0u8; UDP_RECV_BUF];
         loop {
             match r.recv(&mut b).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    // LRU：有回包说明该 sid 仍活跃，刷新其位置。
+                    pool_touch.lock().await.touch(sid);
                     // UDP recv 会静默截断（不报错）：n == buf.len() 说明可能被截。
                     // 拿不到原始包长，只能近似判断，故措辞用 possibly。
                     if n == UDP_RECV_BUF {
@@ -779,6 +807,8 @@ async fn open_udp_stream_to(
         _ = &mut udp_to_ws => { ws_to_udp.abort(); }
     }
     ctx.streams.write().await.remove(&sid);
+    // 归还槽位：槽位是关键资源（1 socket = 1 fd），流结束必须还。
+    pool.lock().await.release(sid);
     let e = ClientMsg::Close { stream: sid, reason: "eof".into() };
     let _ = pkt.send_ctrl(&e);
     Ok(())
@@ -798,7 +828,7 @@ async fn open_udp_stream(ctx: Arc<KCtx>, pkt: Pkt, sid: u32, port: u16) -> anyho
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((p.local_ip.as_str(), p.local_port)).await?;
     tracing::debug!("kudus udp stream {sid} -> {}:{}", p.local_ip, p.local_port);
-    open_udp_stream_to(ctx, pkt, sid, sock).await
+    open_udp_stream_to(ctx, pkt, sid, sock, super::udp_pool::PoolKind::Udp).await
 }
 
 use std::time::Duration;
@@ -807,6 +837,47 @@ use std::time::Duration;
 mod tests {
     use std::collections::HashMap;
     use tokio::sync::{mpsc, RwLock};
+
+    /// 出站 socket 每个 sid 独占一个并 connect 到固定目标——**这是当前设计的
+    /// 正确行为**，不是缺陷。
+    ///
+    /// 原 spec Task 15 主张改用 send_to 以便"一个 socket 服务多个目标"，
+    /// 但那样 socket 就必须 unconnected，`recv` 会收到任意来源的包，
+    /// 必须靠 `recv_from` 的来源地址过滤才不串到别的 sid——而同一目标
+    /// (transmission 51413) 的多条流回包源地址完全相同，根本无法 demux。
+    /// 结论：UDP 语义强制「每 sid 一 socket」，connect 反而是防护（内核已过滤
+    /// 非目标来源），换成 send_to 会引入跨 sid 串包风险。
+    ///
+    /// 池的正确职责因此只是**限制 fd 数量**（POOL_MAX）+ LRU 踢流，
+    /// 而非共享 socket。见 udp_pool.rs 模块头注释。
+    #[test]
+    fn udp_egress_socket_per_stream_is_intentional() {
+        let src = include_str!("kudus_session.rs");
+        let needle = concat!(".", "connect(");
+        let n = src.lines().filter(|l| l.contains(needle)).count();
+        assert!(
+            n >= 1,
+            "出站 udp socket 必须 connect 到目标：unconnected socket 的 recv \
+             会收到任意来源包，同目标多流回包无法 demux，会跨 sid 串包"
+        );
+    }
+
+    /// idle 超时必须与 server 侧 TTL(5s) 对齐。
+    /// 根因：agent 侧曾是 120s（DHT 下 fd 空占太久），改 30s 后仍与
+    /// server TCP 差 6 倍——server 5s 就忘掉 sid，agent 还挂着 fd。
+    #[test]
+    fn udp_idle_timeout_is_5s() {
+        assert_eq!(
+            super::UDP_STREAM_IDLE_SECS,
+            5,
+            "应与 server UDP_SESSION_TTL_SECS_DEFAULT=5 对齐"
+        );
+        assert_eq!(
+            super::UDP_STREAM_IDLE_SECS,
+            crate::server::state::UDP_SESSION_TTL_SECS_DEFAULT,
+            "两端常量必须相等，避免 server 已过期而 agent 还挂着"
+        );
+    }
 
     /// UDP 出站接收 buffer 必须是 2048，不是 64KB。
     /// 根因：旧代码每条 udp 流 vec![0u8; 65535]，256 流 = 16MB 纯堆浪费，
@@ -889,13 +960,18 @@ mod tests {
             link_tasks: tokio::sync::Mutex::new(HashMap::new()),
             streams: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
-            udp_slots: Arc::new(tokio::sync::Semaphore::new(super::KUDUS_MAX_UDP_STREAMS)),
+            udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::Udp),
+            )),
+            link_udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::LinkUdp),
+            )),
         });
         // 目标 socket：绑本地，永不回包（模拟黑洞目标）。
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sid = 42u32;
         let c2 = ctx.clone();
-        let t = tokio::spawn(async move { super::open_udp_stream_to(c2, pkt, sid, sock).await });
+        let t = tokio::spawn(async move { super::open_udp_stream_to(c2, pkt, sid, sock, crate::agent::udp_pool::PoolKind::Udp).await });
         // 等流注册完成
         for _ in 0..100 {
             if ctx.streams.read().await.contains_key(&sid) {
@@ -914,10 +990,15 @@ mod tests {
     #[test]
     fn udp_concurrency_capped() {
         // snail 2026-10-23：无上限时 DHT flood 每流 1 fd 打满 1024 EMFILE。
-        // 注意不能跨 sid 复用 socket：同目标回包无法 demux，只能限并发。
-        assert!(super::KUDUS_MAX_UDP_STREAMS <= 512);
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(super::KUDUS_MAX_UDP_STREAMS));
-        assert_eq!(sem.available_permits(), super::KUDUS_MAX_UDP_STREAMS);
+        // 旧实现用 Semaphore(256) 打满直接拒；现改为池化 512 上限 + LRU 踢流。
+        assert!(
+            crate::agent::udp_pool::POOL_MAX <= 512,
+            "fd 上限仍需可控"
+        );
+        assert!(
+            crate::agent::udp_pool::POOL_INIT < crate::agent::udp_pool::POOL_MAX,
+            "初值应小于上限"
+        );
     }
     #[test]
     fn heartbeat_contract() {

@@ -2597,7 +2597,20 @@ git commit -m "feat(agent/kudus): open_udp_stream 改用 socket 池（替换 Sem
 
 ---
 
-### Task 15: socket 创建改用 `send_to`（不 `connect`）
+### Task 15: ~~socket 创建改用 `send_to`（不 `connect`）~~ —— **实施中撤销**
+
+> **实施决策（2026-10-24）**：本 Task 的设计前提有误，已撤销。
+>
+> 原设想：socket 池复用同一 socket 服务多个目标的 sid，故不能 connect。
+> 实际：同一目标（transmission 51413）的多条流回包源地址完全相同，
+> unconnected socket 靠 `recv_from` 无法 demux 到 sid → **跨 sid 串包**，
+> 比原缺陷更严重。`connect` 反而是内核级来源过滤（防护）。
+>
+> 结论：UDP 语义强制「每 sid 一 socket」。池的职责只是**限制 fd 数量**
+> + LRU 踢流，不共享 socket。Task 14 的实现已符合此结论。
+>
+> 保留一个回归测试 `udp_egress_socket_per_stream_is_intentional`
+> 锁住"必须 connect"这一不变式，防止后来者误改成 send_to。
 
 **Files:**
 - Modify: `src/agent/kudus_session.rs:729-745`（`open_udp_stream` 里 bind + connect）
