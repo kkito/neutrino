@@ -10,6 +10,23 @@ pub const KUDUS_RTO: Duration = Duration::from_millis(200);
 /// 重排/重传缓冲上限：防对端疯发撑爆内存（超了丢新包，等重传补）。
 pub const KUDUS_WINDOW: usize = 512;
 
+/// 背压阈值：retx 未确认包数达到此值即认为窗口积压，需退让等 ACK。
+/// 这是「滞回线」，不是硬上限——正常发送在这里停等一下，与 KUDUS_RETX_CAP 不同。
+pub const KUDUS_RETX_BACKLOG: usize = 256;
+
+/// retx 缓冲硬容量上限。根因→修法：旧 RetxBuf 无上限，无 ACK 时无限积压
+/// （事故实测 8192 包），叠加固定 200ms 重传使流量自我放大 5~40 倍
+/// （ratelimit 实测 thru=22.4MB/s vs limit=512KB/s）。
+/// 4096 = KUDUS_WINDOW(512) × 8，洁 1232B/包约 5MB 内存上限。
+pub const KUDUS_RETX_CAP: usize = 4096;
+
+/// 单个包最大重传次数，超过即放弃并从表移除。
+/// 根因→修法：旧 take_expired 重发时刷新 *sent = now，包永不丢弃（无限复活）。
+pub const KUDUS_MAX_RETX: u32 = 10;
+
+/// 重传退避上限。200ms 起指数翻倍，最长到 8s 封顶。
+pub const KUDUS_RTO_MAX: Duration = Duration::from_secs(8);
+
 /// kudus 看门狗阈值：75s 无任何帧即判死（server/agent 双端共用）。
 /// 根因→修法：WSS 的 45s 按"3×15s server Ping"算；kudus agent 上行最坏 30s 一包，
 /// 45s 只容忍丢 1 包，75s 容忍连丢 2 包不误踢。WSS 的 IDLE_KICK_SECS 不动。
@@ -498,6 +515,21 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 背压阈值与硬容量上限是两个不同的数，不能混用。
+    /// 根因→修法：旧代码把 256 硬编码在 server/kudus.rs 两处 + agent 一处，
+    /// 且没有硬上限，retx 表可无限增长（事故实测积压 8192 包 → 39MB/s）。
+    #[test]
+    fn retx_constants_are_sane() {
+        assert_eq!(super::KUDUS_RETX_BACKLOG, 256);
+        assert_eq!(super::KUDUS_RETX_CAP, 4096);
+        assert!(
+            super::KUDUS_RETX_BACKLOG < super::KUDUS_RETX_CAP,
+            "背压阈值必须小于硬上限"
+        );
+        assert_eq!(super::KUDUS_MAX_RETX, 10);
+        assert_eq!(super::KUDUS_RTO_MAX, Duration::from_secs(8));
+    }
     use super::*;
 
     #[test]
