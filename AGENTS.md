@@ -21,8 +21,26 @@ cargo test --test e2e <name>       # 跑单个 e2e
 ```
 
 ## 测试现状（2026-10-19）
-- 单测 30（`src/server.rs::tests`、`src/agent.rs::tests`、`src/agent_web.rs::tests`、`src/main.rs::main_tests`）。
-- e2e 7（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行。
+- 单测 139（`src/server/*::tests`、`src/agent*::tests`、`src/main.rs::main_tests`）。
+- e2e 35（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link。
+- 全量串行：单测 ~2s + e2e ~39s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
+
+### 测试等待规范（必读，已优化过一轮）
+禁止盲等 `sleep(Ns)` 来“等某状态就绪”。两类正确做法：
+1. **轮询可观测状态**：boot 后就绪看 `/api/tunnels` 或 `/api/overview`（参 `settle()` / `wait_agents_count()`），
+   命中即返回（~20ms），未命中才耗尽上限。boot 变体内的粗同步已统一为 `settle()`（3×20ms）。
+2. **参数化物理时间**：限速类用例是“字节/秒”，等比缩小限速值与灌包/排空窗口即等价
+   （如 `e2e_udp_ratelimit_caps_ingress_rate`：64k/1s/2s → 512k/250ms/300ms，判据从“包数<300”改为“<400”）。
+3. **观察窗类判据**：`e2e_register_does_not_loop_config_push` 原来是“死等 3s 再数条数”，
+   改为“先等首条出现，再观察 400ms 看是否还涨”——死循环的特征是持续增长，此判据更强且更快（3.4s→0.6s）。
+
+**后台 tick 可配**：`server` 新增 `--live-tick-ms/--traffic-tick-ms/--limiter-tick-ms/--persist-tick-ms`，
+0=默认（5000/60000/300000/30000，与旧硬编码一致，`server::tick_tests` 锁死）。
+`tests/e2e.rs::boot_with_desired` 统一传 50ms——`/api/live` 需两个 live tick 才出增量，
+这也使 `e2e_live_snapshot_within_10s` 从 10.2s 降到 0.3s。
+
+**不能动的物理时间**：mock 后端故意慢响应（`e2e_http_conns_cleaned_on_client_abort` 的 5s）、
+限速窗口 1s（`ratelimit.rs`）、kudus RTO 200ms、负向“黑洞”观察窗（`kudus_bad_token_blackhole`）。
 
 ## 铁律：TDD 修 bug / 加功能
 1. **先写失败测试（RED）**：单测放对应模块 `mod tests`，回归放 `tests/e2e.rs`。必须亲眼看到它红，且红的原因是"行为缺失"（不是笔误）。修复前回退验证：临时关掉修复，测试必须变红（如 `overlay log count 250: Register/Config loop!`）。
