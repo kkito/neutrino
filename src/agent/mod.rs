@@ -7,6 +7,7 @@ pub mod local_ingress;
 pub mod quic_session;
 pub mod session;
 pub mod stream;
+pub mod udp_pool;
 pub mod web;
 
 use crate::common::proto::*;
