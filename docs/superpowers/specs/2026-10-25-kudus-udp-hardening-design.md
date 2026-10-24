@@ -901,6 +901,8 @@ socket 出错、对端拒绝、池满踢流在日志里完全不可见。
 | 5 | UDP ingress `tunnel_stats` 埋点（§15.4 补漏） | 层 5b | **待实现** |
 | 6 | accept/close/udp session 全量降 DEBUG | 层 5b | tcp 已完成（`258330e`）；**udp session 待降** |
 | 7 | journald 留存落地（§15.5 ①） | 运维 | **待执行** |
+| 8 | `SIGUSR1` 临时提级 debug 60s（自动恢复） | 层 5d | **待实现** |
+| 9 | `SIGUSR2` 立即恢复 info | 层 5d | **待实现** |
 
 **不在范围**：server 侧 UDP 会话数上限（当前无上限、靠 TTL 回收，
 风险见 §16.7）。
@@ -1041,7 +1043,137 @@ journald 里仍是每分钟 541 条 `tcp accept`/`tcp close` 的 INFO。
 udp 在 info」的不一致；`tunnel stats` 汇总行（每分一次、per-tunnel 明细）
 已在 INFO 保留可见性，单连接明细本就该在 DEBUG 按需开（`RUST_LOG=neutrino=debug`）。
 
-### 16.5 层 5c：journald 留存（运维，不改代码）
+### 16.5 层 5d：动态日志级别（SIGUSR1 / SIGUSR2）
+
+#### ① 为什么需要
+
+层 5a 的流收尾日志是 DEBUG 级，默认 `RUST_LOG=info` 看不到（`main.rs:194`）。
+但生产上排查「5 秒够不够」时，改 systemd 的 `Environment=RUST_LOG=` 再
+`daemon-reload + restart` 是**不可接受的打断**——重启会掐掉所有正在进行的
+UDP 会话，等于把要观测的现象消灭掉了。
+
+需要一个**不重启、限时、自动还原**的开关。
+
+#### ② 为什么不用 HTTP API
+
+| 方案 | 误操作后果 | agent 侧可用性 |
+| ---- | --------- | -------------- |
+| HTTP `/api/log-level` | 400，无害 | **要求 agent 开 `--web`**（当前未开） |
+| SIGUSR1 / SIGUSR2 | 若未注册 handler：**进程被杀** | 无需端口、无需认证 |
+
+agent 侧当前无 WebUI（`--server` 直连模式），HTTP 方案对 agent 不可用。
+信号方案两端对称、零配置，故选信号。
+
+#### ③ 信号选择与语义
+
+| 信号 | 编号 | 动作 |
+| ---- | ---- | ---- |
+| `SIGUSR1` | 10 | 提级到 DEBUG，**60 秒后自动恢复**原级别 |
+| `SIGUSR2` | 12 | 立即恢复原级别（提前结束观察窗） |
+
+```bash
+kill -USR1 $(pgrep -x neutrino)    # 开 60s debug
+kill -USR2 $(pgrep -x neutrino)    # 立刻关
+```
+
+**不用 `SIGURG`/`SIGWINCH` 的理由**：默认忽略虽然更安全，但语义与日志无关，
+后来者看见会困惑；`SIGUSR1/2` 是 nginx/postgres 的既有惯例。
+
+#### ④ 实现要点
+
+```rust
+use tokio::signal::unix::{signal, SignalKind};
+
+// 注册即接管默认行为（默认是终止进程！）
+let mut usr1 = signal(SignalKind::user_defined1())?;
+let mut usr2 = signal(SignalKind::user_defined2())?;
+
+tokio::spawn(async move {
+    let mut restore: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        tokio::select! {
+            _ = usr1.recv() => {
+                // 覆盖前一个 TTL：连按多次只保留最后一个计时器
+                if let Some(h) = restore.take() { h.abort(); }
+                set_level("debug");
+                tracing::info!("log level -> debug for 60s (SIGUSR1)");
+                restore = Some(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    set_level("info");   // 回到启动时的级别，不是硬编码 info
+                    tracing::info!("log level restored after 60s");
+                }));
+            }
+            _ = usr2.recv() => {
+                if let Some(h) = restore.take() { h.abort(); }
+                set_level("info");
+                tracing::info!("log level restored early (SIGUSR2)");
+            }
+        }
+    }
+});
+```
+
+**关键点**：
+
+1. **`signal()` 注册必须成功**，否则 `SIGUSR1` 会直接杀进程（默认行为）。
+   注册失败要在启动时 `warn!` 明示「信号开关不可用」。
+2. **恢复目标是启动时的级别**，不是硬编码 `info`——用户若用
+   `RUST_LOG=neutrino::agent=debug` 启动，USR2 应回到那个值。
+3. **重复 USR1 覆盖计时器**（`abort` 旧的），否则连按 5 次会积累 5 个
+   restore 任务，最后一个提前把级别打回去。
+4. **server 与 agent 各自独立注册**——两个二进制共用 `main.rs`，
+   在 `main` 里统一 spawn 一次即可。
+
+#### ⑤ 启动 banner 必须自曝用法
+
+信号开关最大的问题是**没人知道它存在**。运维不会去翻文档找「怎么开 debug」，
+所以启动时必须打进 banner，与现有 `kudus :` / `web login :` 同一区块：
+
+```
+neutrino-server running:
+  listen : http://0.0.0.0:7440/  (Host=业务域->隧道, /=WebUI, /ws=agent)
+  agent token  : 996f...a919  (agent 用 --server ws://0.0.0.0:7440/ws + 相同 token)
+  web login    : admin / (已设置的口令)
+  kudus    : udp-k://0.0.0.0:36182 (agent 用 --server kudus://0.0.0.0:36182)
+  log level    : info  →  kill -USR1 <pid> 临时开 DEBUG 60s；kill -USR2 <pid> 提前恢复
+```
+
+**要点**：
+
+1. 行首 `log level    : ` 与现有 `web login    : ` 对齐（冒号前补空格到同列）。
+2. **打印的是当前实际级别**（`RUST_LOG` 解析后的值），不是硬编码 `info`——
+   用户用 `RUST_LOG=neutrino=debug` 启动时这里应显示 `debug`，且此时
+   信号开关意义不大（本就已经是 debug），措辞可保持通用。
+3. agent 侧同理，在 agent 的启动 banner 里打同一行（两个二进制共用 `main.rs`，
+   抽一个 `print_log_level_hint(level)` 函数复用）。
+4. 注册失败时这行改为 warn 语气：
+   `log level    : 信号开关不可用（signal() 注册失败），请用 RUST_LOG 环境变量`
+
+#### ⑥ 测试计划
+
+| # | 用例 | 类型 | 抓什么 |
+| - | ---- | ---- | ------ |
+| 6 | `log_level_restore_target_is_startup_value` | 单测 | 恢复目标是启动值而非硬编码 `info` |
+| 7 | `log_level_signal_state_overrides_ttl` | 单测 | 连续 USR1 时旧计时器被 abort（不残留） |
+| 8 | `log_level_hint_line_names_both_signals` | 单测 | banner 文本同时含 `-USR1` 与 `-USR2`，避免只写一半 |
+
+**为什么不测「真的发信号」**：单测进程里 `kill(getpid(), SIGUSR1)` 会与
+测试运行器自身的信号处理冲突。把「计算恢复目标」「覆盖 TTL」抽成纯函数测，
+信号注册与 spawn 只在 e2e/手工验证。
+
+手工验证步骤写入 `docs/`，发版后照做一遍：
+
+```bash
+kill -USR1 $(pgrep -x neutrino) && sleep 3 && journalctl -u neutrino-server -n 50 | grep debug
+```
+
+#### ⑦ 已知限制
+
+- **仅在信号触发的窗口内生效**，不改变启动配置，重启后回到 `RUST_LOG` 的值。
+- 提级期间 DEBUG 日志量可能很大（尤其 `tunnel stats` 逐流明细），
+  60 秒窗口是刻意的上限，避免忘记关闭撑爆 journald。
+
+### 16.6 层 5c：journald 留存（运维，不改代码）
 
 `/etc/systemd/journald.conf`：
 
@@ -1055,7 +1187,7 @@ MaxRetentionSec=30day
 **不引入 `tracing-appender`**：journald 本身是成熟的滚动+保留方案，
 引新依赖会带来「stdout 与文件双写重复」的新问题。
 
-### 16.6 测试计划（TDD，先红后绿）
+### 16.7 测试计划（TDD，先红后绿）
 
 | # | 用例 | 类型 | 抓什么 |
 | - | ---- | ---- | ------ |
@@ -1070,7 +1202,7 @@ ingress 之前就被内核丢掉，实测恒定只进 ≈137 个。用例必须*
 
 **回退验证**：注释掉 UDP 的 `accepts += 1`，用例 4 必须变红。
 
-### 16.7 关键决策记录（本层）
+### 16.8 关键决策记录（本层）
 
 | # | 决策 | 理由 |
 | - | ---- | ---- |
@@ -1079,8 +1211,10 @@ ingress 之前就被内核丢掉，实测恒定只进 ≈137 个。用例必须*
 | C | 旁挂表 + `sessions.retain` 后同步 retain | 覆盖 agent 主动 Close 路径，零泄漏 |
 | D | `--udp-idle-secs` 的 `0` 回退默认 | `from_secs(0)` 是灾难值（瞬杀/泄 fd） |
 | E | `Ok(0)` 与 `Err` 分支必须分开 | 合并即放弃区分「正常关闭 vs 真错误」 |
+| F | 动态日志级别用信号而非 HTTP | agent 无 WebUI 时 HTTP 不可用；信号两端对称、零配置 |
+| G | `SIGUSR1` 限时 60s 自动恢复 | 不限时会让 DEBUG 撑爆 journald；重启改环境变量则会掐掉正在观测的会话 |
 
-### 16.8 教训
+### 16.9 教训
 
 1. **「能不能回答运维的追问」是日志的验收标准。** 这次不是不知道要打什么，
    而是「每分钟一行全局数字」看起来已经够了——直到有人问「5 秒够不够」
@@ -1091,7 +1225,7 @@ ingress 之前就被内核丢掉，实测恒定只进 ≈137 个。用例必须*
 3. **凡是运维可能要调的阈值，都别写死成常量。**
 4. **池里的账要有人读。** `evicted_total` 一直在累加却从不输出，等于没埋。
 
-### 16.9 已知风险（不在本层解决）
+### 16.10 已知风险（不在本层解决）
 
 **server 无会话数上限 vs agent 池 512 上限的不对称**：
 server `sessions` 无数量上限（只按 TTL 时间清），agent 池满 512 才踢 LRU。
