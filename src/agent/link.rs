@@ -645,6 +645,7 @@ mod tests {
             link_udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::LinkUdp),
             )),
+            udp_idle_secs: super::super::kudus_session::resolve_udp_idle_secs(0),
         };
         // 第一个 session 建监听
         sync_link_listeners_kudus(&ctx, &proxies, "workmac", &holder).await;

@@ -209,7 +209,14 @@ async fn sleep_backoff_or_redial(
     }
 }
 
-pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pass: &str) -> anyhow::Result<()> {
+pub async fn run(
+    url: &str,
+    config_path: &str,
+    web: &str,
+    web_user: &str,
+    web_pass: &str,
+    udp_idle_secs: u64,
+) -> anyhow::Result<()> {
     let cfg: AgentFileConfig = load_or_default(config_path, url).await?;
     if !cfg.proxies.is_empty() {
         tracing::warn!("local proxies in {config_path} ignored: server is source of truth");
@@ -454,7 +461,7 @@ pub async fn run(url: &str, config_path: &str, web: &str, web_user: &str, web_pa
         } else if is_kudus {
             let (up2, cfg2, st2, kh) = (up.clone(), cfg.clone(), status.clone(), kudus_egress_out.clone());
             tokio::spawn(async move {
-                kudus_session::session(up2, cfg2, st2, kh).await
+                kudus_session::session(up2, cfg2, st2, kh, udp_idle_secs).await
             })
         } else {
             let (up2, cfg2, st2, eh) = (up.clone(), cfg.clone(), status.clone(), egress_out.clone());

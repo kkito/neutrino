@@ -21,18 +21,79 @@ pub(crate) struct KCtx {
     pub(crate) udp_pool: Arc<tokio::sync::Mutex<super::udp_pool::UdpPool>>,
     /// link_udp 类流的 socket 池。独立实例，BT 洪峰不会饿死 link 功能。
     pub(crate) link_udp_pool: Arc<tokio::sync::Mutex<super::udp_pool::UdpPool>>,
+    /// UDP 流空闲超时（秒）。启动时由 `--udp-idle-secs` 定型，见 `resolve_udp_idle_secs`。
+    pub(crate) udp_idle_secs: u64,
 }
 
-/// UDP 流空闲超时（agent 侧兜底）。根因→修法：曾 120s、后 30s，均与
-/// server 侧 UDP_SESSION_TTL_SECS_DEFAULT=5 相差过大——server 5s 就回收
-/// session 并发 Close，agent 却还挂着 fd。现对齐 5s；主路径仍是 server
-/// 主动 Close，此值只作 server 异常（崩溃/断网）时的兜底。
+/// UDP 流空闲超时默认值（秒）；`--udp-idle-secs` 可覆盖，见 `resolve_udp_idle_secs`。
+/// 根因→修法：曾 120s、后 30s，均与 server 侧 UDP_SESSION_TTL_SECS_DEFAULT 相差过大
+/// ——server 先回收 session 并发 Close，agent 却还挂着 fd。现与 server 默认对齐；
+/// 主路径仍是 server 主动 Close，此值只作 server 异常（崩溃/断网）时的兜底。
 const UDP_STREAM_IDLE_SECS: u64 = 5;
+
+/// 解析 `--udp-idle-secs`：0 视为未传→回退默认值。
+/// 抽成纯函数以便单测，也避免 `Duration::from_secs(0)` 造成“超时立刻触发”
+/// 或“永不超时”这类灾难性误配（前者会把所有流瞬杀）。
+pub(crate) fn resolve_udp_idle_secs(cli: u64) -> u64 {
+    if cli == 0 {
+        UDP_STREAM_IDLE_SECS
+    } else {
+        cli
+    }
+}
 
 /// UDP 出站 socket 的接收缓冲大小（每条流一份，池化后每个 socket 一份）。
 /// 根因→修法：旧值 65535，256 流即 16MB 纯堆内存；池化到 512 流是 32MB。
 /// 而隧道单片上限 KUDUS_UDP_MAX=1232、标准 MTU ~1500，2048 足够并留余量。
 pub(crate) const UDP_RECV_BUF: usize = 2048;
+
+/// UDP 流的结束原因。收尾日志用，避免只看到一个笼统的 eof。
+pub(crate) const END_IDLE: u8 = 0;
+pub(crate) const END_CHANNEL_CLOSED: u8 = 1;
+pub(crate) const END_SEND_ERR: u8 = 2;
+pub(crate) const END_RECV_ERR: u8 = 3;
+pub(crate) const END_LOCAL_EOF: u8 = 4;
+pub(crate) const END_RUNNING: u8 = 255;
+
+/// 单条 UDP 流的计数（两侧泵各写一半，收尾时汇总）。
+#[derive(Debug)]
+pub(crate) struct UdpStreamStat {
+    pub(crate) started: std::time::Instant,
+    pub(crate) rx_pkts: std::sync::atomic::AtomicU64,
+    pub(crate) rx_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) tx_pkts: std::sync::atomic::AtomicU64,
+    pub(crate) tx_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) truncated: std::sync::atomic::AtomicU64,
+    /// 结束原因，取最后写入的那个（哪个泵先退出就是谁的原因）。
+    pub(crate) end: std::sync::atomic::AtomicU8,
+}
+
+impl Default for UdpStreamStat {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            rx_pkts: Default::default(),
+            rx_bytes: Default::default(),
+            tx_pkts: Default::default(),
+            tx_bytes: Default::default(),
+            truncated: Default::default(),
+            end: std::sync::atomic::AtomicU8::new(END_RUNNING),
+        }
+    }
+}
+
+impl UdpStreamStat {
+    pub(crate) fn reason(&self) -> &'static str {
+        match self.end.load(std::sync::atomic::Ordering::Relaxed) {
+            END_IDLE => "idle-timeout",
+            END_CHANNEL_CLOSED => "server-close",
+            END_SEND_ERR => "send-err",
+            END_RECV_ERR => "recv-err",
+            END_LOCAL_EOF => "local-eof",
+            _ => "running",
+        }
+    }
+}
 
 /// agent 侧等待隧道窗口的最长时间；超时即丢弃本次数据（UDP 语义允许丢）。
 /// 根因→修法：旧实现 3000×10ms(30s) 循环耗尽后照样发送，
@@ -208,6 +269,7 @@ pub(crate) async fn session(
     cfg: AgentFileConfig,
     status: Arc<RwLock<super::web::AgentStatus>>,
     kudus_out: super::egress::KudusOutHolder,
+    idle_secs_cli: u64,
 ) -> anyhow::Result<()> {
     let (host, port) = match crate::common::quic::parse_server_url(&up.server_url) {
         crate::common::quic::Transport::Kudus { host, port } => (host, port),
@@ -291,6 +353,7 @@ pub(crate) async fn session(
         link_udp_pool: Arc::new(tokio::sync::Mutex::new(super::udp_pool::UdpPool::new(
             super::udp_pool::PoolKind::LinkUdp,
         ))),
+        udp_idle_secs: resolve_udp_idle_secs(idle_secs_cli),
     });
     let kudus_link_holder = kudus_out.clone();
     super::link::sync_link_listeners_kudus(&ctx, &cfg.proxies, &up.hostname, &kudus_link_holder).await;
@@ -756,33 +819,68 @@ async fn open_udp_stream_to(
         let _ = dtx.send(chunk);
     }
     ctx.streams.write().await.insert(sid, dtx);
+    let idle_secs = ctx.udp_idle_secs;
     let w = sock.clone();
+    // 流级计数：两侧各记一价，收尾时汇总成一行日志。
+    // 根因→修法：旧代码两个泵的失败分支全是静默 break/return（`Ok(0) | Err(_) => break`、
+    // `.is_err() { return; }`），socket 出错、对端拒绝、池满踢流在日志里完全不可见；
+    // UDP 只靠每分钟一行全局 `kudus retx sent=N abandoned=N`，知道「丢了几个」
+    // 但不知道「丢在哪条流 / 为什么丢 / 是不是 5s idle 断的」。
+    // 现每条流收尾打一行：存活时长 + 双向包数字节 + 结束原因。
+    let stat = std::sync::Arc::new(UdpStreamStat::default());
+    let stat_tx = stat.clone();
     let ws_to_udp = tokio::spawn(async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(UDP_STREAM_IDLE_SECS), drx.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(idle_secs), drx.recv()).await {
                 Ok(Some(dg)) => {
-                    if w.send(&dg).await.is_err() {
+                    stat_tx.rx_pkts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stat_tx.rx_bytes.fetch_add(dg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = w.send(&dg).await {
+                        stat_tx.end.store(END_SEND_ERR, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "kudus udp ws->local send failed: sid={sid} err={e} (rx_pkts={})",
+                            stat_tx.rx_pkts.load(std::sync::atomic::Ordering::Relaxed)
+                        );
                         return;
                     }
                 }
-                _ => break,
+                Ok(None) => {
+                    stat_tx.end.store(END_CHANNEL_CLOSED, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                Err(_) => {
+                    stat_tx.end.store(END_IDLE, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
             }
         }
     });
     let pkt3 = pkt.clone();
     let r = sock.clone();
     let pool_touch = pool.clone();
+    let stat_rx = stat.clone();
     let udp_to_ws = tokio::spawn(async move {
         let mut b = vec![0u8; UDP_RECV_BUF];
         loop {
             match r.recv(&mut b).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    stat_rx.end.store(END_LOCAL_EOF, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                Err(e) => {
+                    stat_rx.end.store(END_RECV_ERR, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!("kudus udp local->ws recv failed: sid={sid} err={e}");
+                    break;
+                }
                 Ok(n) => {
+                    stat_rx.tx_pkts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stat_rx.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     // LRU：有回包说明该 sid 仍活跃，刷新其位置。
                     pool_touch.lock().await.touch(sid);
                     // UDP recv 会静默截断（不报错）：n == buf.len() 说明可能被截。
                     // 拿不到原始包长，只能近似判断，故措辞用 possibly。
                     if n == UDP_RECV_BUF {
+                        stat_rx.truncated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
                             "kudus udp recv possibly truncated: n={n} (buf={UDP_RECV_BUF}) sid={sid}"
                         );
@@ -806,6 +904,21 @@ async fn open_udp_stream_to(
         _ = &mut ws_to_udp => { udp_to_ws.abort(); }
         _ = &mut udp_to_ws => { ws_to_udp.abort(); }
     }
+    // 一条流收尾：一行 debug 把「活了多久 / 双向往返多少 / 为什义结束」说清。
+    // 看 lived 是否接近 idle 超时（`--udp-idle-secs`）就是 idle 超时断的（5s 不够）；
+    // 远小于则是对端/本地错误，配合上面的 warn 定位。
+    let lived = stat.started.elapsed();
+    tracing::debug!(
+        "kudus udp stream closed sid={sid} lived={:.2}s reason={} rx_pkts={} rx_bytes={} tx_pkts={} tx_bytes={} truncated={} pool={}",
+        lived.as_secs_f64(),
+        stat.reason(),
+        stat.rx_pkts.load(std::sync::atomic::Ordering::Relaxed),
+        stat.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        stat.tx_pkts.load(std::sync::atomic::Ordering::Relaxed),
+        stat.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        stat.truncated.load(std::sync::atomic::Ordering::Relaxed),
+        pool.lock().await.summary(),
+    );
     ctx.streams.write().await.remove(&sid);
     // 归还槽位：槽位是关键资源（1 socket = 1 fd），流结束必须还。
     pool.lock().await.release(sid);
@@ -862,10 +975,55 @@ mod tests {
         );
     }
 
-    /// idle 超时必须与 server 侧 TTL(5s) 对齐。
-    /// 根因：agent 侧曾是 120s（DHT 下 fd 空占太久），改 30s 后仍与
-    /// server TCP 差 6 倍——server 5s 就忘掉 sid，agent 还挂着 fd。
+    /// 流结束原因必须能区分开：旧代码两个泵的失败分支全静默，
+    /// 日志里只看得到“流没了”，看不到“为什么没的”。
+    /// 看 lived 是否接近 idle 超时就能回答“5s 够不够”。
     #[test]
+    fn udp_stream_stat_reason_names() {
+        for (code, want) in [
+            (super::END_IDLE, "idle-timeout"),
+            (super::END_CHANNEL_CLOSED, "server-close"),
+            (super::END_SEND_ERR, "send-err"),
+            (super::END_RECV_ERR, "recv-err"),
+            (super::END_LOCAL_EOF, "local-eof"),
+            (super::END_RUNNING, "running"),
+        ] {
+            let s = super::UdpStreamStat::default();
+            s.end.store(code, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(s.reason(), want, "code={code} 的名字不对");
+        }
+        // 默认是 running：还没结束就不该报成某个具体原因。
+        assert_eq!(super::UdpStreamStat::default().reason(), "running");
+    }
+
+    /// 池状态要能一行看完“用了几个 / 建了几个 / 踢了几次”。
+    /// 硬顶其实是内核 SO_RCVBUF（实测 ≈137），不知道 in_use 涨到多少就只能猜。
+    #[test]
+    fn udp_pool_summary_counts_in_use_and_evicted() {
+        let mut p = crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::Udp);
+        assert_eq!(p.summary(), "0/0 evicted=0", "空池应是 0/0");
+        p.acquire(7);
+        p.acquire(8);
+        assert_eq!(p.summary(), "2/2 evicted=0");
+        p.release(7);
+        assert_eq!(p.summary(), "1/2 evicted=0", "归还后 in_use 降、created 不降（已建的不回收）");
+    }
+
+    /// idle 超时现在可由 `--udp-idle-secs` 覆盖（默认 5）。
+    /// 根因→修法：旧值是编译期常量 UDP_STREAM_IDLE_SECS=5，改一次要重编两端；
+    /// 而 5s 对 BT uTP 长连接是否够取决于现场丢包/链路，运维应当能在启动项上调，
+    /// 不必重新发一个二进制。0 视为误传 → 回退默认，避免"永不超时"漏 fd。
+    #[test]
+    fn udp_idle_secs_resolves_cli_override() {
+        // 0 = 未传（clap default_value_t = 0）→ 回退默认。
+        assert_eq!(super::resolve_udp_idle_secs(0), super::UDP_STREAM_IDLE_SECS);
+        // 显式传值则原样生效，包括比默认更长的值（运维放宽容忍度）。
+        assert_eq!(super::resolve_udp_idle_secs(60), 60);
+        assert_eq!(super::resolve_udp_idle_secs(1), 1);
+        // 默认值必须与 server 侧默认 TTL 相等，否则一端先回收另一端挂 fd。
+        assert_eq!(super::UDP_STREAM_IDLE_SECS, crate::server::state::UDP_SESSION_TTL_SECS_DEFAULT);
+    }
+
     fn udp_idle_timeout_is_5s() {
         assert_eq!(
             super::UDP_STREAM_IDLE_SECS,
@@ -966,6 +1124,8 @@ mod tests {
             link_udp_pool: std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::agent::udp_pool::UdpPool::new(crate::agent::udp_pool::PoolKind::LinkUdp),
             )),
+            // 测试用很小的 idle，让“黑洞目标”用例不必真等 5s。
+            udp_idle_secs: 1,
         });
         // 目标 socket：绑本地，永不回包（模拟黑洞目标）。
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

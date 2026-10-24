@@ -48,6 +48,18 @@ pub struct UdpPool {
 }
 
 impl UdpPool {
+    /// 一行池状态，供流收尾日志/周期统计使用。
+    /// 根因→修法：池占用的硬顶不是 POOL_MAX=512，而是内核 SO_RCVBUF（实测并发 ≈137）；
+    /// 但以前看不到 in_use 涨到多少、踢了几次，出事只能事后猜。
+    pub fn summary(&self) -> String {
+        format!(
+            "{}/{} evicted={}",
+            self.in_use.len(),
+            self.created,
+            self.evicted_total
+        )
+    }
+
     pub fn new(kind: PoolKind) -> Self {
         Self {
             kind,

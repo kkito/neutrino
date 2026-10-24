@@ -87,6 +87,10 @@ enum Cmd {
         /// optional pid file for --detach
         #[arg(long, default_value = "")]
         pid_file: String,
+        /// UDP 流空闲回收秒数（默认 5，0=默认）。静默这么久没包就拆流；
+        /// BT uTP 长连接在丢包链路上静默可能超过 5s，可按现场放宽（如 60）。
+        #[arg(long, default_value_t = 0)]
+        udp_idle_secs: u64,
     },
     /// bcrypt-hash a password for WebUI
     Genhash { password: String },
@@ -244,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
             );
             server::run_with_ticks(&listen, &http_in, &data, &token, &desired, &quic_listen, &kudus_listen, allow_agent_admin, udp_session_ttl, ticks).await
         }
-        Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file } => {
+        Cmd::Agent { server, config, web, web_user, web_pass, detach, log_file, pid_file, udp_idle_secs } => {
             if should_warn_log_file_ignored(detach, &log_file) {
                 tracing::warn!(
                     "--log-file 仅在 --detach 时生效，当前已忽略；systemd 场景请用 journalctl -u <unit>"
@@ -258,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
             if detach {
                 return detach_spawn(&log, &pid_file);
             }
-            agent::run(&server, &config, &web, &web_user, &web_pass).await
+            agent::run(&server, &config, &web, &web_user, &web_pass, udp_idle_secs).await
         }
         Cmd::Genhash { password } => {
             let h = bcrypt::hash(&password, bcrypt::DEFAULT_COST)?;
