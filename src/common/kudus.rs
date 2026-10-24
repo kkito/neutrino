@@ -213,8 +213,21 @@ impl RetxBuf {
         }
         Ok(s)
     }
-    /// 对端 ACK：清累积确认（<=ack）+ SACK 洞外已到包。
-    pub fn on_ack(&mut self, ack: u32, sack: &[u8; 32]) {
+    /// 对端 ACK：清累积确认（<=ack）+ SACK 洞外已到包，并返回**应立刻重传的洞**。
+    ///
+    /// 根因→修法：旧实现只清表、返回 `()`，重传时机**完全由 RTO 超时决定**
+    /// （`take_expired` 只看 `last_sent`，不看 SACK）。于是对端 SACK 清楚告诉
+    /// “后面的包都到了、前面有个洞”，发送方却只能白等 200ms，且重传再丢还要
+    /// 指数退避翻倍。2026-10-24 现场：本机→HK 链路 15-20% 随机丢包，
+    /// 1MB 下载永久卡死，而同期 TCP（有 3-dup-ACK 快速重传）仍有 28KB/s。
+    ///
+    /// 为什么不用数「3 个重复 ACK」：kudus 接收方每次重排推进都立即回带 SACK 的
+    /// ACK，所以**一份 SACK bitmap 就等价于 TCP 的 duplicate-ACK 信号**，
+    /// 不必另建状态机，也不会因纯 ACK 包丢失而误判。
+    ///
+    /// 只返回**最小那一个洞**（TCP 语义）：一次补一个，避免 15% 丢包下
+    /// 把整窗所有洞同时重发造成流量放大（对比 2026-10-23 重传风暴事故）。
+    pub fn on_ack(&mut self, ack: u32, sack: &[u8; 32]) -> Vec<(u32, Vec<u8>)> {
         self.seqs.retain(|&seq, _| {
             if seq == ack || ack.wrapping_sub(seq) < 0x8000_0000 {
                 return false; // 累积确认覆盖
@@ -228,6 +241,38 @@ impl RetxBuf {
             }
             true
         });
+        // 快速重传：SACK 窗口内「有包已到」且存在更小的洞 ⇒ 立刻补最小洞。
+        // 若 SACK 全零（对端什么都没乱序收到），无从判断是丢包还是全没到，
+        // 不冒进——交给 RTO。
+        let sack_base = ack;
+        let mut highest_sacked: Option<u32> = None;
+        for d in 1..=KUDUS_SACK_BITS as u32 {
+            let i = (d - 1) as usize;
+            if sack[i / 8] & (1 << (i % 8)) != 0 {
+                highest_sacked = Some(d);
+            }
+        }
+        let Some(highest) = highest_sacked else {
+            return Vec::new();
+        };
+        // 找 [1, highest) 中第一个仍在 seqs 里（即未被 SACK、未被累积确认）的洞。
+        for d in 1..highest {
+            let seq = sack_base.wrapping_add(d);
+            if let Some(e) = self.seqs.get_mut(&seq) {
+                // 只补「真正丢了的」：上面 retain 已把 SACK 到过的移除，能走到这里
+                // 就说明它确属洞。限制：同一包不因连续 ACK 反复快速重传。
+                if e.retx == 0 {
+                    e.retx = 1;
+                    e.last_sent = now_ms();
+                    self.stats.sent += 1;
+                    return vec![(seq, e.payload.clone())];
+                }
+                // 已快速重传过（retx>0）则交给 RTO 退避，不在本轮再补，
+                // 否则对端持续回同一份 SACK 会让我们每收一帧就重发一次。
+                return Vec::new();
+            }
+        }
+        Vec::new()
     }
     /// 取出超时未确认包，按 seq 排序。
     ///
@@ -582,6 +627,74 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// RED: 快速重传——SACK 显示"后面的包到了、但前面的洞没到"时，必须立刻补洞，
+    /// 不等 RTO 超时。
+    ///
+    /// 现场根因（docs/incidents/2026-10-24-lossy-link-sack-gap.md）：
+    /// 本机→HK 链路 15-20% 随机丢包，`take_expired` 只看"距上次发送过了多久"，
+    /// 完全不看对端 SACK 说了什么。于是每个洞都要白等 200ms RTO，叠加指数退避，
+    /// 1MB 下载（~1000 包 × 15% ≈ 150 个洞）理论上要 30s+ 且实际永久卡死；
+    /// 同期 TCP（有 3-dup-ACK 快速重传）实测仍能跑 28KB/s。
+    ///
+    /// 本用例：发 seq 1..5，对端 SACK 只标了 3,4,5（说明 1,2 丢了）。
+    /// 旧代码 on_ack 返回 ()，什么也不补——只能等 RTO。
+    /// 新代码必须当场返回洞里的包（seq 1，最小的那个）。
+    #[test]
+    fn sack_hole_triggers_fast_retransmit() {
+        let mut tx = RetxBuf::new(1);
+        for i in 1..=5u8 {
+            tx.on_send(vec![i]).unwrap();
+        }
+        // 构造 SACK：ack=0（即 next-1，什么都没连续收到），bitmap 标 d=3,4,5。
+        // d = seq - base，base=ack=0 ⇒ seq 3,4,5 对应 d=3,4,5（bit 索引 d-1）。
+        let mut sack = [0u8; 32];
+        for d in [3u32, 4, 5] {
+            let i = (d - 1) as usize;
+            sack[i / 8] |= 1 << (i % 8);
+        }
+        let fast = tx.on_ack(0, &sack);
+        assert!(
+            fast.iter().any(|(s, _)| *s == 1),
+            "SACK 显示 3,4,5 已到而 1,2 未到 —— 必须立刻重传 seq=1，不等 RTO；实际 {fast:?}"
+        );
+    }
+
+    /// 快速重传不能变成"每次 ACK 都狂重发"：没洞时必须返回空。
+    /// 否则 15% 丢包下会把流量放大成重传风暴（对比 2026-10-23 事故）。
+    #[test]
+    fn no_sack_hole_means_no_fast_retransmit() {
+        let mut tx = RetxBuf::new(1);
+        for i in 1..=5u8 {
+            tx.on_send(vec![i]).unwrap();
+        }
+        // 连续确认到 3：SACK 标 4,5（无洞），不应有任何快速重传。
+        let mut sack = [0u8; 32];
+        for d in [1u32, 2] {
+            let i = (d - 1) as usize;
+            sack[i / 8] |= 1 << (i % 8);
+        }
+        let fast = tx.on_ack(3, &sack);
+        assert!(fast.is_empty(), "无洞时不得快速重传；实际 {fast:?}");
+    }
+
+    /// 同一轮 ACK 里多个洞：只补最靠前的（TCP 语义），不整批重发。
+    #[test]
+    fn fast_retransmit_returns_only_lowest_hole() {
+        let mut tx = RetxBuf::new(1);
+        for i in 1..=8u8 {
+            tx.on_send(vec![i]).unwrap();
+        }
+        // ack=0，SACK 标 3,5,7（1,2,4,6,8 是洞）。最小洞 = 1。
+        let mut sack = [0u8; 32];
+        for d in [3u32, 5, 7] {
+            let i = (d - 1) as usize;
+            sack[i / 8] |= 1 << (i % 8);
+        }
+        let fast = tx.on_ack(0, &sack);
+        assert_eq!(fast.len(), 1, "一轮只补最小洞，实际 {fast:?}");
+        assert_eq!(fast[0].0, 1);
+    }
 
     /// 核心回归（2026-10-23 事故）：无 ACK 时，N 个包的累计发送次数必须有上界。
     ///

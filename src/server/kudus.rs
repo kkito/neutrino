@@ -485,7 +485,20 @@ async fn handle_conn(
             // 注意：握手完成前 Register 还没重放（见下 SYN-ACK 段），此时 rxbuf 锚 1 收的是
             // 上行控制帧——但读循环在 handle_conn 握手之后才进，此处只见数据态包。
             // 上行序列从 1 起（agent SYN seq=0 不可靠帧），rxbuf 同锚无撞车。
-            rel.lock().unwrap().retx.on_ack(h.ack, &h.sack);
+            // 快速重传：SACK 告示“后面的包到了、前面有洞”时当场重发最小洞，
+            // 不等 200ms RTO。根因→修法见 docs/incidents/2026-10-24-lossy-link-sack-gap.md：
+            // 链路 15-20% 随机丢包时仅靠 RTO 会让大传输永久卡死。
+            let fast = rel.lock().unwrap().retx.on_ack(h.ack, &h.sack);
+            if !fast.is_empty() {
+                let (a, s) = {
+                    let r = rel.lock().unwrap();
+                    (r.ack, r.sack)
+                };
+                for (seq, b) in fast {
+                    let fh = KudusHdr { ver: 1, flags: FLAG_DATA, seq, ack: a, sack: s, ts_ms: now_ms() };
+                    tx.send_pkt(&fh, &b);
+                }
+            }
             if h.flags & FLAG_DATA != 0 {
                 // 可靠投递：重排缓冲保序，洞后包缓存等补齐；推进即更新 ACK 快照。
                 // 根因→修法：旧 win.check 到包即投，丢包永久少块；现缓存等补齐后全投。

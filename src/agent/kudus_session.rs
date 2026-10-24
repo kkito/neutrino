@@ -124,6 +124,40 @@ impl RelSend {
     }
 }
 
+/// 写泵故障计数（发送失败帧数）。
+/// 单独计数而非直接 warn：写泵死后每个包都会失败（几百/秒），逐条 warn 会打爆日志。
+/// 改为累计 + 限流（见 [`note_send_fail`]），运维仍能从一行 warn 里看到“故障在持续”。
+static SEND_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEND_FAIL_LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 测试与运维观察用：累计发送失败帧数。
+pub(crate) fn send_fail_count() -> u64 {
+    SEND_FAILS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 记录一次发送失败；最多每 5s 输出一行 warn（带累计数与帧类型）。
+///
+/// 根因：`emit` 的全链路调用点（`send_ack_only`/`send_ctrl`/`send`）都是 `let _ =`，
+/// 写泵 task 退出后发送立刻失败却完全静默。2026-10-24 现场：agent 上行 tx
+/// 从 ~4KB/5s 跌到恒 0、抓包 396 入/4 出，日志一片干净——正是“静默失败”的后果。
+fn note_send_fail(flags: u8, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = SEND_FAILS.fetch_add(1, Relaxed) + 1;
+    let now = now_ms();
+    let last = SEND_FAIL_LAST_WARN.load(Relaxed);
+    // now - last >= 5000，用 saturating_sub 防时钟回拨。
+    if now.saturating_sub(last) >= 5_000
+        && SEND_FAIL_LAST_WARN
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "kudus agent uplink send failed (flags={flags:#04x} len={len}) total_fails={n} \
+             — write pump likely dead, uplink is DOWN"
+        );
+    }
+}
+
 impl Pkt {
     /// 组一帧 datagram 并经写泵发出（调用方已定好 flags/seq/ack/sack）。
     fn emit(&self, flags: u8, seq: u32, ack: u32, sack: [u8; 32], body: &[u8]) -> anyhow::Result<()> {
@@ -136,7 +170,12 @@ impl Pkt {
         let n = fresh_nonce();
         self.out
             .send(encode_packet(self.session, &n, &seal(&self.key, &n, &plain)))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| {
+                // 写泵（UDP 发送 task）已退出时这里立即失败。旧代码全链路 `let _ =`
+                // 吞错，于是“上行整条断了”在日志里毫无痕迹。
+                note_send_fail(flags, plain.len());
+                anyhow::anyhow!("{e}")
+            })?;
         Ok(())
     }
     fn ack_snap(&self) -> (u32, [u8; 32]) {
@@ -148,9 +187,21 @@ impl Pkt {
         let (ack, sack) = self.ack_snap();
         let _ = self.emit(FLAG_ACK, 0, ack, sack, &[]);
     }
-    /// 对端 ACK 到达：清重传缓冲。
+    /// 对端 ACK 到达：清重传缓冲，并**立即补 SACK 显示的洞**（快速重传）。
+    ///
+    /// 根因→修法：旧实现只清表不管洞，重传完全靠 200ms RTO 超时。
+    /// 链路 15-20% 丢包时（docs/incidents/2026-10-24-lossy-link-sack-gap.md）
+    /// 每个洞白等 RTO，大传输永久卡死。对端 SACK 本已告知“后面到了、前面有洞”，
+    /// 这里拿到洞就当场重发一帧，不必等超时。
     pub(crate) fn on_ack(&self, ack: u32, sack: [u8; 32]) {
-        self.rel.lock().unwrap().retx.on_ack(ack, &sack);
+        let fast = self.rel.lock().unwrap().retx.on_ack(ack, &sack);
+        for (seq, body) in fast {
+            // 原样重发该 DATA 帧（seq 保持不变，对端按重排窗接纳）。
+            let (a, s) = self.ack_snap();
+            if let Err(e) = self.emit(FLAG_DATA, seq, a, s, &body) {
+                tracing::debug!("fast retransmit seq={seq} failed: {e:#}");
+            }
+        }
     }
     /// 收包侧推进 ACK 快照（主循环从重排缓冲取 ack()/sack() 后调用）。
     pub(crate) fn set_ack(&self, ack: u32, sack: [u8; 32]) {
@@ -315,9 +366,12 @@ pub(crate) async fn session(
                             last_stats_at = std::time::Instant::now();
                             let st = r.retx.take_stats();
                             if st.sent + st.abandoned + st.full > 0 || st.backlog_max > 0 {
+                                // send_fail = 上行写泵故障帧数（累计）。非 0 就说明上行在丢帧，
+                                // 2026-10-24 事故里这个值会持续增长而上行 tx 为 0。
                                 tracing::info!(
-                                    "kudus retx session={} hostname={} sent={} abandoned={} full={} backlog_max={}",
-                                    sess_hex, host_name, st.sent, st.abandoned, st.full, st.backlog_max
+                                    "kudus retx session={} hostname={} sent={} abandoned={} full={} backlog_max={} send_fail={}",
+                                    sess_hex, host_name, st.sent, st.abandoned, st.full, st.backlog_max,
+                                    send_fail_count()
                                 );
                             }
                         }
@@ -960,6 +1014,65 @@ use std::time::Duration;
 mod tests {
     use std::collections::HashMap;
     use tokio::sync::{mpsc, RwLock};
+
+    /// 发送失败必须能被观测到（不得静默吞错）。
+    ///
+    /// 根因：`emit` 的 `self.out.send()` 在写泵 task 退出后立即返回 Err，
+    /// 而全部调用点（`send_ack_only`、`send_ctrl`、`send`）都是 `let _ =`。
+    /// 2026-10-24 现场：agent 上行 tx 从 ~4KB/5s 跌到恒 0，抓包 396 入 / 4 出，
+    /// 却没有任何一行日志说明“发送失败了”——只能靠人肉抓包才看得出来。
+    /// 这与 2026-10-23 事故（grep retx 全零）是同一类盲区。
+    ///
+    /// 本用例锁住：写泵接收端关闭后，emit 必须返回 Err（而不是假装成功），
+    /// 这样调用方/日志才能区分“发出去了”与“根本没发”。
+    #[tokio::test]
+    async fn emit_reports_error_when_outlet_closed() {
+        let (otx, mut orx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let pkt = super::Pkt {
+            out: otx,
+            key: [0u8; 32],
+            session: 1,
+            rel: std::sync::Arc::new(std::sync::Mutex::new(super::RelSend::new())),
+        };
+        // 写泵在跑时：发送成功。
+        assert!(pkt.send(super::FLAG_ACK, 0, [0u8; 32], b"").is_ok());
+        assert!(orx.recv().await.is_some(), "写泵应收到一帧");
+        // 模拟写泵退出：丢弃接收端。
+        drop(orx);
+        assert!(
+            pkt.send(super::FLAG_ACK, 0, [0u8; 32], b"").is_err(),
+            "写泵已退出时 send 必须报错，否则发送失败永远不可见"
+        );
+        // 纯 ACK 路径同样不得静默成功。
+        pkt.send_ack_only(); // 内部必须自行记 warn，不 panic
+    }
+
+    /// 数据帧发送失败不得静默 break。
+    ///
+    /// 根因：`send_data_stream` 旧代码 `if self.send(...).is_err() { break; }`，
+    /// 只停止继续发，不区分“对端已断”与“本端写泵已死”，也没有任何日志。
+    /// 2026-10-24 现场：上行 tx 从 4KB/5s 跌到恒 0、抓包 396 入/4 出，
+    /// 日志里一行都没有——运维只能靠人肉抓包才能发现整条上行已断。
+    ///
+    /// 本用例用统计计数（而非捕获日志）锁行为：失败帧数必须被记录下来。
+    #[tokio::test]
+    async fn send_failures_are_counted() {
+        let (otx, orx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let pkt = super::Pkt {
+            out: otx,
+            key: [0u8; 32],
+            session: 1,
+            rel: std::sync::Arc::new(std::sync::Mutex::new(super::RelSend::new())),
+        };
+        drop(orx); // 写泵已死
+        // 静态计数器是进程级的，并行跑的其它用例会先累加——断言增量，不断言绝对值。
+        let before = super::send_fail_count();
+        pkt.send_data_stream(7, b"hello world");
+        assert!(
+            super::send_fail_count() > before,
+            "写泵死后的发送失败必须被计数（并据此打 warn），否则上行断了没人知道"
+        );
+    }
 
     /// 出站 socket 每个 sid 独占一个并 connect 到固定目标——**这是当前设计的
     /// 正确行为**，不是缺陷。
