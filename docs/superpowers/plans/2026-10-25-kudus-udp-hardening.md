@@ -2928,26 +2928,31 @@ git commit -m "docs(agents): 记录 RetxBuf 上限/退避与背压阈值+硬上�
 
 | Spec 项 | 对应 Task | 状态 |
 | --- | --- | --- |
-| §4.2 容量上限 cap=4096 | Task 1, 2 | |
-| §4.3 重传计数 | Task 3 | |
-| §4.4 指数退避 | Task 3 | |
-| §4.5 放弃机制 | Task 4 | |
-| §4.6 常量澄清 | Task 1, 6, 7 | |
-| §5.2 server 背压 bail（两处） | Task 6 | |
-| §5.5 agent 上行超时丢包 | Task 7 | |
-| §6 buffer 2048 + 截断检测 | Task 8 | |
-| §7 动态池 64→512 | Task 9-14 | |
-| §7.4 send_to 替代 connect | Task 15 | |
-| §7.5 两池独立 | Task 12, 13 | |
-| §8 idle 5s | Task 13 | |
-| §9 埋点 | Task 4, 6, 7, 10-12 | |
-| §10.1 RetxBuf 单测 | Task 1-5 | |
-| §10.2 pool 单测 | Task 9-12 | |
-| §10.3 session 单测 | Task 8, 13, 15 | |
-| §10.4 e2e | Task 16 | |
-| §10.5 核心回归 | Task 5 | |
+| §4.2 容量上限 cap=4096 | Task 1, 2 | ✅ |
+| §4.3 重传计数 | Task 3 | ✅ |
+| §4.4 指数退避 | Task 3 | ✅ |
+| §4.5 放弃机制 | Task 4 | ✅ |
+| §4.6 常量澄清 | Task 1, 6, 7 | ✅ |
+| §5.2 server 背压 bail（两处） | Task 6 | ✅ |
+| §5.5 agent 上行超时丢包 | Task 7 | ✅ |
+| §6 buffer 2048 + 截断检测 | Task 8 | ✅ |
+| §7 动态池 64→512 | Task 9-14 | ✅ |
+| §7.4 send_to 替代 connect | Task 15 | ⛔ 撤销（见 Task 15 说明：会跨 sid 串包，connect 是必要防护） |
+| §7.5 两池独立 | Task 12, 13 | ✅ |
+| §8 idle 5s | Task 13 | ✅ |
+| §9 埋点 | Task 4, 6, 7, 10-12 | ✅ |
+| §10.1 RetxBuf 单测 | Task 1-5 | ✅ |
+| §10.2 pool 单测 | Task 9-12 | ✅ |
+| §10.3 session 单测 | Task 8, 13, 15 | ✅ |
+| §10.4 e2e | Task 16 | ✅ |
+| §10.5 核心回归 | Task 5 | ✅ |
+| §15 可观测性（日志补强） | Task 0a/0b/0c, 18 | ✅（Task 18 待做） |
 
-全部勾上后完成。
+**§7.4 偏离说明**：原 spec 设想池共享 socket 用 `send_to`。实施时发现同目标
+（如 transmission 51413）多条流回包源地址完全相同，unconnected socket 无法
+按来源 demux 到 sid → 跨 sid 串包（比原缺陷更严重）。故保留每 sid 一 socket +
+`connect`（内核级来源过滤），池只限 fd 数 + LRU 踢流。已加回归测试
+`udp_egress_socket_per_stream_is_intentional` 锁住该不变式。
 
 ---
 

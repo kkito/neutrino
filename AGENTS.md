@@ -20,10 +20,10 @@ cargo test --bin neutrino <name>   # 跑单个单测
 cargo test --test e2e <name>       # 跑单个 e2e
 ```
 
-## 测试现状（2026-10-19）
-- 单测 139（`src/server/*::tests`、`src/agent*::tests`、`src/main.rs::main_tests`）。
-- e2e 35（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link。
-- 全量串行：单测 ~2s + e2e ~39s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
+## 测试现状（2026-10-24）
+- 单测 178（`src/server/*::tests`、`src/agent*::tests`、`src/common/kudus.rs::tests`、`src/main.rs::main_tests`）。
+- e2e 37（`tests/e2e.rs`）：真子进程 + 随机端口，覆盖 Host 路由/404/WebUI 分流/XFP/tcp 回声/udp/期望态 CRUD/重启覆盖/防 Register 循环/agent WebUI 改上行/限速/kudus/quic/link/udp 多 peer 并发。
+- 全量串行：单测 ~13s + e2e ~46s（`--test-threads=1`，e2e 必须串行，并发会因时间窗互相干扰而假红）。
 
 ### 测试等待规范（必读，已优化过一轮）
 禁止盲等 `sleep(Ns)` 来“等某状态就绪”。两类正确做法：
@@ -63,3 +63,14 @@ cargo test --test e2e <name>       # 跑单个 e2e
 - agent `Config` 回 `Register` 确认；WebUI 改上行走 redial generation 比对，睡眠间隙的 bump 不能丢。
 - agent `--web-pass` 只在首次生成 hash 时生效，已有 `{config}.webpass` 时传参 warn 忽略；删文件才重置。
 - `ProxyConfig` 比较依赖 `PartialEq`；加字段记得检查收敛比较与单测。
+- `RetxBuf` 有硬上限 `KUDUS_RETX_CAP=4096`，`on_send` 返回 `Result`；满了要丢包，
+  别忽略返回值（`-D warnings` 会拦 `unused_must_use`）。重传按 `rto_for(retx)` 指数退避，
+  超 `KUDUS_MAX_RETX=10` 次即放弃——这是 2026-10-23 流量风暴的止血点，别改回固定 RTO。
+- 背压阈值 `KUDUS_RETX_BACKLOG=256` 与硬上限 `KUDUS_RETX_CAP=4096` 是**两个不同的数**：
+  前者是滞回线（等一等），后者是天花板（拒绝/丢弃）。混用会导致「要么不背压、要么一上来就拒」。
+- agent UDP 出站 socket **每 sid 一个且必须 `connect`**：unconnected socket 靠 `recv_from`
+  无法把回包 demux 到 sid（同目标多流源地址相同）→ 跨 sid 串包。`connect` 是内核级来源过滤。
+  池（`udp_pool.rs`）只负责限 fd 数 + LRU 踢流，**不共享 socket**（spec Task 15 原设想已撤销）。
+- server UDP ingress 把 `SO_RCVBUF` 钳到 64KB（刻意的丢包限速）。突发灌包会先溢出内核缓冲：
+  实测 160/200/240/256 个包**恒定只进 137 个**，丢包发生在 ingress 之前、与 sid 上限无关。
+  写 UDP e2e 压测必须错峰发，否则测的是内核缓冲而不是业务逻辑。
