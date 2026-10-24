@@ -26,6 +26,11 @@ pub(crate) const KUDUS_MAX_UDP_STREAMS: usize = 256;
 /// UDP 流 server 侧无数据空闲超时（旧 120s：DHT 下 fd 空占太久）。
 const UDP_STREAM_IDLE_SECS: u64 = 30;
 
+/// UDP 出站 socket 的接收缓冲大小（每条流一份，池化后每个 socket 一份）。
+/// 根因→修法：旧值 65535，256 流即 16MB 纯堆内存；池化到 512 流是 32MB。
+/// 而隧道单片上限 KUDUS_UDP_MAX=1232、标准 MTU ~1500，2048 足够并留余量。
+pub(crate) const UDP_RECV_BUF: usize = 2048;
+
 /// agent 侧等待隧道窗口的最长时间；超时即丢弃本次数据（UDP 语义允许丢）。
 /// 根因→修法：旧实现 3000×10ms(30s) 循环耗尽后照样发送，
 /// 与 server 侧同构——背压在超时后形同虚设。
@@ -742,11 +747,20 @@ async fn open_udp_stream_to(
     let pkt3 = pkt.clone();
     let r = sock.clone();
     let udp_to_ws = tokio::spawn(async move {
-        let mut b = vec![0u8; 65535];
+        let mut b = vec![0u8; UDP_RECV_BUF];
         loop {
             match r.recv(&mut b).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => send_data(&pkt3, sid, &b[..n], true),
+                Ok(n) => {
+                    // UDP recv 会静默截断（不报错）：n == buf.len() 说明可能被截。
+                    // 拿不到原始包长，只能近似判断，故措辞用 possibly。
+                    if n == UDP_RECV_BUF {
+                        tracing::warn!(
+                            "kudus udp recv possibly truncated: n={n} (buf={UDP_RECV_BUF}) sid={sid}"
+                        );
+                    }
+                    send_data(&pkt3, sid, &b[..n], true);
+                }
             }
         }
     });
@@ -793,6 +807,27 @@ use std::time::Duration;
 mod tests {
     use std::collections::HashMap;
     use tokio::sync::{mpsc, RwLock};
+
+    /// UDP 出站接收 buffer 必须是 2048，不是 64KB。
+    /// 根因：旧代码每条 udp 流 vec![0u8; 65535]，256 流 = 16MB 纯堆浪费，
+    /// 池化到 512 流则是 32MB。而隧道单片上限 KUDUS_UDP_MAX=1232、
+    /// 标准 MTU ~1500，2048 已足够且留 33% 余量。
+    #[test]
+    fn udp_recv_buf_is_small() {
+        assert!(
+            super::UDP_RECV_BUF <= 2048,
+            "UDP_RECV_BUF={} 过大，每流 64KB 在 512 流下是 32MB 浪费",
+            super::UDP_RECV_BUF
+        );
+        // 不能小于标准 MTU，否则正常包会被截断
+        assert!(
+            super::UDP_RECV_BUF >= 1500,
+            "UDP_RECV_BUF={} 小于 MTU 1500，会截断正常包",
+            super::UDP_RECV_BUF
+        );
+        // 必须覆盖隧道单片上限
+        assert!(super::UDP_RECV_BUF >= crate::common::kudus::KUDUS_UDP_MAX);
+    }
 
     /// agent 侧背压超时后必须放弃本次发送，不能像旧代码那样照样发。
     /// 根因：旧 wait_window 是 3000x10ms 循环，耗尽后直接返回 ()，
