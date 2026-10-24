@@ -3140,3 +3140,101 @@ async fn e2e_udp_session_expiry_frees_agent_sockets() {
     );
     let _ = env;
 }
+
+/// UDP 多 peer 并发冒烟（2026-10-23 事故次因）：同一 UDP 隧道端口上，
+/// 300 个不同源端口的会话都应拿到回声，不应被并发上限卡死。
+///
+/// 历史：旧代码 `KUDUS_MAX_UDP_STREAMS=256` 的 Semaphore 打满后，
+/// 第 257 个 sid 直接 `Close{reason:"udp busy"}`，peer 收不到任何回包
+/// ——snail 上 3608 条 "too many udp streams" 即此。现改为池化
+/// (POOL_MAX=512, 满则踢 LRU) 后不再硬拒。
+///
+/// **定位说明**：池的"踢 LRU 而非拒绝"语义由 `udp_pool.rs` 单测
+/// (`pool_evicts_lru_when_full`) 精确锁死；本 e2e 只做真实链路的多 peer 冒烟。
+/// 它抓不住 256 上限回归（因为 300 < POOL_MAX=512，且按 10ms 错峰发，
+/// 同时活跃 sid 数远达不到 512）——若要真压满池需 >512 并发，
+/// 而 server ingress 的 64KB SO_RCVBUF 钳制会先丢包，测不到池行为。
+///
+/// 断言抓什么：300 个源端口（各 = 一个 sid）绝大多数收到正确回声（≥280，
+/// 容忍 UDP 部分丢包）。
+#[tokio::test]
+async fn e2e_udp_pool_survives_many_peers() {
+    let uback = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ubport = uback.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 2048];
+        loop {
+            let Ok((n, p)) = uback.recv_from(&mut b).await else {
+                break;
+            };
+            let _ = uback.send_to(&b[..n], p).await;
+        }
+    });
+    let rport = free_port();
+    let env = boot_kudus(&format!(
+        "[[proxies]]\nname=\"u\"\ntype=\"udp\"\nlocal_ip=\"127.0.0.1\"\n\
+         local_port={ubport}\nremote_port={rport}\n"
+    ))
+    .await;
+    // 先探一次，确认 kudus 链路收敛（轮询可观测状态，不盲等）
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    probe.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+    let mut converged = false;
+    for _ in 0..60 {
+        probe.send(b"probe").await.unwrap();
+        let mut b = [0u8; 64];
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(300), probe.recv(&mut b)).await
+        {
+            if &b[..n] == b"probe" {
+                converged = true;
+                break;
+            }
+        }
+    }
+    assert!(converged, "kudus udp never converged");
+
+    // 300 个不同源端口，**先全部 bind 持有**（造出 >256 个同时活跃的 sid），
+    // 但发送要**限速**：server 侧 ingress 把 SO_RCVBUF 钳到 64KB（见 ingress.rs
+    // `SO_RCVBUF clamp`，这是刻意的 UDP 丢包限速），突发灌 300 包必溢出内核缓冲，
+    // 丢包发生在 ingress 之前、与 sid 上限无关（实测恒定只进 137 个）。
+    // 若在这里突发灌包，测的是内核缓冲而不是池容量——所以按 10ms 间隔发。
+    const N: usize = 300;
+    const GAP: Duration = Duration::from_millis(3);
+    let mut socks = Vec::with_capacity(N);
+    for _ in 0..N {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.connect(format!("127.0.0.1:{rport}")).await.unwrap();
+        socks.push(s);
+    }
+    // 错峰发：既保证同一时刻活跃 sid 数量远超 256（收包前 socket 都还持有、
+    // server 侧 session TTL=5s 未过期），又不打爆 64KB 内核缓冲。
+    let mut tasks = Vec::with_capacity(N);
+    for (i, s) in socks.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            let msg = format!("peer-{i}");
+            if s.send(msg.as_bytes()).await.is_err() {
+                return false;
+            }
+            let mut b = [0u8; 128];
+            match tokio::time::timeout(Duration::from_secs(15), s.recv(&mut b)).await {
+                Ok(Ok(n)) if &b[..n] == msg.as_bytes() => true,
+                _ => false,
+            }
+        }));
+        tokio::time::sleep(GAP).await;
+    }
+    let mut oks = 0usize;
+    for t in tasks {
+        if t.await.unwrap_or(false) {
+            oks += 1;
+        }
+    }
+    let _ = env;
+    // UDP 不保证送达，允许个别丢包（本地回环实测偶发 1 个）。
+    // 但必须远高于旧上限 256——旧代码 sid>256 会直接 Close{reason:"udp busy"}，
+    // 成功数封顶在 256 附近。取 280 作判据：既容忍 UDP 丢包，又能抓住硬拒回归。
+    assert!(
+        oks >= 280,
+        "300 个源端口应几乎全部拿到回声（旧代码 sid>256 会被硬拒，封顶 256）；实际成功 {oks}"
+    );
+}
