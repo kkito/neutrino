@@ -24,6 +24,13 @@ pub const KUDUS_RETX_CAP: usize = 4096;
 /// 根因→修法：旧 take_expired 重发时刷新 *sent = now，包永不丢弃（无限复活）。
 pub const KUDUS_MAX_RETX: u32 = 10;
 
+/// 发送背压最长等待。根因→修法：旧 30s（3000×10ms）已证明过宽，
+/// 事故中持续近 2 小时；5s 足够正常抖动（窗口 512 包排空远小于 5s）。
+pub const KUDUS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 背压轮询间隔。抽出来供 server/agent 三处共用，消除硬编码 10ms。
+pub const BACKPRESSURE_POLL: Duration = Duration::from_millis(10);
+
 /// 重传退避上限。200ms 起指数翻倍，最长到 8s 封顶。
 pub const KUDUS_RTO_MAX: Duration = Duration::from_secs(8);
 

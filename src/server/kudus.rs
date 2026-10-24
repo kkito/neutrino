@@ -57,6 +57,12 @@ struct Tx {
 /// 写泵用可靠发送：DATA 帧登记重传（seq 分配 + 捎带 ACK 快照），
 /// 控制/FIN 等非 DATA 帧原样发（不占可靠序列）。
 /// 根因→修法：旧写泵全部 ack=0 发完即忘，跨机丢包即截断；现登记+ACK清+超时补。
+/// 背压等待是否已耗尽。根因→修法：旧代码 3000×10ms(30s) 后 `break` 出
+/// 等待循环但**照旧发包**，背压形同虚设。现在耗尽即返回错误，由调用方退出写泵。
+fn backpressure_exhausted(waited: std::time::Duration) -> bool {
+    waited >= crate::common::kudus::KUDUS_BACKPRESSURE_TIMEOUT
+}
+
 fn rel_emit(tx: &Tx, rel: &std::sync::Mutex<ServerRel>, flags: u8, body: &[u8]) -> bool {
     // 注意：单次 lock 拿全三件——写泵 2MB 切 2000 帧时 double-lock 会把临界区
     // 串成 4000 次加锁，重传泵 try_lock 永远抢不到，RTO 形同虚设（blob 219608/2M 即此）。
@@ -309,12 +315,24 @@ async fn handle_conn(
                     // UDP 下行整包：≤1132B 整包一帧；>1132B 分片逐片发（agent 侧
                     // UdpReasm 攒齐后整包交付，包边界不变）；>8KB 丢 + warn。
                     // 与上行 send_udp 对称。背压与 TCP 分支同阈值（256 未确认）。
-                    for _ in 0..3000 {
-                        let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
-                        if n < 256 {
-                            break;
+                    {
+                        let mut waited = Duration::ZERO;
+                        loop {
+                            let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
+                            if n < crate::common::kudus::KUDUS_RETX_BACKLOG {
+                                break;
+                            }
+                            if backpressure_exhausted(waited) {
+                                // 写泵返回 ()，不能 bail；error + break 退出写泵，
+                                // 由会话看门狗/上层重连收尾。
+                                tracing::error!(
+                                    "kudus send backpressure timeout (udp downlink), backlog={n}, aborting write pump"
+                                );
+                                return;
+                            }
+                            tokio::time::sleep(crate::common::kudus::BACKPRESSURE_POLL).await;
+                            waited += crate::common::kudus::BACKPRESSURE_POLL;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     if dg.len() <= crate::common::kudus::KUDUS_UDP_MAX {
                         let inner = encode_dgram(&dg);
@@ -346,12 +364,24 @@ async fn handle_conn(
                     // 注意：outbox (sid,payload) 无 kind 位，上游 ingress/egress/link
                     // 全是裸字节 TCP——UDP 下行不走这里（见下 udp_rx 分支，由上游
                     // 显式标记）。此处只剩 TCP 字节流，切片逐片交付语义正确。
-                    for _ in 0..3000 {
-                        let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
-                        if n < 256 {
-                            break;
+                    {
+                        let mut waited = Duration::ZERO;
+                        loop {
+                            let n = relw.lock().map(|r| r.retx.len()).unwrap_or(0);
+                            if n < crate::common::kudus::KUDUS_RETX_BACKLOG {
+                                break;
+                            }
+                            if backpressure_exhausted(waited) {
+                                // 写泵返回 ()，不能 bail；error + break 退出写泵，
+                                // 由会话看门狗/上层重连收尾。
+                                tracing::error!(
+                                    "kudus send backpressure timeout (outbox), backlog={n}, aborting write pump"
+                                );
+                                return;
+                            }
+                            tokio::time::sleep(crate::common::kudus::BACKPRESSURE_POLL).await;
+                            waited += crate::common::kudus::BACKPRESSURE_POLL;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     let pieces: Vec<&[u8]> = if payload.is_empty() {
                         vec![&[][..]]
@@ -784,6 +814,19 @@ pub(crate) async fn run_kudus(s: S, token: Arc<String>, bind: &str) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 背压超时必须报错，不能静默继续发。
+    /// 根因：旧代码 3000x10ms(30s) 循环耗尽后 `break` 出循环照旧 send_pkt，
+    /// 等于背压完全失效——窗口满了还继续灌，对端重排窗溢出→丢包→更多重传。
+    #[test]
+    fn backpressure_exhausted_is_error() {
+        // 还没到时限 → 继续等
+        assert!(!super::backpressure_exhausted(std::time::Duration::from_secs(0)));
+        assert!(!super::backpressure_exhausted(std::time::Duration::from_millis(4990)));
+        // 到 5s 必须判为耗尽
+        assert!(super::backpressure_exhausted(std::time::Duration::from_secs(5)));
+        assert!(super::backpressure_exhausted(std::time::Duration::from_secs(31)));
+    }
 
     #[test]
     fn replay_seq_is_dropped() {
