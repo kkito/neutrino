@@ -867,3 +867,238 @@ tick 用 `boot_with_desired` 的 50ms 参数化，不盲目 `sleep`。
 | INFO 日志量 | 800 条/分 | ~50 条/分 |
 | 日志留存 | 2 天 | 30 天 |
 | 下次事故破案 | 几乎不可能 | 可定位到具体隧道与放大倍数 |
+
+---
+
+## 16. 层 5：UDP 流生命周期可观测 + 闭环补盲（2026-10-24 追加）
+
+### 16.1 动机
+
+§15.4 规划了「降噪 + per-tunnel 汇总」，但实施时暴露两个更基本的问题：
+
+1. **§15.4 的 UDP 部分未落地**。TCP/HTTP 的 `tunnel_stats` 已埋（`ec97bee`），
+   UDP ingress 一处都没有——而 BT 的 UDP tracker / DHT / uTP **全走 UDP**，
+   等于最重的流量在日志里不存在。
+2. **「5 秒够不够」无法回答**。2026-10-24 现场追问 agent 侧
+   `UDP_STREAM_IDLE_SECS=5` 是否过激，翻遍日志只能看到每分钟一行全局
+   `kudus retx sent=N abandoned=N`，不知道**哪条流活了多久、为什么断**。
+
+第 2 点揭示一个更普遍的缺陷：两个 UDP 泵的失败分支全是**静默**的
+（`Ok(0) | Err(_) => break`、`.is_err() { return; }`），
+socket 出错、对端拒绝、池满踢流在日志里完全不可见。
+
+详见 [2026-10-24-udp-stream-lifecycle-blind.md](../../incidents/2026-10-24-udp-stream-lifecycle-blind.md)
+与 [2026-10-24-tunnel-stats-udp-gap.md](../../incidents/2026-10-24-tunnel-stats-udp-gap.md)。
+
+### 16.2 范围
+
+| # | 项 | 归属 | 状态 |
+| - | -- | ---- | ---- |
+| 1 | agent 侧流级统计 `UdpStreamStat` + 收尾日志 | 层 5a | 已实现 |
+| 2 | 两个泵的失败分支补 warn（去静默） | 层 5a | 已实现 |
+| 3 | `UdpPool::summary()` 池状态可见 | 层 5a | 已实现 |
+| 4 | `--udp-idle-secs` 启动参数（替代硬编码常量） | 层 5a | 已实现 |
+| 5 | UDP ingress `tunnel_stats` 埋点（§15.4 补漏） | 层 5b | **待实现** |
+| 6 | accept/close/udp session 全量降 DEBUG | 层 5b | tcp 已完成（`258330e`）；**udp session 待降** |
+| 7 | journald 留存落地（§15.5 ①） | 运维 | **待执行** |
+
+**不在范围**：server 侧 UDP 会话数上限（当前无上限、靠 TTL 回收，
+风险见 §16.7）。
+
+### 16.3 层 5a：agent 侧流级可观测（已实现）
+
+#### ① `UdpStreamStat`
+
+```rust
+pub(crate) struct UdpStreamStat {
+    started: Instant,
+    rx_pkts: AtomicU64, rx_bytes: AtomicU64,   // ws→local 方向
+    tx_pkts: AtomicU64, tx_bytes: AtomicU64,   // local→ws 方向
+    truncated: AtomicU64,                       // n == UDP_RECV_BUF 的次数
+    end: AtomicU8,                              // 结束原因
+}
+```
+
+两侧泵各写一半（原子计数，无锁），流收尾统一汇总。
+
+#### ② 收尾日志（DEBUG）
+
+```
+kudus udp stream closed sid=123 lived=5.02s reason=idle-timeout
+  rx_pkts=3 rx_bytes=180 tx_pkts=0 tx_bytes=0 truncated=0 pool=12/64 evicted=0
+```
+
+**判读表**（直接回答「5 秒够不够」）：
+
+| `lived` | `reason` | 含义 |
+| ------- | -------- | ---- |
+| ≈ idle 秒数 | `idle-timeout` | **卡在 idle 边界 → 超时太短**，应放宽 |
+| 远小于 idle | `recv-err` / `send-err` | 本地目标/内核出错，与 idle 无关 |
+| 任意 | `server-close` | server 主动关（正常 TTL 回收） |
+| 任意 | `local-eof` | 本地 transmission 关了 socket |
+
+`reason` 取值：`idle-timeout` / `server-close` / `send-err` / `recv-err` /
+`local-eof` / `running`。
+
+#### ③ 去静默
+
+```rust
+// local→ws
+Err(e) => {
+    stat.end.store(END_RECV_ERR, ..);
+    tracing::warn!("kudus udp local->ws recv failed: sid={sid} err={e}");
+    break;
+}
+// ws→local
+if let Err(e) = w.send(&dg).await {
+    stat.end.store(END_SEND_ERR, ..);
+    tracing::warn!("kudus udp ws->local send failed: sid={sid} err={e} (rx_pkts={n})");
+    return;
+}
+```
+
+**关键决策：`Ok(0)` 与 `Err` 必须分开**。旧代码合并成 `Ok(0) | Err(_)`，
+把「对端正常关闭」和「`ECONNREFUSED`/`ENOBUFS` 真错误」混为一谈，
+事后无法区分——这是静默事故的标准写法。
+
+#### ④ `UdpPool::summary()`
+
+```rust
+pub fn summary(&self) -> String {
+    format!("{}/{} evicted={}", self.in_use.len(), self.created, self.evicted_total)
+}
+```
+
+判读：`in_use` 涨到 100+ 就该警惕（**真实硬顶是内核 `SO_RCVBUF`
+钳 64KB，实测并发 ≈137**，不是 `POOL_MAX=512`）；`evicted` 涨 = 已在踢 LRU。
+
+#### ⑤ `--udp-idle-secs`
+
+```bash
+neutrino agent --server kudus://hk:36182 --config agent.toml --udp-idle-secs 60
+```
+
+```rust
+pub(crate) fn resolve_udp_idle_secs(cli: u64) -> u64 {
+    if cli == 0 { UDP_STREAM_IDLE_SECS } else { cli }
+}
+```
+
+**为什么 `0` 回退默认而非当真**：`Duration::from_secs(0)` 在超时语义下是灾难值
+——要么瞬杀全部 UDP 流，要么永不超时泄 fd（正是
+[retx-storm 事故](../../incidents/2026-10-23-kudus-retx-storm.md) 的旧病根）。
+误配代价太高，`0` 一律当「没传」。
+
+server 侧早有 `--udp-session-ttl`，agent 侧却没有对应开关——**不对称本身就是缺陷信号**。
+
+### 16.4 层 5b：UDP `tunnel_stats` 埋点（待实现）
+
+#### ① 为什么不能 tick 扫表
+
+`conns` 表在会话关闭时即 `remove`，tick 时扫表只能看到仍存活的连接。
+BT 短连接大量快开快关，扫表统计会**严重偏低**（§15.4 ② 已论证）。
+**累加必须在「关闭时刻」做。**
+
+#### ② 旁挂表 + 对齐回收
+
+`sessions` 元组已有 5 个字段，再塞 `stats_key` 要动所有解构模式
+（`ingress.rs:899` / `:976` 等）。改用旁挂小表：
+
+```rust
+// 与 sessions 同生命周期：sid -> "hostname/proxyname"
+let mut sid_stats: HashMap<u32, String> = HashMap::new();
+```
+
+**清理必须与 `sessions` 对齐**（关键决策 C）：`TTL 路径`显式删，
+另外在 `sessions.retain(...)` 之后同步 `sid_stats.retain(|sid, _| live.contains(sid))`，
+覆盖 agent 主动 Close（池满踢流、断线）这些不走 TTL 的路径，否则长期运行泄漏。
+
+#### ③ 三个埋点
+
+| 位置 | 动作 | 说明 |
+| ---- | ---- | ---- |
+| 新建 session（`ingress.rs:976` 插 `sessions` 前） | `accepts += 1` + 写 `sid_stats` | 语义 = **新建会话数** |
+| TTL 回收（`:872` `expired_sids` 后） | **先**累加 `closes += 1` **再**删 `sid_stats` | 顺序反了查不到 key |
+| `conns` 行累加点（`:930` 附近） | `rx += payload.len()` / `tx += chunk.len()` | 按 `sid_stats` 找 key |
+
+**`accepts` 语义决策（A）**：= 新建 session 数，不是收包数。
+与 TCP 的「建立连接」对等，`accepts/closes` 配对才有意义；包量由 `rx`/`tx` 字节体现。
+
+#### ④ 降噪范围（决策 B）
+
+| 位置 | 现状 | 动作 |
+| ---- | ---- | ---- |
+| `ingress.rs:624` tcp accept | 已 `debug!`（`258330e`） | 无 |
+| `ingress.rs:762` tcp close | 已 `debug!`（`258330e`） | 无 |
+| `ingress.rs:975` udp session | **`info!`** | → `debug!` |
+| HTTP accept/close | 本就无单连接日志 | 无 |
+
+**注意：源码降噪早已提交（`258330e`），但 HK 跑的是旧二进制**，
+journald 里仍是每分钟 541 条 `tcp accept`/`tcp close` 的 INFO。
+**部署新二进制即自动生效**——这次降噪的价值一半在「把已改的代码发上去」。
+
+**为什么还要降 `udp session`**：同类日志只降一处会留下「tcp 在 debug、
+udp 在 info」的不一致；`tunnel stats` 汇总行（每分一次、per-tunnel 明细）
+已在 INFO 保留可见性，单连接明细本就该在 DEBUG 按需开（`RUST_LOG=neutrino=debug`）。
+
+### 16.5 层 5c：journald 留存（运维，不改代码）
+
+`/etc/systemd/journald.conf`：
+
+```ini
+[Journal]
+SystemMaxUse=500M
+MaxRetentionSec=30day
+```
+
+「日志只剩 2 天」的根因是 journald 未配上限，不是没有文件。
+**不引入 `tracing-appender`**：journald 本身是成熟的滚动+保留方案，
+引新依赖会带来「stdout 与文件双写重复」的新问题。
+
+### 16.6 测试计划（TDD，先红后绿）
+
+| # | 用例 | 类型 | 抓什么 |
+| - | ---- | ---- | ------ |
+| 1 | `udp_stream_stat_reason_names` | 单测 | 6 个结束原因的名字映射 |
+| 2 | `udp_pool_summary_counts_in_use_and_evicted` | 单测 | `summary()` 的 in_use/created/evicted |
+| 3 | `udp_idle_secs_resolves_cli_override` | 单测 | `0 → 默认`、显式值原样、两端常量相等 |
+| 4 | `e2e_udp_tunnel_stats_line_emitted` | e2e | UDP 打流后 `tunnel stats <host>/<proxy> accepts>=1` |
+| 5 | `ingress_accumulates_tunnel_stats` | 单测 | 现有源码字面量断言（**不可信**，见 §16.8） |
+
+**e2e 4 的坑**：server UDP ingress 把 `SO_RCVBUF` 钳到 64KB，突发灌包在
+ingress 之前就被内核丢掉，实测恒定只进 ≈137 个。用例必须**少量包或错峰发**。
+
+**回退验证**：注释掉 UDP 的 `accepts += 1`，用例 4 必须变红。
+
+### 16.7 关键决策记录（本层）
+
+| # | 决策 | 理由 |
+| - | ---- | ---- |
+| A | `accepts` = 新建会话数，非收包数 | 与 TCP 语义对等，配对才有意义 |
+| B | tcp/http/udp 三处 accept/close 全降 DEBUG | 避免同类日志级别不一致 |
+| C | 旁挂表 + `sessions.retain` 后同步 retain | 覆盖 agent 主动 Close 路径，零泄漏 |
+| D | `--udp-idle-secs` 的 `0` 回退默认 | `from_secs(0)` 是灾难值（瞬杀/泄 fd） |
+| E | `Ok(0)` 与 `Err` 分支必须分开 | 合并即放弃区分「正常关闭 vs 真错误」 |
+
+### 16.8 教训
+
+1. **「能不能回答运维的追问」是日志的验收标准。** 这次不是不知道要打什么，
+   而是「每分钟一行全局数字」看起来已经够了——直到有人问「5 秒够不够」
+   才发现答不上来。好的日志应让**下一个问题**也能被回答。
+2. **源码字面量断言会给出虚假的安全感。** `ingress_accumulates_tunnel_stats`
+   在 UDP 完全空白时依然全绿（它只查 `.accepts += 1` 是否存在，不区分路径）。
+   行为断言（e2e 真打流看日志行）才是唯一可信的证据。
+3. **凡是运维可能要调的阈值，都别写死成常量。**
+4. **池里的账要有人读。** `evicted_total` 一直在累加却从不输出，等于没埋。
+
+### 16.9 已知风险（不在本层解决）
+
+**server 无会话数上限 vs agent 池 512 上限的不对称**：
+server `sessions` 无数量上限（只按 TTL 时间清），agent 池满 512 才踢 LRU。
+若 BT 洪峰把并发推过 512，会出现「agent 踢掉 → server 还在 → peer 再发包
+→ 又建」的**踢建抖动**。
+
+当前实测 107 条，离 512 很远。层 5a 的 `pool=.../... evicted=` 日志上线后，
+`evicted` 一旦开始涨即可确认。届时再评估是否加 server 侧上限。
+
+> 另注：§15.9 遗留项 1（`Address not available` 崩溃循环 1505 次）仍未排查。
