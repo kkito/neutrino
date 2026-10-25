@@ -369,6 +369,34 @@ async fn http_get_via(env: &Env, host: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 取隧道响应的原始 body（按 content-length 截取，供大二进制比对用）。
+async fn http_get_body_via(env: &Env, host: &str) -> Option<Vec<u8>> {
+    let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", env.http_port))
+        .await
+        .ok()?;
+    c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .ok()?;
+    let mut out = vec![];
+    c.read_to_end(&mut out).await.ok()?;
+    let pos = out.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&out[..pos]).to_ascii_lowercase();
+    if !head.starts_with("http/1.1 200") {
+        return None;
+    }
+    let want: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    let body = out[pos + 4..].to_vec();
+    if body.len() != want {
+        return None;
+    }
+    Some(body)
+}
+
 async fn login(base: &str) -> String {
     let c = reqwest::Client::new();
     let r = c
@@ -966,6 +994,75 @@ async fn quic_http_udp_and_hot_config() {
     assert!(tokio::time::timeout(Duration::from_secs(3), cli2.recv(&mut b2))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn quic_large_binary_body_not_corrupted() {
+    // 回归（2026-10-25 线上）：QUIC 下行大响应字节错位。
+    // 现场：curl -x http://agent:18080 https://...100KB → (56) SSL wrong version number；
+    // 同目标走 kudus 200/1000000。plain HTTP 全好，HTTPS >10KB 必挂。
+    // 根因：数据帧内层两端不对称 —— 发侧只对 UDP 套 dgram 帧，收侧却「先试
+    // decode_dgram、失败才当裸字节」。TLS 记录头 `16 03 03 00 7a` 的 0x1603
+    // 被读成长度 5635，前 2 字节被吞 → 整段错位。
+    // 断言：搬一段含 0x16 0x03 大写法的伪 TLS 大 body，逐字节比对，必须完整一致。
+    let mut body = vec![0u8; 300_000];
+    for (i, b) in body.iter_mut().enumerate() {
+        // 前置真实 TLS-handshake 头，后面用可校验的伪随机填充
+        *b = if i < 5 {
+            [0x16u8, 0x03, 0x03, 0x00, 0x7a][i]
+        } else {
+            (i.wrapping_mul(2654435761) >> 13) as u8
+        };
+    }
+    let want = body.clone();
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(&body).await;
+            });
+        }
+    });
+    let env = boot_quic(&format!(
+        "[[proxies]]\nname=\"big\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"big.e2e.test\"]\n"
+    ))
+    .await;
+    // 先等路由收敛（首个小请求打通即代表 Register 完成）
+    let mut ready = false;
+    for _ in 0..50 {
+        if http_get_via(&env, "big.e2e.test").await.contains("HTTP/1.1 200") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "quic route never converged");
+    // 直接拿原始响应体：http_get_via 只适合小文本，这里自己收全。
+    let mut got = None;
+    for _ in 0..20 {
+        if let Some(b) = http_get_body_via(&env, "big.e2e.test").await {
+            got = Some(b);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let got = got.expect("no complete body over quic");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "body length mismatch: quic dropped/added bytes"
+    );
+    assert_eq!(got, want, "body bytes corrupted over quic (framing misparse)");
 }
 
 #[tokio::test]

@@ -35,8 +35,13 @@ impl Sender for WsSender {
 pub(crate) struct QuicSender(pub(crate) mpsc::UnboundedSender<Vec<u8>>);
 impl Sender for QuicSender {
     fn send_data(&self, sid: u32, chunk: &[u8]) {
-        use crate::common::quic::encode_frame;
-        let _ = self.0.send(encode_frame(&encode_data(sid, chunk)));
+        use crate::common::quic::{encode_dgram, encode_frame};
+        // 与下行对称：一律套 dgram 帧，server 侧按 split_payload(.., true) 拆。
+        // 根因→修法：旧版裸发 encode_data，server 读循环无条件试 decode_dgram，
+        // 上行 TLS 字节前 2 字节被当长度吞掉（HTTPS 大响应必挂）。
+        let _ = self
+            .0
+            .send(encode_frame(&encode_data(sid, &encode_dgram(chunk))));
     }
     fn send_ctrl(&self, m: &ClientMsg) {
         use crate::common::quic::encode_frame;
@@ -115,7 +120,13 @@ pub(crate) async fn http_response_pump<S: Sender>(tx: S, sid: u32, mut lr: tokio
         };
         let fixed_head = rewrite_chunked_head(&head[..hlen], body.len());
         tx.send_data(sid, &fixed_head);
-        tx.send_data(sid, &body);
+        // 根因→修法：旧版把整个 body 当一包 `send_data`，超过 dgram 的 u16
+        // 长度上限（65535）就溢出成伪随机长度，接收端按错长度拆包 → 截断
+        // （2026-10-25 现场：同样 300KB 三跑得 157785/168783/238625）。
+        // 定长分支（下方）本就 32KB 一片，这里对齐成同一分片大小。
+        for piece in body.chunks(32 * 1024) {
+            tx.send_data(sid, piece);
+        }
         return;
     }
     if hdr_txt.lines().any(|l| {

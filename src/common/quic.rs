@@ -61,6 +61,20 @@ pub fn decode_frames(buf: &[u8]) -> (Vec<Vec<u8>>, usize) {
 }
 
 pub fn encode_dgram(payload: &[u8]) -> Vec<u8> {
+    // 防御：u16 长度前缀装不下 >65535 的包。旧版直接 `as u16` 溢出成伪随机
+    // 长度（300000 as u16 = 41248），接收端按错长度拆包 → 大响应每次截断
+    // 的字节数都不一样（现场：157785 / 168783 / 238625 三跑三值）。
+    // 这里硬截断到 DGRAM_MAX，并保证调用方不该单包发这么大的片。
+    let payload = if payload.len() > DGRAM_MAX {
+        tracing::warn!(
+            "encode_dgram: payload {} > DGRAM_MAX {}, truncating",
+            payload.len(),
+            DGRAM_MAX
+        );
+        &payload[..DGRAM_MAX]
+    } else {
+        payload
+    };
     let mut v = Vec::with_capacity(2 + payload.len());
     v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     v.extend_from_slice(payload);
@@ -83,6 +97,34 @@ pub fn decode_dgram(buf: &[u8]) -> Option<(&[u8], usize)> {
         return None;
     }
     Some((&buf[2..2 + len], 2 + len))
+}
+
+/// 拆一个 QUIC 数据帧的 payload 为若干片段。
+///
+/// 背景（根因）：QUIC 数据帧内层既要承载 UDP 单包边界，也要承载任意 TCP/TLS
+/// 字节流。旧实现在两端都「先试 decode_dgram，失败才当裸字节」——这对 TCP 是
+/// 灾难：TLS 记录头 `16 03 03 00 7a ...` 前两字节 `0x1603` 被读成长度 5635，
+/// 于是前 2 字节被吞掉、后续整段错位，curl 报 `wrong version number`
+/// （2026-10-25 实测：HTTPS 响应 >10KB 必挂，plain HTTP 却全好）。
+///
+/// 修法：把「是否套了 dgram 帧」变成帧内的显式标记，不再靠猜测。
+/// `udp == true` 表示发送方用 encode_dgram 逐包封装过，按 dgram 帧拆；
+/// `udp == false` 表示裸字节流，整段原样返回（绝不动前两个字节）。
+pub fn split_payload(payload: &[u8], udp: bool) -> Vec<&[u8]> {
+    if !udp {
+        return if payload.is_empty() { Vec::new() } else { vec![payload] };
+    }
+    let mut out = Vec::new();
+    let mut off = 0;
+    while let Some((dg, used)) = decode_dgram(&payload[off..]) {
+        off += used;
+        out.push(dg);
+    }
+    if out.is_empty() {
+        // 标记为 udp 但拆不出完整 dgram 帧：按单片透传，不丢数据。
+        out.push(payload);
+    }
+    out
 }
 
 pub fn parse_server_url(url: &str) -> Transport {
@@ -132,6 +174,49 @@ pub async fn resolve_server_addr(host: &str, port: u16) -> std::io::Result<std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_dgram_never_truncates_silently() {
+        // 回归：u16 长度前缀对 >65535 的 payload 会溢出成伪随机长度
+        // （300000 as u16 == 41248），接收端按错长度拆包，导致每次截断
+        // 的字节数都不一样。这里锁定：超限必被截到 DGRAM_MAX。
+        let big = vec![0x5Au8; 300_000];
+        let framed = encode_dgram(&big);
+        assert!(framed.len() <= DGRAM_MAX + 2);
+        let (body, _) = decode_dgram(&framed).expect("truncated frame must still parse");
+        assert_eq!(body.len(), DGRAM_MAX);
+    }
+
+    #[test]
+    fn split_payload_never_swallows_tcp_bytes() {
+        // 回归：QUIC 下行 HTTPS 响应。TLS 记录头 `16 03 03 00 7a ...` 前两字节
+        // 0x1603=5635 曾被旧代码（无条件 decode_dgram）读成长度，导致前 2 字节被吞、
+        // 整段错位。现场：curl -x 查 1MB → curl: (56) wrong version number；
+        // kudus 同目标 200/1000000 正常。断言：非 udp 帧必须原样返回。
+        let mut tls = vec![0x16, 0x03, 0x03, 0x00, 0x7a];
+        tls.extend(std::iter::repeat(0xAB).take(6000));
+        let parts = split_payload(&tls, false);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], &tls[..], "TCP 字节一个都不能动");
+    }
+
+    #[test]
+    fn split_payload_splits_dgram_only_when_flagged_udp() {
+        let mut two = Vec::new();
+        two.extend_from_slice(&encode_dgram(b"aaa"));
+        two.extend_from_slice(&encode_dgram(b"bbbb"));
+        assert_eq!(split_payload(&two, true), vec![&b"aaa"[..], &b"bbbb"[..]]);
+        // 同样字节若标记为非 udp，就是一个整段。
+        assert_eq!(split_payload(&two, false), vec![&two[..]]);
+    }
+
+    #[test]
+    fn split_payload_udp_falls_back_when_dgram_incomplete() {
+        // 标记 udp 但给的是一段拆不出完整 dgram 帧的数据：不能静默丢弃。
+        let junk = [0x00, 0x09, 0x01]; // 声明 9 字节，实得 1 字节
+        assert_eq!(split_payload(&junk, true), vec![&junk[..]]);
+        assert!(split_payload(&[], false).is_empty());
+    }
 
     #[test]
     fn frame_roundtrip_sticky_and_half() {

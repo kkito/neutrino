@@ -3,7 +3,7 @@
 //! Register/Config 收敛 → 心跳 → 隧道泵。控制帧全部经 control stream 的
 //! length-prefixed JSON；数据走每隧道一条 QUIC 双向 stream。
 use crate::common::proto::*;
-use crate::common::quic::{decode_dgram, encode_dgram, encode_frame, CONTROL_MAX};
+use crate::common::quic::{encode_dgram, encode_frame, CONTROL_MAX};
 use super::state::{log_ev, save_state, AgentHandle, AgentInfo, Shared};
 use crate::server::tunnel::{on_register, spawn_egress_dial, spawn_link_relay, spawn_link_udp_relay};
 use std::collections::HashMap;
@@ -230,21 +230,29 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
     };
     // 写泵：ctl（ServerMsg）与 out（数据）都经 control stream 发，
     // 数据帧复用 [stream:u32 BE][payload] 二进制编码（与 WSS Binary 同形），
-    // UDP 包先套 dgram 帧再进 payload（对端按 decode_dgram 拆）。
+    // UDP 包先套 dgram 帧再进 payload（两端发侧一律套帧，收侧按 split_payload 拆）。
     let write_pump = async {
         loop {
             tokio::select! {
                 Some(m) = ctl_rx.recv() => {
                     let t = serde_json::to_string(&m).unwrap();
                     let is_close_stream = matches!(m, ServerMsg::Close { .. });
-                    if ctl_send.write_all(&encode_frame(t.as_bytes())).await.is_err() { break; }
+                    if let Err(e) = ctl_send.write_all(&encode_frame(t.as_bytes())).await {
+                        tracing::warn!("quic ctl write stopped: {e}");
+                        break;
+                    }
                     let _ = is_close_stream;
                 }
                 Some((id, payload, _)) = out_rx.recv() => {
-                    let b = encode_data(id, &payload);
-                    // 每条隧道数据走独立 stream：sid 复用 QUIC stream 太重，
-                    // 此处沿用 control 复用帧（agent 侧按 sid 分发），队头影响限于同 agent。
-                    if ctl_send.write_all(&encode_frame(&b)).await.is_err() { break; }
+                    // 两端对称套 dgram 帧（agent 侧按 split_payload(.., true) 拆）：
+                    // 旧版这里裸发 encode_data(id, &payload)，而 agent 收侧无条件试
+                    // decode_dgram → 下行 TLS 记录头 0x1603 被读成长度，字节错位，
+                    // HTTPS 大响应必挂。与 kudus_session.rs 注释同一坑。
+                    let b = encode_data(id, &encode_dgram(&payload));
+                    if let Err(e) = ctl_send.write_all(&encode_frame(&b)).await {
+                        tracing::warn!("quic data write stopped: {e} (sid={id})");
+                        break;
+                    }
                     // 原子累加，零 agents 写锁（同 kudus 写泵）。
                     if let Some(h) = s.agents.read().await.get(&agent_id) {
                         h.ctr_tx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -302,16 +310,9 @@ async fn handle_conn(s: S, token: Arc<String>, conn: quinn::Connection) {
                 continue;
             }
             if let Some((id, payload)) = decode_data(&body) {
-                // UDP 包带 dgram 内帧：拆出每个 datagram 依次投递。
-                let mut off = 0;
-                let mut delivered = false;
-                while let Some((dg, used)) = decode_dgram(&payload[off..]) {
-                    off += used;
-                    delivered = true;
+                // 两端对称套 dgram 帧：这里按 dgram 拆（绝不对裸字节猜长度前缀）。
+                for dg in crate::common::quic::split_payload(payload, true) {
                     deliver(&s, &agent_id, id, dg).await;
-                }
-                if !delivered {
-                    deliver(&s, &agent_id, id, payload).await;
                 }
             }
         }

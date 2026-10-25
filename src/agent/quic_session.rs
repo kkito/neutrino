@@ -4,7 +4,7 @@
 //! control stream 走 length-prefixed JSON，数据经 control 复用帧
 //! `[stream:u32 BE][payload]`（UDP 包套 dgram 内帧保边界）。
 use crate::common::proto::*;
-use crate::common::quic::{decode_dgram, decode_frames, encode_dgram, encode_frame, CONTROL_MAX};
+use crate::common::quic::{decode_frames, encode_dgram, encode_frame, CONTROL_MAX};
 use super::{AgentFileConfig, Upstream};
 // http_response_pump 经 pump_tcp 内联引用（见下），此处不直接用。
 use std::{collections::HashMap, sync::Arc};
@@ -118,7 +118,10 @@ pub(crate) async fn session(
     // 写泵：control 帧串行写（JSON len 帧 + 复用二进制帧都经此通道保序）。
     let writer = tokio::spawn(async move {
         while let Some(f) = out_rx.recv().await {
-            if ctl_send.write_all(&f).await.is_err() {
+            if let Err(e) = ctl_send.write_all(&f).await {
+                // 静默 break 是盲区：写失败后本会话上行已断，但上层看不到原因，
+                // 只有心跳超时才重连。至少 warn + 带帧长，便于对照 server 侧日志。
+                tracing::warn!("quic writer stopped: {e} (last frame {}B)", f.len());
                 break;
             }
         }
@@ -226,16 +229,9 @@ pub(crate) async fn session(
                 continue;
             }
             if let Some((id, payload)) = decode_data(&body) {
-                // server 下发的 UDP 包带 dgram 内帧：逐个拆投；非 dgram 即裸 TCP/HTTP 字节。
-                let mut off = 0;
-                let mut delivered = false;
-                while let Some((dg, used)) = decode_dgram(&payload[off..]) {
-                    off += used;
-                    delivered = true;
+                // 两端对称套 dgram 帧：这里按 dgram 拆（绝不对裸字节猜长度前缀）。
+                for dg in crate::common::quic::split_payload(payload, true) {
                     deliver(&ctx, id, dg).await;
-                }
-                if !delivered {
-                    deliver(&ctx, id, payload).await;
                 }
             }
         }
@@ -258,9 +254,16 @@ async fn deliver(ctx: &Arc<QCtx>, id: u32, payload: &[u8]) {
     }
 }
 
-/// 数据发送：裸字节包复用帧；UDP 包先套 dgram 帧保边界。
-fn send_data(ctx: &QCtx, sid: u32, payload: &[u8], is_udp: bool) {
-    let inner = if is_udp { encode_dgram(payload) } else { payload.to_vec() };
+/// 数据发送：payload 一律先套 dgram 帧再进复用帧。
+///
+/// 根因→修法：旧版只对 UDP 套 dgram，TCP 裸发；而接收端无条件「先试
+/// decode_dgram」→ TLS 记录头 `16 03 03` 的 `0x1603` 被读成长度 5635，
+/// 前 2 字节被吞、整段错位，curl 报 `wrong version number`（HTTPS >10KB 必挂）。
+/// 与 kudus 对齐（kudus_session.rs 注释已记过同一坑）：两端对称套帧，
+/// 接收端按 split_payload(.., true) 拆包，永不把裸字节当前缀解析。
+/// `is_udp` 仅用于语义标记，封帧行为两者一致。
+fn send_data(ctx: &QCtx, sid: u32, payload: &[u8], _is_udp: bool) {
+    let inner = encode_dgram(payload);
     let _ = ctx.out.send(encode_frame(&encode_data(sid, &inner)));
 }
 
@@ -407,18 +410,10 @@ async fn open_udp_stream_sock(ctx: Arc<QCtx>, sid: u32, sock: tokio::net::UdpSoc
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(120), drx.recv()).await {
                 Ok(Some(dg)) => {
-                    // stream 内 dgram 帧可能是粘连的多包：逐个拆发
-                    let mut off = 0;
-                    let mut any = false;
-                    while let Some((one, used)) = decode_dgram(&dg[off..]) {
-                        off += used;
-                        any = true;
-                        if w.send(one).await.is_err() {
-                            return;
-                        }
-                    }
-                    if !any {
-                        let _ = w.send(&dg).await;
+                    // deliver 已按 split_payload 拆过 dgram 帧，这里拿到的是单个 UDP 包体，
+                    // 不能再拆一层（双重拆包会把包体前 2 字节当长度吞掉）。
+                    if w.send(&dg).await.is_err() {
+                        return;
                     }
                 }
                 _ => break,
