@@ -75,7 +75,21 @@ pub(crate) async fn http_response_pump<S: Sender>(tx: S, sid: u32, mut lr: tokio
     let mut head = vec![];
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            // 首包阶段一个字节都没读到就结束：无可透传，但留痕便于排查空响应。
+            Ok(Ok(0)) => {
+                if head.is_empty() {
+                    tracing::warn!("http pump sid={sid} EOF before any header byte");
+                }
+                return;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("http pump sid={sid} header read error: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("http pump sid={sid} header read timeout");
+                return;
+            }
             Ok(Ok(n)) => {
                 head.extend_from_slice(&b[..n]);
                 if head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -111,7 +125,18 @@ pub(crate) async fn http_response_pump<S: Sender>(tx: S, sid: u32, mut lr: tokio
                 break body;
             }
             match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break greedy_decode_chunked(&buf),
+                Ok(Ok(0)) => {
+                    tracing::warn!("http pump sid={sid} chunked EOF early, greedy decode {}B", buf.len());
+                    break greedy_decode_chunked(&buf);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("http pump sid={sid} chunked read error: {e}");
+                    break greedy_decode_chunked(&buf);
+                }
+                Err(_) => {
+                    tracing::warn!("http pump sid={sid} chunked read timeout");
+                    break greedy_decode_chunked(&buf);
+                }
                 Ok(Ok(n)) => buf.extend_from_slice(&b[..n]),
             }
             if buf.len() > 32 * 1024 * 1024 + 65536 {
@@ -150,15 +175,68 @@ pub(crate) async fn http_response_pump<S: Sender>(tx: S, sid: u32, mut lr: tokio
     }
     let mut got = body_prefix.len();
     let mut extra = want.saturating_sub(got);
+    // 根因→修法：原来 `Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break` 把「正常 EOF」与
+    // 「读错误/超时」合并，退出后又不校验 got == want —— 30% 丢包下 client 收到
+    // 98304B/1048576B 却仍 HTTP 200，完全无感知。现在分开记原因 + 退出时校验。
+    let mut why: Option<ShortRead> = None;
     while extra > 0 {
         match tokio::time::timeout(std::time::Duration::from_secs(10), lr.read(&mut b)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(0)) => {
+                why = short_read_reason(got, want);
+                break;
+            }
+            Ok(Err(e)) => {
+                why = short_read_reason_err(got, want, "read error");
+                tracing::warn!("http pump sid={sid} read error: {e} (got {got}/{want})");
+                break;
+            }
+            Err(_) => {
+                why = short_read_reason_err(got, want, "read timeout");
+                tracing::warn!("http pump sid={sid} read timeout (got {got}/{want})");
+                break;
+            }
             Ok(Ok(n)) => {
                 tx.send_data(sid, &b[..n]);
                 got += n;
                 extra = want.saturating_sub(got);
             }
         }
+    }
+    // 截断必须留痕：client 已收到 content-length 承诺，缺字节就是数据损坏。
+    if let Some(r) = why {
+        tracing::error!("http pump sid={sid} truncated body: got {got}/{want} ({r:?})");
+    }
+}
+
+/// 定长响应「没收够」的原因。用于把静默截断变成可观测事件。
+///
+/// 根因：`Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break` 把「正常 EOF」与
+/// 「读错误/超时」合并，退出后又不校验 `got == want`。2026-10-25 实测
+/// （tc netem 30% loss，1MB）：client 拿到 98304B / 983040B，HTTP 仍是
+/// 200，curl 不报错 —— 静默数据损坏。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ShortRead {
+    /// 对端正常关闭，但字节数不够（服务端提前断、上游截断）。
+    Eof,
+    /// 读错误/超时（链路丢包、连接 reset）。
+    Error(&'static str),
+}
+
+/// `got >= want` 返回 None（正常结束）；否则返回截断原因。
+pub(crate) fn short_read_reason(got: usize, want: usize) -> Option<ShortRead> {
+    if got >= want {
+        None
+    } else {
+        Some(ShortRead::Eof)
+    }
+}
+
+/// 同上，但优先报「读错误」——错误比 clean EOF 信息更有用。
+pub(crate) fn short_read_reason_err(got: usize, want: usize, err: &'static str) -> Option<ShortRead> {
+    if got >= want {
+        None
+    } else {
+        Some(ShortRead::Error(err))
     }
 }
 
@@ -278,7 +356,17 @@ pub(crate) async fn stream_body_until_idle<S: Sender>(tx: S, sid: u32, lr: &mut 
     let mut b = vec![0u8; 32 * 1024];
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(5), lr.read(&mut b)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(0)) => break,
+            // 此处 body 无 content-length 承诺（connection: close / 裸流），
+            // 中途断了就少了字节，必须留痕而不是静默 break。
+            Ok(Err(e)) => {
+                tracing::warn!("stream pump sid={sid} read error: {e}");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("stream pump sid={sid} idle timeout");
+                break;
+            }
             Ok(Ok(n)) => {
                 tx.send_data(sid, &b[..n]);
             }
@@ -291,6 +379,39 @@ pub(crate) async fn stream_body_until_idle<S: Sender>(tx: S, sid: u32, lr: &mut 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_read_is_detected_not_silently_accepted() {
+        // RED：定长响应在 `got < want` 时退出，必须能判定为「截断」而不是
+        // 「正常结束」。现场（2026-10-25 tc netem 30% loss，1MB）：
+        //   curl 拿到 98304B / 983040B 却仍是 HTTP 200，完全不报错。
+        // 根因：`Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break` 把「正常 EOF」与
+        // 「读错误/超时」合并，退出后又不校验 got == want。
+        assert_eq!(super::short_read_reason(100, 100), None);
+        assert_eq!(super::short_read_reason(0, 0), None);
+        assert_eq!(
+            super::short_read_reason(98304, 1048576),
+            Some(super::ShortRead::Eof),
+            "收到 EOF 但字节数不够 → 必须报截断"
+        );
+        assert_eq!(
+            super::short_read_reason(0, 1048576),
+            Some(super::ShortRead::Eof),
+            "一个字节都没收到也是截断"
+        );
+    }
+
+    #[test]
+    fn short_read_distinguishes_error_from_clean_eof() {
+        // 读错误（丢包超时/连接 reset）与正常 EOF 是两回事，日志要能区分，
+        // 否则事后排查分不清「对端正常关」还是「链路烂了」。
+        assert_eq!(
+            super::short_read_reason_err(500, 1048576, "timed out"),
+            Some(super::ShortRead::Error("timed out")),
+        );
+        // 已经收够了就是正常结束，哪怕底层有错。
+        assert_eq!(super::short_read_reason_err(1048576, 1048576, "boom"), None);
+    }
+
     #[test]
     fn chunked_body_decodes_fully_before_forward() {
         // RED: chunked framing（块大小行/`0` 结束块）绝不能透传给 client。

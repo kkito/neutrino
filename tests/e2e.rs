@@ -74,6 +74,8 @@ struct Env {
     _ag: tokio::process::Child,
     /// agent 子进程 pid：UDP socket 泄漏回归需要观测它的 fd 数。
     ag_pid: u32,
+    /// agent 日志文件（仅 `boot_quic_logged` 填）。用于断言「静默失败已留痕」。
+    ag_log: Option<std::path::PathBuf>,
 }
 
 /// e2e 子进程输出策略：负向用例（非法 TOML reload 等）会故意触发 server
@@ -161,6 +163,7 @@ async fn boot_with_desired(proxies_toml: &str, desired_toml: Option<&str>) -> En
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: None,
     }
 }
 
@@ -250,6 +253,7 @@ async fn boot_with_logfile(
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: None,
     };
     (env, log_path)
 }
@@ -335,6 +339,7 @@ async fn boot_udp_ttl(proxies_toml: &str, ttl_secs: u64) -> Env {
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: None,
     }
 }
 
@@ -843,6 +848,11 @@ async fn e2e_udp_and_hot_config() {
 /// QUIC 版 boot：server 同时开 --quic-listen，agent 用 quic:// 拨号。
 /// 其余与 WSS 版一致（desired/HTTP 入站同端口，Host 路由不变）。
 async fn boot_quic(proxies_toml: &str) -> Env {
+    boot_quic_inner(proxies_toml, false).await
+}
+
+/// `log_to_file=true` 时把 agent 的 tracing 输出接到 data_dir/agent.log。
+async fn boot_quic_inner(proxies_toml: &str, log_to_file: bool) -> Env {
     let ws_port = free_port();
     let quic_port = free_port();
     let dir = std::env::temp_dir().join(format!("nt-e2e-quic-{}", uuid::Uuid::new_v4()));
@@ -878,9 +888,19 @@ async fn boot_quic(proxies_toml: &str) -> Env {
         .spawn()
         .unwrap();
     wait_for(&format!("127.0.0.1:{ws_port}")).await;
+    let ag_log_file = dir.join("agent.log");
+    let (ag_out, ag_err) = if log_to_file {
+        let f = std::fs::File::create(&ag_log_file).unwrap();
+        (
+            std::process::Stdio::from(f.try_clone().unwrap()),
+            std::process::Stdio::from(f),
+        )
+    } else {
+        (e2e_stdio(), e2e_stdio())
+    };
     let ag = tokio::process::Command::new(&bin)
-        .stdout(e2e_stdio())
-        .stderr(e2e_stdio())
+        .stdout(ag_out)
+        .stderr(ag_err)
         .args([
             "agent",
             "--server",
@@ -902,7 +922,14 @@ async fn boot_quic(proxies_toml: &str) -> Env {
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: if log_to_file { Some(ag_log_file) } else { None },
     }
+}
+
+/// 同 `boot_quic`，但把 agent 的 stdout/stderr（tracing 输出）写到 `dir/agent.log`，
+/// 便于对"静默失败已留痕"做断言（不再靠人工看 --nocapture）。
+async fn boot_quic_logged(proxies_toml: &str) -> Env {
+    boot_quic_inner(proxies_toml, true).await
 }
 
 #[tokio::test]
@@ -1066,6 +1093,85 @@ async fn quic_large_binary_body_not_corrupted() {
 }
 
 #[tokio::test]
+async fn truncated_upstream_body_is_not_reported_as_success() {
+    // 回归（2026-10-25 tc netem 30% loss 现场）：上游声称 content-length: 1MB
+    // 但只发 100KB 就关连接。旧代码 `Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break`
+    // 静默退出、不校验 got==want，client 收到 100KB 仍是 HTTP 200，curl 不报错。
+    // 断言：完整 body 拿不到（http_get_body_via 内部校验 body.len()==content-length），
+    // 且 agent 日志必须有 truncated body 的 ERROR。
+    let want_len = 1_048_576usize;
+    let send_bytes = 100_000usize;
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bport = back.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = back.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 4096];
+                let _ = s.read(&mut b).await;
+                // 只发 100KB 就 drop(s)：模拟链路烂到数据传不完。
+                // 注意：不带 connection: close，才能走 http_response_pump 的
+                // 定长分支（该分支才会检测 got < want 并打 ERROR）。
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {want_len}\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(&vec![0x42u8; send_bytes]).await;
+                let _ = s.flush().await;
+                drop(s);
+            });
+        }
+    });
+    let env = boot_quic_logged(&format!(
+        "[[proxies]]\nname=\"trunc\"\ntype=\"http\"\nlocal_ip=\"127.0.0.1\"\nlocal_port={bport}\ndomains=[\"trunc.e2e.test\"]\n"
+    ))
+    .await;
+    let mut ready = false;
+    for _ in 0..50 {
+        if http_get_via(&env, "trunc.e2e.test").await.contains("HTTP/1.1 200") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "quic route never converged");
+    // 数据不足 1MB：必须拿不到「完整 body」（不能把 100KB 当成功）。
+    let mut complete = None;
+    for _ in 0..20 {
+        if let Some(b) = http_get_body_via(&env, "trunc.e2e.test").await {
+            complete = Some(b);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    match complete {
+        None => {}
+        Some(b) => panic!(
+            "truncated body accepted as success: got {}B, content-length claimed {want_len}B",
+            b.len()
+        ),
+    }
+    // 关键断言：截断必须在 agent 日志留下 ERROR。
+    // 旧代码 `Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break` 静默退出，日志里什么都没有，
+    // 事后完全无法判断「client 收到的 100KB 是完整还是残的」。
+    let log_path = env.ag_log.clone().expect("ag_log");
+    let mut seen = false;
+    for _ in 0..50 {
+        if let Ok(txt) = tokio::fs::read_to_string(&log_path).await {
+            if txt.contains("truncated body") && txt.contains("got 100000/1048576") {
+                seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        seen,
+        "truncated body was not logged — silent data loss is back (see src/agent/stream.rs)"
+    );
+}
+
+#[tokio::test]
 async fn quic_bad_token_closes() {
     // 错 token 的 QUIC agent 建连即被 401 close：server 侧 agents 表无此 hostname，
     // WebUI conns 为空；旧代码（Task 2 前）无 QUIC 监听，connect 直接超时。
@@ -1196,6 +1302,7 @@ async fn boot_kudus(proxies_toml: &str) -> Env {
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: None,
     }
 }
 
@@ -1549,6 +1656,7 @@ async fn kudus_many_proxies_ctrl_frag_converges() {
         _srv: srv,
         _ag: ag,
         ag_pid,
+        ag_log: None,
     };
     let mut ok = false;
     for _ in 0..75 {
