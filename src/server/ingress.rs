@@ -532,6 +532,45 @@ async fn http_ingress(bind: &str, s: S) -> anyhow::Result<()> {
     }
 }
 
+/// `first-chunk timeout` 日志降噪器（按 remote_port 一份，进程级共享）。
+///
+/// 根因→修法：`:51413` 暴露公网后每秒约 4 个 BT 扫描连接，每个都触发一条
+/// `first-chunk timeout` WARN —— 实测 **1 小时 960 条**，而同期实际传输 0 B/s
+/// （33 个种子全做种、`peersGettingFromUs` 全 0，平均每连接仅 370 字节，
+/// 就是一个 BT handshake 的量级）。日志被纯噪音刷满，真异常反而淹掉。
+///
+/// 聚合口径：**每个窗口只打第一条**（保留可见性），窗口结束时下一条带出
+/// 「被抑制了多少条」。计数用 `stick` 埋点照旧逐条累加，不丢统计精度。
+#[derive(Default)]
+pub(crate) struct StickNoise {
+    window_start: Option<Instant>,
+    suppressed: u64,
+}
+
+/// 聚合窗口。60s 与 `traffic-tick` 同量级，够看清趋势也不至于太吵。
+const STICK_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+impl StickNoise {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 返回 `Some(上一窗口被抑制的条数)` 表示本条要打印；`None` 表示抑制。
+    /// 首个窗口返回 `Some(0)`（首条必须可见）。
+    pub(crate) fn observe(&mut self, now: Instant) -> Option<u64> {
+        match self.window_start {
+            Some(start) if now.saturating_duration_since(start) < STICK_LOG_WINDOW => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.window_start = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
 // ================= tcp ingress (per remote_port, lazy) =================
 pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
     if s.tcp_listening.read().await.contains(&port) {
@@ -544,6 +583,9 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
             Ok(lis) => {
                 tracing::info!("tcp ingress on 0.0.0.0:{port}");
                 log_ev(&s2, format!("tcp listening :{port}"));
+                // per-port 一份降噪器：窗口内 `first-chunk timeout` 只打第一条。
+                // Arc+Mutex：每连接一个 task，状态必须跨 task 共享才能聚合。
+                let stick_noise = std::sync::Arc::new(std::sync::Mutex::new(StickNoise::new()));
                 loop {
                     let Ok((inbound, peer)) = lis.accept().await else {
                         continue;
@@ -580,6 +622,7 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                         }
                     }
                     let s3 = s2.clone();
+                    let stick_noise = stick_noise.clone();
                     tokio::spawn(async move {
                         let Some(aid) =
                             pick_port(&s3, port, "tcp").await
@@ -713,7 +756,19 @@ pub(crate) async fn ensure_tcp_listener(s: &S, port: u16) {
                                 {
                                     Ok(Some(c)) => Some(c),
                                     _ => {
-                                        tracing::warn!("tcp :{port} sid={sid} first-chunk timeout (reorder hole?), close early");
+                                        // 降噪：BT 扫描连接可达 4/秒，逐条打会把 journald 刷满
+                                        // （实测 960 条/小时）。窗口内只打首条 + 带累计数。
+                                        let hit = stick_noise
+                                            .lock()
+                                            .ok()
+                                            .and_then(|mut n| n.observe(Instant::now()));
+                                        if let Some(prev) = hit {
+                                            if prev == 0 {
+                                                tracing::warn!("tcp :{port} sid={sid} first-chunk timeout (reorder hole?), close early");
+                                            } else {
+                                                tracing::warn!("tcp :{port} sid={sid} first-chunk timeout (reorder hole?), close early (+{prev} suppressed in last 60s)");
+                                            }
+                                        }
                                         // spec §15.4：粘包/乱序洞计数，与 accepts 对比可看出隧道健康度
                                         if let Ok(mut m) = s3.tunnel_stats.lock() {
                                             m.entry(stats_key.clone()).or_default().stick += 1;
@@ -1384,6 +1439,54 @@ mod tests {
         assert!(
             !src.contains(&format!("{inf}{clo}")),
             "tcp close 不能是 info（回归）"
+        );
+    }
+
+    /// 回归（2026-10-25）：`:51413` 暴露公网后每秒约 4 个 BT 扫描连接，
+    /// 每个都触发 `first-chunk timeout` WARN —— 实测 **1 小时 960 条**，
+    /// 而同期实际传输 0 B/s（33 个种子全做种、`peersGettingFromUs` 全 0）。
+    /// 日志被纯噪音刷屏，真正的异常反而淹掉。
+    ///
+    /// 修法：按隧道聚合，窗口内只打第一条，窗口结束时补一条带累计数的汇总。
+    /// 好判据是「窗口内第 N 次（N>1）不再单独打」+「下一次窗口开头带上次累计数」。
+    #[test]
+    fn stick_noise_suppresses_repeats_within_window() {
+        let mut n = StickNoise::new();
+        let t0 = ::std::time::Instant::now();
+        // 窗口内第一条：必须打印（不能把首次也吞掉，否则完全失去可见性）。
+        assert_eq!(n.observe(t0), Some(0), "第一条必须打印，suppressed=0");
+        // 同窗口后续：全部抑制。
+        for i in 1..=10 {
+            assert_eq!(
+                n.observe(t0 + Duration::from_millis(i * 100)),
+                None,
+                "同窗口第 {i} 条必须被抑制"
+            );
+        }
+        // 跨窗口：再次打印，并带上前一窗口被抑制的条数（10）。
+        assert_eq!(
+            n.observe(t0 + Duration::from_secs(61)),
+            Some(10),
+            "新窗口首条必须带上被抑制的条数"
+        );
+    }
+
+    /// 窗口边界必须严格，差 1ms 都不能提前重置（否则高频抖动会突破限流）。
+    #[test]
+    fn stick_noise_window_boundary_is_strict() {
+        let mut n = StickNoise::new();
+        let t0 = ::std::time::Instant::now();
+        assert_eq!(n.observe(t0), Some(0));
+        assert_eq!(n.observe(t0 + Duration::from_secs(59)), None);
+        assert_eq!(
+            n.observe(t0 + Duration::from_millis(59_999)),
+            None,
+            "差 1ms 到窗口边界仍属同窗口"
+        );
+        assert_eq!(
+            n.observe(t0 + Duration::from_secs(60)),
+            Some(2),
+            "满 60s 才是新窗口（前两次被抑制）"
         );
     }
 
